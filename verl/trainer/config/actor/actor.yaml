@@ -260,6 +260,66 @@ profiler:
       # Whether to fail on unknown stage or missing msprobe
       strict: ${oc.select:global_profiler.global_tool_config.precision_debugger.strict,False}
 
+# Self-distillation (SDPO) configuration — only active when policy_loss.loss_mode == "sdpo"
+self_distillation:
+
+  # Target dataclass for this configuration
+  _target_: verl.workers.config.SelfDistillationConfig
+
+  # Whether to use full-logit KL distillation (vs. token-level reverse KL only)
+  full_logit_distillation: true
+
+  # Top-k logits used for distillation (null = full vocab)
+  distillation_topk: 100
+
+  # Add tail bucket to top-k distribution for mass conservation
+  distillation_add_tail: true
+
+  # KL interpolation: 0.0=forward KL, 1.0=reverse KL, in-between=JSD
+  alpha: 0.5
+
+  # Minimum sequence reward to treat a response as a successful demonstration
+  success_reward_threshold: 0.5
+
+  # Teacher regularization: ema | trust_region | none
+  teacher_regularization: ema
+
+  # EMA mixing rate toward student (null falls back to ema_update_rate)
+  teacher_update_rate: null
+
+  # Deprecated alias for teacher_update_rate
+  ema_update_rate: 0.05
+
+  # Maximum token length of the reprompted teacher input
+  max_reprompt_len: 10240
+
+  # Truncation side for reprompt: right | left
+  reprompt_truncation: right
+
+  # Skip reprompting samples that already succeeded themselves
+  dont_reprompt_on_self_success: true
+
+  # Strip <think>...</think> from demonstrations before reprompting
+  remove_thinking_from_demonstration: true
+
+  # IS-clipping coefficient for distillation loss (null = disabled)
+  is_clip: 2
+
+  # Template combining prompt, solution, and feedback
+  reprompt_template: "{prompt}{solution}{feedback}\n\nCorrectly solve the original question.\n"
+
+  # Template wrapping the successful demonstration
+  solution_template: "\nCorrect solution:\n\n{successful_previous_attempt}\n\n"
+
+  # Template wrapping environment feedback
+  feedback_template: "\nThe following is feedback from your unsuccessful earlier attempt:\n\n{feedback_raw}\n\n"
+
+  # Whether to include environment feedback (from reward_extra_infos["feedback"])
+  include_environment_feedback: true
+
+  # Use feedback only when no successful demonstration is available
+  environment_feedback_only_without_solution: true
+
 # Router replay configuration for MoE models
 router_replay:
 
@@ -310,4 +370,3 @@ qat:
 
   # Path to vLLM quantization config JSON file
   quantization_config_path: null
-

@@ -52,7 +52,9 @@ from verl.workers.config import (
     TrainingWorkerConfig,
 )
 from verl.workers.rollout.base import BaseRollout, get_rollout_class
-from verl.workers.utils.losses import ppo_loss
+from verl.workers.utils.losses import _sdpo_teacher_extractor, ppo_loss, sdpo_ppo_loss
+from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+from verl.workers.utils.sdpo import TrustRegionTeacher, has_non_empty_multi_modal_inputs
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -194,6 +196,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         if isinstance(grad_norm, torch.Tensor):
             grad_norm = grad_norm.detach().item()
         lr = metrics.pop("lr", None)
+        did_update = output.pop("did_update", True)
 
         # For other metrics, we perform all gather in dp group (only if DP > 1)
         if dp_group is not None:
@@ -227,7 +230,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
         # model outputs
         model_output = output.pop("model_output", {})
         # We only return final_metrics
-        final_output = tu.get_tensordict(tensor_dict=model_output, non_tensor_dict={"metrics": final_metrics})
+        final_output = tu.get_tensordict(
+            tensor_dict=model_output, non_tensor_dict={"metrics": final_metrics, "did_update": did_update}
+        )
         return final_output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
@@ -302,6 +307,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 output_lst.append(actor_output)
 
             if self.engine.is_mp_src_rank_with_outputs():
+                did_update = any(tu.get_non_tensor_data(output, "did_update", default=True) for output in output_lst)
+
                 actor_output = [tu.get(output, "metrics") for output in output_lst]
                 metrics = {}
                 for output in actor_output:
@@ -315,7 +322,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
                             )
                     append_to_dict(metrics, output)
 
-                output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
+                output = tu.get_tensordict(
+                    tensor_dict={}, non_tensor_dict={"metrics": metrics, "did_update": did_update}
+                ).cpu()
             else:
                 output = None
         return output
@@ -483,6 +492,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             rr_mode = "disabled"
         self.enable_routing_replay = rr_mode != "disabled"
 
+        # SDPO detection
+        sdpo_cfg = config.actor.get("self_distillation", None) if self._is_actor else None
+        sdpo_loss_mode = config.actor.policy_loss.get("loss_mode", "vanilla") if self._is_actor else "vanilla"
+        self.sdpo_enabled = sdpo_cfg is not None and sdpo_loss_mode == "sdpo"
+        self.sdpo_config = None  # populated in init_model
+
         DistProfilerExtension.__init__(
             self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
         )
@@ -576,7 +591,23 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else:
                 assert self.config.rollout.log_prob_micro_batch_size_per_gpu is not None
                 assert self.config.actor.ppo_micro_batch_size_per_gpu is not None
-            if self.distillation_enabled:
+            if self.sdpo_enabled:
+                from verl.utils.config import omega_conf_to_dataclass as _to_dc
+                from verl.workers.config.actor import SelfDistillationConfig
+
+                self.sdpo_config = _to_dc(self.config.actor.self_distillation, SelfDistillationConfig)
+                if self.sdpo_config.full_logit_distillation:
+                    actor_uses_fused_kernels = actor_training_config.engine_config.use_fused_kernels
+                    ref_uses_fused_kernels = self.ref is not None and self.ref.engine_config.use_fused_kernels
+                    if actor_uses_fused_kernels or ref_uses_fused_kernels:
+                        raise ValueError("Logit distillation requires disabling fused kernels.")
+                self.loss_fn = partial(
+                    sdpo_ppo_loss,
+                    config=actor_config,
+                    sdpo_config=self.sdpo_config,
+                    teacher_logprob_fn=self._compute_sdpo_teacher_logps_for_loss,
+                )
+            elif self.distillation_enabled:
                 self.loss_fn = partial(
                     distillation_ppo_loss, config=actor_config, distillation_config=distillation_config
                 )
@@ -586,6 +617,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.actor.reset()
             self.actor.set_loss_fn(self.loss_fn)
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
+
+        if self.sdpo_enabled:
+            self._configure_sdpo_teacher()
 
         # 3. build rollout engine
         if "rollout" in self.role:
@@ -651,7 +685,135 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
         output = self.actor.train_mini_batch(data=data)
+        if self.sdpo_enabled and tu.get_non_tensor_data(output, "did_update", default=True):
+            self._update_teacher_ema()
         return output.cpu() if output is not None else None
+
+    def _compute_sdpo_teacher_logps_for_loss(
+        self,
+        data: TensorDict,
+        student_topk_indices: Optional[torch.Tensor] = None,
+        return_all_logps: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """Compute SDPO teacher targets inside the actor loss microbatch."""
+        if self.ref is None:
+            raise RuntimeError("SDPO teacher inference requires an initialized ref model.")
+        required_keys = {
+            "teacher_input_ids",
+            "teacher_attention_mask",
+            "teacher_position_ids",
+            "self_distillation_mask",
+        }
+        missing = required_keys - set(data.keys())
+        if missing:
+            raise ValueError(f"SDPO is enabled but required teacher keys are missing: {sorted(missing)}")
+        if has_non_empty_multi_modal_inputs(data):
+            raise ValueError("SDPO does not support multi-modal inputs in actor.update_policy.")
+
+        responses = data["responses"]
+        teacher_input_ids = data["teacher_input_ids"]
+        teacher_attention_mask = data["teacher_attention_mask"]
+        teacher_position_ids = data["teacher_position_ids"]
+        response_mask = data["response_mask"]
+
+        teacher_prompt_len = teacher_input_ids.shape[1] - responses.shape[1]
+        teacher_prompts = teacher_input_ids[:, :teacher_prompt_len]
+
+        tensor_dict = {
+            "input_ids": teacher_input_ids,
+            "attention_mask": teacher_attention_mask,
+            "position_ids": teacher_position_ids,
+            "response_mask": response_mask,
+            "responses": responses,
+            "prompts": teacher_prompts,
+        }
+        if student_topk_indices is not None:
+            tensor_dict["student_topk_indices"] = student_topk_indices
+
+        temperature = tu.get_non_tensor_data(data=data, key="temperature", default=1.0)
+        non_tensor_dict = {
+            "temperature": temperature,
+            "pad_token_id": tu.get_non_tensor_data(data=data, key="pad_token_id", default=0),
+        }
+        teacher_td = tu.get_tensordict(tensor_dict=tensor_dict, non_tensor_dict=non_tensor_dict)
+        teacher_td = left_right_2_no_padding(teacher_td)
+
+        use_logits_processor = return_all_logps or student_topk_indices is not None
+        default_keys = {
+            "use_remove_padding": tu.get_non_tensor_data(
+                data=data, key="use_remove_padding", default=self.ref.model_config.get("use_remove_padding", False)
+            ),
+            "use_dynamic_bsz": False,
+            "max_token_len_per_gpu": None,
+            "micro_batch_size_per_gpu": data.batch_size[0],
+            "use_fused_kernels": tu.get_non_tensor_data(
+                data=data, key="use_fused_kernels", default=self.ref.engine_config.use_fused_kernels
+            ),
+            "calculate_entropy": False,
+            "distillation_use_topk": use_logits_processor,
+        }
+        tu.assign_non_tensor(teacher_td, **default_keys)
+
+        # When full-logit distillation is on (top-k or all-vocab), run the teacher
+        # extractor as the engine's logits processor; otherwise only plain log_probs
+        # are needed. The extractor itself picks top-k vs all-vocab from the data.
+        loss_function = _sdpo_teacher_extractor if use_logits_processor else None
+
+        with self.ref.engine.eval_mode(disable_auto_offload=False):
+            output = self.ref.engine.infer_batch(teacher_td, loss_function=loss_function)
+        model_output = output["model_output"]
+        result = {"teacher_log_probs": no_padding_2_padding(model_output["log_probs"], teacher_td).float()}
+        if return_all_logps:
+            result["teacher_all_log_probs"] = no_padding_2_padding(model_output["all_logps"], teacher_td).float()
+        elif student_topk_indices is not None:
+            result["teacher_topk_log_probs"] = no_padding_2_padding(model_output["topk_logps"], teacher_td).float()
+        return result
+
+    def _update_teacher_ema(self) -> None:
+        """EMA-update ref model toward actor after gradient step (SDPO)."""
+        if not self.sdpo_enabled or not self._is_ref:
+            return
+        teacher_regularization = self.sdpo_config.teacher_regularization
+        if teacher_regularization != "ema":
+            return
+        update_rate = self._resolve_sdpo_teacher_update_rate()
+        if update_rate == 0.0:
+            return
+        with torch.no_grad():
+            for ref_param, actor_param in zip(
+                self.ref.engine.module.parameters(),
+                self.actor.engine.module.parameters(),
+                strict=False,
+            ):
+                actor_data = actor_param.data.to(device=ref_param.device)
+                ref_param.data.mul_(1.0 - update_rate).add_(actor_data, alpha=update_rate)
+
+    def _configure_sdpo_teacher(self) -> None:
+        if self.ref is None:
+            raise RuntimeError("SDPO teacher inference requires an initialized ref model.")
+        teacher_regularization = self.sdpo_config.teacher_regularization
+        if teacher_regularization != "trust_region":
+            return
+
+        if self.actor is None:
+            raise RuntimeError("SDPO trust_region teacher requires an initialized actor model.")
+        if self.actor.engine_config.use_fused_kernels or self.ref.engine_config.use_fused_kernels:
+            raise ValueError("trust_region teacher requires disabling fused kernels to access logits.")
+        trust_region_teacher = TrustRegionTeacher(
+            ref_module=self.ref.engine.module,
+            student_module=self.actor.engine.module,
+            mix_coef=self._resolve_sdpo_teacher_update_rate(),
+        )
+
+        set_inference_module = getattr(self.ref.engine, "set_inference_module", None)
+        if set_inference_module is None:
+            raise RuntimeError("SDPO trust_region teacher requires an engine that supports an inference module.")
+        set_inference_module(trust_region_teacher)
+
+    def _resolve_sdpo_teacher_update_rate(self) -> float:
+        rate = getattr(self.sdpo_config, "teacher_update_rate", None)
+        legacy = getattr(self.sdpo_config, "ema_update_rate", 0.05)
+        return float(legacy if rate is None else rate)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):

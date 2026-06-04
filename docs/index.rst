@@ -83,6 +83,7 @@ verl is fast with:
    algo/otb.md
    algo/dppo.md
    algo/opd.md
+   algo/sdpo.md
 
 .. toctree::
    :maxdepth: 1

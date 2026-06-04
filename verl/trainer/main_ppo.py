@@ -129,6 +129,15 @@ class TaskRunner:
         from verl.trainer.ppo.ray_trainer import Role
         from verl.workers.engine_workers import ActorRolloutRefWorker
 
+        # SDPO validation
+        self_distillation_cfg = config.actor_rollout_ref.actor.get("self_distillation", None)
+        loss_mode = config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+        self_distillation_needs_ref = self_distillation_cfg is not None and loss_mode == "sdpo"
+        if self_distillation_needs_ref and need_reference_policy(config):
+            raise ValueError("SDPO cannot share the reference policy with KL regularization.")
+        if self_distillation_needs_ref and config.actor_rollout_ref.actor.strategy not in {"fsdp", "fsdp2"}:
+            raise ValueError("SDPO currently supports FSDP/FSDP2 actor strategy only.")
+
         actor_rollout_cls = ActorRolloutRefWorker
         ray_worker_group_cls = RayWorkerGroup
 
@@ -137,7 +146,8 @@ class TaskRunner:
             lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
         ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
         # Ref policy is fused into ActorRolloutRefWorker unless LoRA is used with a dedicated ref model.
-        if need_reference_policy(config) and not ref_in_actor:
+        # For SDPO, always use ActorRolloutRef so teacher inference has both ref and actor modules.
+        if (need_reference_policy(config) and not ref_in_actor) or self_distillation_needs_ref:
             role = Role.ActorRolloutRef
         else:
             role = Role.ActorRollout

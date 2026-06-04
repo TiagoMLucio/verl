@@ -147,6 +147,7 @@ class FSDPEngine(BaseEngine):
         # defaults so forward_step / optimizer_step can still read them safely.
         self._autocast_dtype = torch.bfloat16
         self.scaler = None
+        self._inference_module: Optional[torch.nn.Module] = None
 
         # QAT (Quantization-Aware Training)
         self._qat_config = getattr(self.engine_config, "qat", None)
@@ -172,6 +173,9 @@ class FSDPEngine(BaseEngine):
     @property
     def is_optimizer_offload_enabled(self) -> bool:
         return self._is_offload_optimizer
+
+    def set_inference_module(self, module: Optional[torch.nn.Module]) -> None:
+        self._inference_module = module
 
     def is_mp_src_rank_with_outputs(self):
         if self.ulysses_device_mesh is not None:
@@ -1140,7 +1144,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     cu_seqlens = input_ids.offsets()
                     for k, v in outputs.items():
                         v = v.squeeze(0)
-                        assert v.shape == log_probs.shape, f"log_probs shape: {log_probs.shape}, {k} shape: {v.shape}"
+                        assert v.shape[0] == log_probs.shape[0], (
+                            f"log_probs shape: {log_probs.shape}, {k} shape: {v.shape}"
+                        )
                         if self.use_ulysses_sp:
                             pad_size = output_args["pad_size"]
                             v = gather_outputs_and_unpad(v, gather_dim=0, unpad_dim=0, padding_size=pad_size)
@@ -1222,7 +1228,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
                         for k, v in outputs.items():
                             v = v.squeeze(0)
-                            assert v.shape == log_probs.shape, (
+                            assert v.shape[0] == log_probs.shape[0], (
                                 f"log_probs shape: {log_probs.shape}, {k} shape: {v.shape}"
                             )
                             model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
@@ -1267,7 +1273,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
             else torch.autocast(device_type=device_name, dtype=autocast_dtype)
         )
         with autocast_ctx:
-            raw_output = self.module(
+            forward_module = self.module
+            if forward_only and self._inference_module is not None:
+                forward_module = self._inference_module
+            raw_output = forward_module(
                 **model_inputs,
                 use_cache=False,
             )  # prevent model thinks we are generating

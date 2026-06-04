@@ -13,12 +13,22 @@
 # limitations under the License.
 
 
+from typing import Any, Optional
+
 import torch
 from tensordict import TensorDict
 
-from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import (
+    agg_loss,
+    compute_self_distillation_loss,
+    compute_value_loss,
+    get_policy_loss_fn,
+    kl_penalty,
+)
 from verl.utils import tensordict_utils as tu
+from verl.utils.attention_utils import index_first_axis, rearrange
 from verl.utils.dataset.dataset_utils import DatasetPadMode
+from verl.utils.device import get_device_name
 from verl.utils.metric import AggregationType, Metric
 from verl.utils.torch_functional import masked_mean, masked_sum
 from verl.workers.config import ActorConfig, CriticConfig
@@ -140,6 +150,174 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         policy_loss += kl_loss * config.kl_loss_coef
         metrics["kl_loss"] = Metric(value=kl_loss, aggregation=metric_aggregation)
         metrics["kl_coef"] = config.kl_loss_coef
+
+    return policy_loss, metrics
+
+
+def _sdpo_response_topk_indices_to_no_padding(data: TensorDict, logits: torch.Tensor) -> Optional[torch.Tensor]:
+    """Map padded response top-k indices onto the flattened no-padding sequence."""
+    topk_indices = tu.get(data, "student_topk_indices", default=None)
+    if topk_indices is None:
+        return None
+
+    response_length = data["responses"].shape[-1]
+    topk = topk_indices.size(-1)
+    batch_size = topk_indices.shape[0]
+    max_seq_len = tu.get_non_tensor_data(data=data, key="max_seq_len", default=None)
+
+    full_topk_indices = torch.zeros(
+        batch_size,
+        max_seq_len,
+        topk,
+        device=topk_indices.device,
+        dtype=topk_indices.dtype,
+    )
+    full_topk_indices[:, -response_length - 1 : -1, :] = topk_indices
+
+    indices = tu.get_non_tensor_data(data=data, key="indices", default=None)
+    gathered_indices = index_first_axis(rearrange(full_topk_indices, "b s k -> (b s) k"), indices)
+    sp_size = tu.get_non_tensor_data(data=data, key="sp_size", default=1)
+    if sp_size > 1:
+        from verl.utils.ulysses import slice_input_tensor
+
+        gathered_indices = slice_input_tensor(gathered_indices.unsqueeze(0), dim=1, padding=True).squeeze(0)
+    return gathered_indices[: logits.shape[0]]
+
+
+def _sdpo_logits_processor(student_logits: torch.Tensor, sdpo_config) -> dict:
+    """Logits-processor call during actor forward: compute student top-k or full logps."""
+    logits = student_logits.squeeze(0)  # (total_nnz, vocab_size)
+    distill_topk = sdpo_config.distillation_topk
+    if distill_topk is not None:
+        topk = min(distill_topk, logits.shape[-1])
+        topk_logits, topk_indices = torch.topk(logits, topk, dim=-1)
+        logsumexp = torch.logsumexp(logits, dim=-1, keepdim=True)
+        topk_logps = topk_logits - logsumexp
+        return {"topk_logps": topk_logps, "topk_indices": topk_indices}
+    all_logps = torch.log_softmax(logits, dim=-1)
+    return {"all_logps": all_logps}
+
+
+def _sdpo_teacher_extractor(
+    student_logits: Optional[torch.Tensor] = None,
+    data=None,
+    **kwargs,
+) -> dict | tuple[torch.Tensor, dict]:
+    """Teacher logits processor for full-vocab or student-top-k SDPO targets."""
+    if student_logits is None:
+        return torch.tensor(1.0, device=get_device_name()), {}
+    logits = student_logits.squeeze(0)
+    topk_indices = _sdpo_response_topk_indices_to_no_padding(data=data, logits=logits)
+    if topk_indices is None:
+        return {"all_logps": torch.log_softmax(logits, dim=-1)}
+    topk_logits = torch.gather(logits, dim=-1, index=topk_indices)
+    logsumexp = torch.logsumexp(logits, dim=-1, keepdim=True)
+    return {"topk_logps": topk_logits - logsumexp}
+
+
+def sdpo_ppo_loss(
+    config: ActorConfig,
+    sdpo_config,
+    teacher_logprob_fn=None,
+    student_logits: Optional[torch.Tensor] = None,
+    model_output: Optional[dict] = None,
+    data: Optional[TensorDict] = None,
+    dp_group=None,
+) -> tuple[torch.Tensor, dict[str, Any]] | dict:
+    """SDPO loss function used as both logits processor and final policy loss."""
+    if student_logits is not None:
+        return _sdpo_logits_processor(student_logits=student_logits, sdpo_config=sdpo_config)
+
+    student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
+    teacher_log_probs = None
+
+    response_mask = tu.get(data, "response_mask", default=None)
+    if response_mask is None:
+        raise ValueError("SDPO: response_mask missing in data.")
+
+    self_distillation_mask = tu.get(data, "self_distillation_mask", default=None)
+    old_log_probs = tu.get(data, "old_log_probs", default=None)
+    rollout_is_weights = tu.get(data, "rollout_is_weights", default=None)
+
+    full_logit_distillation = sdpo_config.full_logit_distillation
+    distill_topk = sdpo_config.distillation_topk
+    student_topk_logps = None
+    student_topk_indices = None
+    student_all_logps = None
+    teacher_topk_logps = None
+    teacher_all_logps = None
+
+    if full_logit_distillation and distill_topk is not None:
+        student_topk_logps = no_padding_2_padding(model_output["topk_logps"], data)
+        student_topk_indices = no_padding_2_padding(model_output["topk_indices"], data)
+    elif full_logit_distillation:
+        student_all_logps = no_padding_2_padding(model_output["all_logps"], data)
+
+    if teacher_logprob_fn is not None:
+        teacher_outputs = teacher_logprob_fn(
+            data=data,
+            student_topk_indices=student_topk_indices,
+            return_all_logps=full_logit_distillation and distill_topk is None,
+        )
+        teacher_log_probs = teacher_outputs.get("teacher_log_probs", teacher_log_probs)
+        teacher_topk_logps = teacher_outputs.get("teacher_topk_log_probs", teacher_topk_logps)
+        teacher_all_logps = teacher_outputs.get("teacher_all_log_probs", teacher_all_logps)
+
+    if teacher_log_probs is None:
+        raise ValueError("SDPO: teacher_log_probs missing and no teacher_logprob_fn produced it.")
+    if full_logit_distillation and distill_topk is not None and teacher_topk_logps is None:
+        raise ValueError("SDPO: teacher_topk_log_probs missing for full-logit top-k distillation.")
+    if full_logit_distillation and distill_topk is None and teacher_all_logps is None:
+        raise ValueError("SDPO: teacher_all_log_probs missing for full-logit distillation.")
+
+    loss, metrics = compute_self_distillation_loss(
+        student_log_probs=student_log_probs,
+        teacher_log_probs=teacher_log_probs,
+        response_mask=response_mask,
+        self_distillation_config=sdpo_config,
+        old_log_probs=old_log_probs,
+        student_all_log_probs=student_all_logps,
+        teacher_all_log_probs=teacher_all_logps,
+        student_topk_log_probs=student_topk_logps,
+        teacher_topk_log_probs=teacher_topk_logps,
+        self_distillation_mask=self_distillation_mask,
+        loss_agg_mode=config.loss_agg_mode,
+        rollout_is_weights=rollout_is_weights,
+    )
+    metrics["self_distillation/empty_target_batch"] = (
+        self_distillation_mask.sum().item() == 0 if self_distillation_mask is not None else False
+    )
+
+    config.global_batch_info["dp_size"] = data["dp_size"]
+    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
+    config.global_batch_info["global_batch_size"] = data["global_batch_size"]
+    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
+
+    if (
+        data["dp_size"] > 1
+        or data["batch_num_tokens"] is not None
+        or data["global_batch_size"] is not None
+        or config.loss_scale_factor is not None
+    ):
+        metric_aggregation = AggregationType.SUM
+    else:
+        metric_aggregation = AggregationType.MEAN
+
+    metrics = Metric.from_dict(metrics, aggregation=AggregationType.MEAN)
+    metrics["actor/pg_loss"] = Metric(value=loss, aggregation=metric_aggregation)
+    policy_loss = loss
+
+    entropy = model_output.get("entropy", None)
+    if entropy is not None:
+        entropy = no_padding_2_padding(entropy, data)
+        entropy_loss = agg_loss(
+            loss_mat=entropy,
+            loss_mask=response_mask,
+            loss_agg_mode=config.loss_agg_mode,
+            **config.global_batch_info,
+        )
+        policy_loss -= config.entropy_coeff * entropy_loss
+        metrics["actor/entropy_loss"] = Metric(value=entropy_loss, aggregation=metric_aggregation)
 
     return policy_loss, metrics
 
