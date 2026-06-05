@@ -304,6 +304,9 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 
     async def generate_sequences(self, batch: TensorDict) -> None:
         """Spawn agent loop for each sample in the batch without waiting for the results."""
+        from verl.utils.modal_debug import maybe_wait_at
+        maybe_wait_at("agent_loop")
+
         validate = batch["validate"] if "validate" in batch else False
         batch.pop("validate", None)
         config = self.config.actor_rollout_ref.rollout
@@ -612,6 +615,9 @@ class PPOTrainer:
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
+        from verl.utils.modal_debug import maybe_wait_at
+        maybe_wait_at("init_workers")
+
         self.resource_pool_manager.create_resource_pool()
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
@@ -1843,6 +1849,9 @@ class PPOTrainer:
         metrics.update(compute_spec_decode_metrics(spec_drafts, spec_accepts, spec_verifies, non_padding_mask))
 
     def fit(self):
+        from verl.utils.modal_debug import maybe_wait_at
+        maybe_wait_at("fit")
+
         if self._dump_executor._shutdown:
             self._init_dump_executor()
 
@@ -2091,6 +2100,9 @@ class TaskRunner:
     def run(self, config):
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
+
+        from verl.utils.modal_debug import maybe_wait_at
+        maybe_wait_at("taskrunner")
 
         # initialize transfer queue
         tq.init(config.transfer_queue)

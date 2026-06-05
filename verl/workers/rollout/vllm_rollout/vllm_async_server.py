@@ -466,6 +466,8 @@ class vLLMHttpServer:
         priority: int = 0,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
+        from verl.utils.modal_debug import maybe_wait_at
+        maybe_wait_at("vllm_server")
         prompt_ids = normalize_token_ids(prompt_ids)
 
         # Calculate the maximum possible new tokens based on available context space

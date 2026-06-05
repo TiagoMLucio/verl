@@ -520,6 +520,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
+        from verl.utils.modal_debug import maybe_wait_at
+        maybe_wait_at("actor_init_model")
+
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
 
         # 1. build reference model
@@ -676,6 +679,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     @_with_routing_replay_flag(enabled=False)
     def compute_ref_log_prob(self, data: TensorDict) -> TensorDict:
+        from verl.utils.modal_debug import maybe_wait_at
+        maybe_wait_at("compute_ref_log_prob")
         output = self.ref.infer_batch(data=data)
         return output.cpu() if output is not None else None
 
@@ -683,6 +688,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     @_with_routing_replay_flag(enabled=True)
     def compute_log_prob(self, data: TensorDict) -> TensorDict:
+        from verl.utils.modal_debug import maybe_wait_at
+        maybe_wait_at("compute_log_prob")
         output = self.actor.infer_batch(data)
 
         return output.cpu() if output is not None else None
@@ -691,6 +698,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
+        from verl.utils.modal_debug import maybe_wait_at
+        maybe_wait_at("update_actor")
+
         output = self.actor.train_mini_batch(data=data)
         if self.sdpo_enabled and tu.get_non_tensor_data(output, "did_update", default=True):
             self._update_teacher_ema()
@@ -703,6 +713,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return_all_logps: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Compute SDPO teacher targets inside the actor loss microbatch."""
+        from verl.utils.modal_debug import maybe_wait_at
+        maybe_wait_at("sdpo_teacher_loss")
+
         if self.ref is None:
             raise RuntimeError("SDPO teacher inference requires an initialized ref model.")
         required_keys = {"teacher_input_ids", "self_distillation_mask"}
