@@ -134,12 +134,8 @@ def test_reconstruct_padded_teacher_matches_legacy_layout():
     teacher_input_ids_nested = torch.nested.nested_tensor(
         [torch.tensor([10, 11, 1, 2, 3]), torch.tensor([20, 21, 22, 4, 5])], layout=torch.jagged
     )
-    responses = torch.nested.nested_tensor(
-        [torch.tensor([1, 2, 3]), torch.tensor([4, 5])], layout=torch.jagged
-    )
-    response_mask = torch.nested.nested_tensor(
-        [torch.tensor([1, 1, 1]), torch.tensor([1, 1])], layout=torch.jagged
-    )
+    responses = torch.nested.nested_tensor([torch.tensor([1, 2, 3]), torch.tensor([4, 5])], layout=torch.jagged)
+    response_mask = torch.nested.nested_tensor([torch.tensor([1, 1, 1]), torch.tensor([1, 1])], layout=torch.jagged)
 
     teacher_input_ids, teacher_attention_mask, teacher_position_ids, responses_padded, response_mask_padded = (
         reconstruct_padded_teacher_from_nested(teacher_input_ids_nested, responses, response_mask, pad_token_id=0)

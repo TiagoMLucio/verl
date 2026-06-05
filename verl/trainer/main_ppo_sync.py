@@ -1461,9 +1461,7 @@ class PPOTrainer:
         response_list = responses.unbind()
         teacher_input_ids = torch.nested.nested_tensor(
             [
-                torch.cat(
-                    [teacher_prompt_input_ids[i][teacher_prompt_attention_mask[i].bool()], response_list[i]]
-                )
+                torch.cat([teacher_prompt_input_ids[i][teacher_prompt_attention_mask[i].bool()], response_list[i]])
                 for i in range(batch_size)
             ],
             layout=torch.jagged,
