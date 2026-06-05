@@ -25,7 +25,7 @@ from verl.workers.engine_workers import ActorRolloutRefWorker
 from verl.workers.utils import losses as sdpo_losses
 from verl.workers.utils.losses import _sdpo_logits_processor, _sdpo_teacher_extractor
 from verl.workers.utils.padding import no_padding_2_padding
-from verl.workers.utils.sdpo import TrustRegionTeacher
+from verl.workers.utils.sdpo import TrustRegionTeacher, reconstruct_padded_teacher_from_nested
 
 
 class ConstantLogitsModule(torch.nn.Module):
@@ -124,6 +124,36 @@ def test_trust_region_teacher_blends_ref_and_student_logits():
     output = teacher(input_ids=torch.tensor([[1, 2, 3]]))
 
     torch.testing.assert_close(output.logits, torch.lerp(ref_logits, student_logits, 0.25))
+
+
+def test_reconstruct_padded_teacher_matches_legacy_layout():
+    # Transfer-queue path stores the teacher sequence (teacher prompt + response), responses and
+    # response mask as nested per-sample tensors; the worker rebuilds the left-padded prompt +
+    # right-padded response layout that the legacy trainer produced. Prompts here are [10,11] and
+    # [20,21,22]; the teacher sequence is the prompt concatenated with the response.
+    teacher_input_ids_nested = torch.nested.nested_tensor(
+        [torch.tensor([10, 11, 1, 2, 3]), torch.tensor([20, 21, 22, 4, 5])], layout=torch.jagged
+    )
+    responses = torch.nested.nested_tensor(
+        [torch.tensor([1, 2, 3]), torch.tensor([4, 5])], layout=torch.jagged
+    )
+    response_mask = torch.nested.nested_tensor(
+        [torch.tensor([1, 1, 1]), torch.tensor([1, 1])], layout=torch.jagged
+    )
+
+    teacher_input_ids, teacher_attention_mask, teacher_position_ids, responses_padded, response_mask_padded = (
+        reconstruct_padded_teacher_from_nested(teacher_input_ids_nested, responses, response_mask, pad_token_id=0)
+    )
+
+    # max_prompt_len=3, max_response_len=3 -> teacher seq len 6
+    assert teacher_input_ids.tolist() == [[0, 10, 11, 1, 2, 3], [20, 21, 22, 4, 5, 0]]
+    assert teacher_attention_mask.tolist() == [[0, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 0]]
+    # position ids = clip(cumsum(mask) - 1, min=0)
+    assert teacher_position_ids.tolist() == [[0, 0, 1, 2, 3, 4], [0, 1, 2, 3, 4, 4]]
+    assert responses_padded.tolist() == [[1, 2, 3], [4, 5, 0]]
+    assert response_mask_padded.tolist() == [[1, 1, 1], [1, 1, 0]]
+    # the prompt boundary is uniform so the legacy slicing teacher_input_ids[:, :Lp] is valid
+    assert teacher_input_ids.shape[1] - responses_padded.shape[1] == 3
 
 
 @pytest.mark.parametrize("mix_coef", [-0.1, 1.1])

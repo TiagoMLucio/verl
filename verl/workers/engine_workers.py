@@ -54,7 +54,11 @@ from verl.workers.config import (
 from verl.workers.rollout.base import BaseRollout, get_rollout_class
 from verl.workers.utils.losses import _sdpo_teacher_extractor, ppo_loss, sdpo_ppo_loss
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
-from verl.workers.utils.sdpo import TrustRegionTeacher, has_non_empty_multi_modal_inputs
+from verl.workers.utils.sdpo import (
+    TrustRegionTeacher,
+    has_non_empty_multi_modal_inputs,
+    reconstruct_padded_teacher_from_nested,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -698,23 +702,39 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         """Compute SDPO teacher targets inside the actor loss microbatch."""
         if self.ref is None:
             raise RuntimeError("SDPO teacher inference requires an initialized ref model.")
-        required_keys = {
-            "teacher_input_ids",
-            "teacher_attention_mask",
-            "teacher_position_ids",
-            "self_distillation_mask",
-        }
+        required_keys = {"teacher_input_ids", "self_distillation_mask"}
         missing = required_keys - set(data.keys())
         if missing:
             raise ValueError(f"SDPO is enabled but required teacher keys are missing: {sorted(missing)}")
         if has_non_empty_multi_modal_inputs(data):
             raise ValueError("SDPO does not support multi-modal inputs in actor.update_policy.")
 
-        responses = data["responses"]
+        # Both trainers pass the same fields; the transfer-queue path materializes the teacher
+        # sequence as a nested (no-padding) tensor and we rebuild the padded layout here, while
+        # the legacy path already carries the padded teacher tensors (and precomputed mask/pos).
         teacher_input_ids = data["teacher_input_ids"]
-        teacher_attention_mask = data["teacher_attention_mask"]
-        teacher_position_ids = data["teacher_position_ids"]
-        response_mask = data["response_mask"]
+        if teacher_input_ids.is_nested:
+            (
+                teacher_input_ids,
+                teacher_attention_mask,
+                teacher_position_ids,
+                responses,
+                response_mask,
+            ) = reconstruct_padded_teacher_from_nested(
+                teacher_input_ids=teacher_input_ids,
+                responses=data["responses"],
+                response_mask=data["response_mask"],
+                pad_token_id=tu.get_non_tensor_data(data=data, key="pad_token_id", default=0),
+            )
+        else:
+            legacy_keys = {"teacher_attention_mask", "teacher_position_ids"}
+            missing = legacy_keys - set(data.keys())
+            if missing:
+                raise ValueError(f"SDPO is enabled but required teacher keys are missing: {sorted(missing)}")
+            responses = data["responses"]
+            teacher_attention_mask = data["teacher_attention_mask"]
+            teacher_position_ids = data["teacher_position_ids"]
+            response_mask = data["response_mask"]
 
         teacher_prompt_len = teacher_input_ids.shape[1] - responses.shape[1]
         teacher_prompts = teacher_input_ids[:, :teacher_prompt_len]

@@ -26,6 +26,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 import uuid
@@ -33,7 +34,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pprint import pprint
-from typing import Any
+from typing import Any, Optional
 
 import hydra
 import numpy as np
@@ -536,6 +537,14 @@ class PPOTrainer:
         )
         trust_remote_code = self.config.data.get("trust_remote_code", False)
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+        if loss_mode == "sdpo":
+            self.tokenizer.padding_side = "left"
+            reprompt_truncation = self.config.actor_rollout_ref.actor.get("self_distillation", {}).get(
+                "reprompt_truncation"
+            )
+            if reprompt_truncation in {"left", "right"}:
+                self.tokenizer.truncation_side = reprompt_truncation
         # Used for multimodal LLM, could be None
         self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
@@ -1254,6 +1263,251 @@ class PPOTrainer:
             extra_info=batch.extra_info,
         )
 
+    @staticmethod
+    def _collect_feedback(
+        include_environment_feedback: bool,
+        reward_extra_infos_dict: Optional[dict[str, Any]],
+        batch_size: int,
+    ) -> list[Any]:
+        """Collect non-empty textual environment feedback from reward extras."""
+        feedback_list: list[Any] = [None] * batch_size
+        if include_environment_feedback and reward_extra_infos_dict is not None:
+            raw_feedback = reward_extra_infos_dict.get("feedback", [])
+            if isinstance(raw_feedback, np.ndarray):
+                raw_feedback = raw_feedback.tolist()
+            for i in range(min(len(raw_feedback), batch_size)):
+                if isinstance(raw_feedback[i], str) and raw_feedback[i].strip():
+                    feedback_list[i] = raw_feedback[i]
+        return feedback_list
+
+    def _collect_solutions_by_uid(
+        self, uids: list[Any], reward_tensor: torch.Tensor, success_reward_threshold: float
+    ) -> dict[Any, list[int]]:
+        """Collect successful sample indices per UID based on sequence-level reward threshold."""
+        seq_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
+        success_by_uid: dict[Any, list[int]] = defaultdict(list)
+        for idx, uid in enumerate(uids):
+            if seq_scores[idx] >= success_reward_threshold:
+                success_by_uid[uid].append(idx)
+        return success_by_uid
+
+    @staticmethod
+    def _remove_thinking_trace(text: str) -> str:
+        """Remove <think>...</think> sections from a demonstration."""
+        return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+
+    def _get_solution(
+        self,
+        idx: int,
+        success_by_uid: dict[Any, list[int]],
+        uids: list[Any],
+        response_texts: list[str],
+        dont_reprompt_on_self_success: bool = False,
+        remove_thinking_from_demonstration: bool = False,
+    ) -> Optional[str]:
+        """Select a successful demonstration for one sample from its UID group."""
+        uid = uids[idx]
+        solution_idxs = success_by_uid[uid]
+        if dont_reprompt_on_self_success:
+            solution_idxs = [j for j in solution_idxs if j != idx]
+        if len(solution_idxs) == 0:
+            return None
+        solution_idx = solution_idxs[0]
+        solution_str = response_texts[solution_idx]
+        if remove_thinking_from_demonstration:
+            solution_str = self._remove_thinking_trace(solution_str)
+        return solution_str
+
+    def _maybe_build_self_distillation_batch(self, batch: KVBatchMeta, metrics: dict) -> None:
+        """Build SDPO teacher inputs and distillation masks when loss_mode is set to ``sdpo``.
+
+        Mirrors ``RayPPOTrainer._maybe_build_self_distillation_batch``, adapted to TransferQueue:
+        the rollout outputs are read from TQ instead of a ``DataProto`` (``reward_tensor`` and
+        ``reward_extra_infos_dict``, which the legacy trainer receives as arguments, are
+        reconstructed here), and the per-sample teacher sequence (``teacher_input_ids`` = teacher
+        prompt + response) and ``self_distillation_mask`` are written back to TQ instead of
+        returned. The teacher attention mask / position ids are derived and recomputed inside the
+        actor worker (see ``reconstruct_padded_teacher_from_nested``).
+        """
+        self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
+        loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+        if self_distillation_cfg is None or loss_mode != "sdpo":
+            return
+
+        data = tq.kv_batch_get(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            select_fields=["responses", "rm_scores", "raw_prompt", "uid", "extra_fields"],
+        )
+
+        if "raw_prompt" not in data:
+            raise ValueError("SDPO requires `raw_prompt` in TransferQueue to build teacher prompts.")
+        if "uid" not in data:
+            raise ValueError("SDPO requires `uid` in TransferQueue.")
+
+        responses = data["responses"]
+        batch_size = len(batch.keys)
+        uids = data["uid"].tolist()
+        reward_tensor = data["rm_scores"].to_padded_tensor(padding=0.0)
+        reward_extra_infos_dict = {
+            "feedback": [
+                extra_field.get("reward_extra_info", {}).get("feedback") if isinstance(extra_field, dict) else None
+                for extra_field in data["extra_fields"].tolist()
+            ]
+        }
+
+        response_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in responses.unbind()]
+        raw_prompts = data["raw_prompt"].tolist()
+
+        prompt_texts: list[str] = []
+        for messages in raw_prompts:
+            if len(messages) == 0:
+                prompt_texts.append("")
+                continue
+            content = messages[-1].get("content", "")
+            if not isinstance(content, str):
+                raise ValueError("SDPO currently only supports textual single-turn prompts.")
+            prompt_texts.append(content)
+
+        feedback_list = self._collect_feedback(
+            include_environment_feedback=self_distillation_cfg.include_environment_feedback,
+            reward_extra_infos_dict=reward_extra_infos_dict,
+            batch_size=batch_size,
+        )
+
+        success_by_uid = self._collect_solutions_by_uid(
+            uids,
+            reward_tensor,
+            success_reward_threshold=self_distillation_cfg.success_reward_threshold,
+        )
+        solution_strs = [
+            self._get_solution(
+                i,
+                success_by_uid,
+                uids,
+                response_texts,
+                self_distillation_cfg.dont_reprompt_on_self_success,
+                self_distillation_cfg.get("remove_thinking_from_demonstration", False),
+            )
+            for i in range(batch_size)
+        ]
+
+        def _build_teacher_message(i: int) -> list[dict]:
+            system_messages = raw_prompts[i][:-1]
+            has_solution = solution_strs[i] is not None
+            has_feedback = feedback_list[i] is not None
+            feedback_only_without_solution = self_distillation_cfg.get(
+                "environment_feedback_only_without_solution",
+                False,
+            )
+            use_feedback = has_feedback and (not feedback_only_without_solution or not has_solution)
+
+            solution_section = ""
+            if has_solution:
+                solution_section = self_distillation_cfg.solution_template.format(
+                    successful_previous_attempt=solution_strs[i]
+                )
+
+            feedback_section = ""
+            if use_feedback:
+                feedback_section = self_distillation_cfg.feedback_template.format(feedback_raw=feedback_list[i])
+
+            if use_feedback or has_solution:
+                reprompt_text = self_distillation_cfg.reprompt_template.format(
+                    prompt=prompt_texts[i],
+                    solution=solution_section,
+                    feedback=feedback_section,
+                )
+            else:
+                reprompt_text = prompt_texts[i]
+
+            return system_messages + [{"role": "user", "content": reprompt_text}]
+
+        messages = [_build_teacher_message(i) for i in range(batch_size)]
+        apply_kwargs = dict(self.config.data.get("apply_chat_template_kwargs", {}))
+        chat_template_kwargs = dict(
+            tokenize=True,
+            return_tensors="pt",
+            return_dict=True,
+            add_generation_prompt=True,
+            max_length=self_distillation_cfg.max_reprompt_len,
+            padding=True,
+            truncation=True,
+            **apply_kwargs,
+        )
+        try:
+            teacher_prompt = self.tokenizer.apply_chat_template(
+                messages,
+                continue_final_message=False,
+                **chat_template_kwargs,
+            )
+        except TypeError:
+            teacher_prompt = self.tokenizer.apply_chat_template(messages, **chat_template_kwargs)
+
+        if isinstance(teacher_prompt, torch.Tensor):
+            teacher_prompt_input_ids = teacher_prompt
+            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            teacher_prompt_attention_mask = (teacher_prompt_input_ids != pad_token_id).to(dtype=torch.long)
+        else:
+            teacher_prompt_input_ids = teacher_prompt["input_ids"]
+            teacher_prompt_attention_mask = teacher_prompt.get("attention_mask")
+            if teacher_prompt_attention_mask is None:
+                teacher_prompt_attention_mask = torch.ones_like(teacher_prompt_input_ids, dtype=torch.long)
+
+        # The legacy trainer builds teacher_input_ids = cat(teacher_prompt, responses) together with
+        # the teacher attention mask and position ids. Here we store only the no-padding teacher
+        # sequence per sample (the teacher prompt, stripped of its left padding, followed by the real
+        # response tokens); the actor worker re-pads it and recomputes the mask / position ids.
+        response_list = responses.unbind()
+        teacher_input_ids = torch.nested.nested_tensor(
+            [
+                torch.cat(
+                    [teacher_prompt_input_ids[i][teacher_prompt_attention_mask[i].bool()], response_list[i]]
+                )
+                for i in range(batch_size)
+            ],
+            layout=torch.jagged,
+        )
+
+        feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
+        feedback_used = [
+            feedback_list[i] is not None and (not feedback_only_without_solution or solution_strs[i] is None)
+            for i in range(batch_size)
+        ]
+        self_distillation_mask = torch.tensor(
+            [solution_strs[i] is not None or feedback_used[i] for i in range(batch_size)],
+            dtype=torch.float32,
+        )
+
+        unique_uids = set(uids)
+        num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
+        num_with_feedback_used = sum(1 for f in feedback_used if f)
+        num_with_solution = sum(1 for s in solution_strs if s is not None)
+        metrics.update(
+            {
+                "self_distillation/success_group_fraction": len(
+                    [uid for uid in unique_uids if len(success_by_uid[uid]) > 0]
+                )
+                / len(unique_uids),
+                "self_distillation/success_sample_fraction": num_with_solution / batch_size,
+                "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,
+                "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
+                "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
+            }
+        )
+
+        tq.kv_batch_put(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            fields=TensorDict(
+                {
+                    "teacher_input_ids": teacher_input_ids,
+                    "self_distillation_mask": self_distillation_mask,
+                },
+                batch_size=batch_size,
+            ),
+        )
+
     def _get_required_batch_multiple(self, dp_size: int) -> int:
         """Return the global batch multiple required by downstream train steps(e.g. critics, actors)."""
         required_multiple = dp_size
@@ -1494,7 +1748,11 @@ class PPOTrainer:
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
             self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
         )
-        distillation_use_topk = (
+        self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
+        loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+        sdpo_enabled = self_distillation_cfg is not None and loss_mode == "sdpo"
+        sdpo_needs_logits_processor = sdpo_enabled and self_distillation_cfg.get("full_logit_distillation", False)
+        distillation_use_topk = sdpo_needs_logits_processor or (
             self.distillation_config.distillation_loss.loss_settings.use_topk
             if is_distillation_enabled(self.config.get("distillation"))
             else False
@@ -1719,6 +1977,10 @@ class PPOTrainer:
         if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.REMAX:
             batch = self._add_remax_reward_baselines(batch)
 
+        # 3.5 [OPTIONAL] build SDPO teacher reprompts and distillation masks. Runs before balancing
+        # so the synthetic padding samples inherit the teacher fields from the template sample.
+        self._maybe_build_self_distillation_batch(batch, metrics=metrics)
+
         # 4. balance batch across data parallel groups
         batch = self._balance_batch(batch, metrics=metrics)
 
@@ -1763,12 +2025,25 @@ class TaskRunner:
 
     def add_actor_rollout_worker(self, config):
         """Add actor rollout worker to mapping."""
+        # SDPO validation
+        self_distillation_cfg = config.actor_rollout_ref.actor.get("self_distillation", None)
+        loss_mode = config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+        self_distillation_needs_ref = self_distillation_cfg is not None and loss_mode == "sdpo"
+        if self_distillation_needs_ref and need_reference_policy(config):
+            raise ValueError("SDPO cannot share the reference policy with KL regularization.")
+        if self_distillation_needs_ref and config.actor_rollout_ref.actor.strategy not in {"fsdp", "fsdp2"}:
+            raise ValueError("SDPO currently supports FSDP/FSDP2 actor strategy only.")
+
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
         if lora_rank <= 0:
             lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
         ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
-
-        role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
+        # Ref policy is fused into ActorRolloutRefWorker unless LoRA is used with a dedicated ref model.
+        # For SDPO, always use ActorRolloutRef so teacher inference has both ref and actor modules.
+        if (need_reference_policy(config) and not ref_in_actor) or self_distillation_needs_ref:
+            role = Role.ActorRolloutRef
+        else:
+            role = Role.ActorRollout
         self.role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)
         self.mapping[role] = "global_pool"
 

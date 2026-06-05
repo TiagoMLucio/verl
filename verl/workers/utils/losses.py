@@ -235,9 +235,26 @@ def sdpo_ppo_loss(
     if response_mask is None:
         raise ValueError("SDPO: response_mask missing in data.")
 
-    self_distillation_mask = tu.get(data, "self_distillation_mask", default=None)
-    old_log_probs = tu.get(data, "old_log_probs", default=None)
-    rollout_is_weights = tu.get(data, "rollout_is_weights", default=None)
+    # Convert the response-shaped fields from the no-padding (nested) layout to the padded
+    # layout the distillation loss expects; this is a no-op for already-padded tensors
+    # (e.g. the legacy worker path). Mirrors the ppo_loss convention above. The original
+    # ``data`` is left untouched because it is still consumed below (student no_padding_2_padding
+    # calls and the teacher_logprob_fn).
+    pad_fields = [
+        field
+        for field in ("response_mask", "self_distillation_mask", "old_log_probs", "rollout_is_weights")
+        if field in data
+    ]
+    padded = data.select(*pad_fields).to_padded_tensor()
+    response_mask = padded["response_mask"]
+    self_distillation_mask = tu.get(padded, "self_distillation_mask", default=None)
+    old_log_probs = tu.get(padded, "old_log_probs", default=None)
+    rollout_is_weights = tu.get(padded, "rollout_is_weights", default=None)
+
+    # The per-sample self-distillation mask is stored as a scalar field in the transfer queue,
+    # which can materialize as (batch,) or (batch, 1); collapse it to (batch,) as the legacy path.
+    if self_distillation_mask is not None and self_distillation_mask.dim() > 1:
+        self_distillation_mask = self_distillation_mask.reshape(self_distillation_mask.shape[0])
 
     full_logit_distillation = sdpo_config.full_logit_distillation
     distill_topk = sdpo_config.distillation_topk
