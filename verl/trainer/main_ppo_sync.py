@@ -1347,17 +1347,17 @@ class PPOTrainer:
 
         responses = data["responses"]
         batch_size = len(batch.keys)
-        uids = data["uid"].tolist()
+        uids = list(data["uid"])
         reward_tensor = data["rm_scores"].to_padded_tensor(padding=0.0)
         reward_extra_infos_dict = {
             "feedback": [
                 extra_field.get("reward_extra_info", {}).get("feedback") if isinstance(extra_field, dict) else None
-                for extra_field in data["extra_fields"].tolist()
+                for extra_field in data["extra_fields"]
             ]
         }
 
         response_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in responses.unbind()]
-        raw_prompts = data["raw_prompt"].tolist()
+        raw_prompts = list(data["raw_prompt"])
 
         prompt_texts: list[str] = []
         for messages in raw_prompts:

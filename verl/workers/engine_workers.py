@@ -200,7 +200,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
         if isinstance(grad_norm, torch.Tensor):
             grad_norm = grad_norm.detach().item()
         lr = metrics.pop("lr", None)
-        did_update = output.pop("did_update", True)
+        # A forward-only pass performs no optimizer step, so it never updates the model; the engine
+        # only sets `did_update` on the training path (see EngineBase.train_batch), so default to
+        # `not forward_only` here.
+        did_update = output.pop("did_update", not forward_only)
 
         # For other metrics, we perform all gather in dp group (only if DP > 1)
         if dp_group is not None:

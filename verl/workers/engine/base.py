@@ -15,6 +15,7 @@
 The abstract base class defining the interface for model training engines.
 """
 
+import math
 import os
 from abc import abstractmethod
 from contextlib import nullcontext
@@ -126,7 +127,7 @@ class BaseEngine:
         self.optimizer_zero_grad()
         outputs = self.forward_backward_batch(data, loss_function, forward_only=False)
         grad_norm = self.optimizer_step()
-        did_update = torch.isfinite(grad_norm).item()
+        did_update = math.isfinite(float(grad_norm))
         if self.is_mp_src_rank_with_outputs():
             assert "grad_norm" not in outputs["metrics"]
             outputs["metrics"]["grad_norm"] = grad_norm
