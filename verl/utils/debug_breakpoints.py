@@ -1,9 +1,9 @@
 """Gated breakpoints for the Ray Distributed Debugger VS Code extension.
 
-``maybe_wait_at(name)`` calls the builtin ``breakpoint()`` when ``name`` (or a
-group containing it) is listed in ``VERL_RAY_BREAKPOINTS``. The launcher sets it
-from its ``RAY_BREAKPOINTS`` arg, e.g. ``RAY_BREAKPOINTS=all`` or
-``RAY_BREAKPOINTS=agent,sdpo``.
+    if should_break("agent_run"): breakpoint()   # stops on THIS line, in your code
+
+Fires when name (or a group containing it) is in VERL_RAY_BREAKPOINTS, set by the
+launcher's RAY_BREAKPOINTS arg (e.g. RAY_BREAKPOINTS=all, or agent,sdpo).
 """
 
 from __future__ import annotations
@@ -28,6 +28,5 @@ def _enabled() -> set[str]:
     return names
 
 
-def maybe_wait_at(name: str) -> None:
-    if name in _enabled():
-        breakpoint()
+def should_break(name: str) -> bool:
+    return name in _enabled()

@@ -1014,8 +1014,8 @@ class RayPPOTrainer:
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
-        from verl.utils.modal_debug import maybe_wait_at
-        maybe_wait_at("init_workers")
+        from verl.utils.debug_breakpoints import should_break
+        if should_break("init_workers"): breakpoint()
 
         self.resource_pool_manager.create_resource_pool()
 
@@ -1608,8 +1608,8 @@ class RayPPOTrainer:
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
-        from verl.utils.modal_debug import maybe_wait_at
-        maybe_wait_at("fit")
+        from verl.utils.debug_breakpoints import should_break
+        if should_break("fit"): breakpoint()
 
         if self._dump_executor._shutdown:
             self._init_dump_executor()
