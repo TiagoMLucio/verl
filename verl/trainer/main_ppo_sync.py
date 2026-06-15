@@ -97,6 +97,7 @@ from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.ray_utils import auto_await
+from verl.utils.rollout_trace import RolloutTraceConfig
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
@@ -331,10 +332,21 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 
         trajectory_info = await get_trajectory_info(batch["global_steps"], batch["index"], validate)
 
+        # Select which samples to trace this step (mirrors AgentLoopWorker.generate_sequences):
+        # trace up to max_samples_per_step_per_worker unique samples per worker (None traces all).
+        raw_index = batch["index"]
+        index = list(raw_index.tolist()) if hasattr(raw_index, "tolist") else list(raw_index)
+        max_samples_per_worker = RolloutTraceConfig.get_instance().max_samples_per_step_per_worker
+        unique_indices = list(set(index))
+        if max_samples_per_worker is not None and max_samples_per_worker < len(unique_indices):
+            selected_samples = set(np.random.choice(unique_indices, max_samples_per_worker, replace=False).tolist())
+            traced_indices = {i for i in range(len(batch)) if index[i] in selected_samples}
+        else:
+            traced_indices = set(range(len(batch)))
+
         # create background tasks for each sample in the batch
         for i in range(len(batch)):
-            # TODO(wuxibin): add trace support
-            trace_this_sample = False
+            trace_this_sample = i in traced_indices
             prompt = {}
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
@@ -403,9 +415,11 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         )
 
         if final_output.reward_score is not None:
+            final_reward_extra_info = final_output.extra_fields.get("reward_extra_info")
             for output in outputs[:-1]:
                 output.reward_score = final_output.reward_score
-                output.extra_fields["reward_extra_info"] = final_output.extra_fields["reward_extra_info"]
+                if final_reward_extra_info is not None:
+                    output.extra_fields["reward_extra_info"] = final_reward_extra_info
 
         # NOTE: agent loop may has multiple outputs, put each output into TransferQueue.
         # key format: {uid}_{session_id}_{index}
@@ -1398,8 +1412,9 @@ class PPOTrainer:
             for i in range(batch_size)
         ]
 
+        extra_fields_list = list(data["extra_fields"])
+
         def _build_teacher_message(i: int) -> list[dict]:
-            system_messages = raw_prompts[i][:-1]
             has_solution = solution_strs[i] is not None
             has_feedback = feedback_list[i] is not None
             feedback_only_without_solution = self_distillation_cfg.get(
@@ -1418,6 +1433,24 @@ class PPOTrainer:
             if use_feedback:
                 feedback_section = self_distillation_cfg.feedback_template.format(feedback_raw=feedback_list[i])
 
+            # Per-segment teacher context: a condensation segment (segment_index > 0) was
+            # generated from a *condensed history*, not the original task. Build its teacher
+            # from that history + an appended augmentation turn, so teacher and student share
+            # the same context (differing only by feedback/solution). Segment 0 (and the
+            # no-condensation case) keeps the original single-turn reconstruction below.
+            ef = extra_fields_list[i] if isinstance(extra_fields_list[i], dict) else {}
+            segment_prompt = ef.get("segment_prompt")
+            if segment_prompt and ef.get("segment_index", 0):
+                if not (use_feedback or has_solution):
+                    return list(segment_prompt)
+                aug_text = self_distillation_cfg.reprompt_template.format(
+                    prompt="",
+                    solution=solution_section,
+                    feedback=feedback_section,
+                )
+                return list(segment_prompt) + [{"role": "user", "content": aug_text}]
+
+            system_messages = raw_prompts[i][:-1]
             if use_feedback or has_solution:
                 reprompt_text = self_distillation_cfg.reprompt_template.format(
                     prompt=prompt_texts[i],
@@ -1945,10 +1978,12 @@ class PPOTrainer:
                     self._shutdown_dump_executor()
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
+                    self.logger.finish()
                     return
 
         # Ensure dump executor is shut down when training loop ends without reaching is_last_step
         self._shutdown_dump_executor()
+        self.logger.finish()
 
     def step(self, batch_dict: dict, metrics: dict, timing_raw: dict) -> KVBatchMeta:
         # 1. put batch to agent loop manager

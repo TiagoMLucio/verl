@@ -185,7 +185,14 @@ class Tracking:
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
 
-    def __del__(self):
+    def finish(self):
+        # Finalize all backends. Idempotent so it is safe to call explicitly at the
+        # end of training (while the process is healthy) and again from __del__ at
+        # interpreter shutdown. Calling it explicitly avoids relying on a teardown
+        # that may run too late (e.g. inside a remote actor torn down abruptly).
+        if getattr(self, "_finished", False):
+            return
+        self._finished = True
         if "wandb" in self.logger:
             self.logger["wandb"].finish(exit_code=0)
         if "swanlab" in self.logger:
@@ -200,6 +207,9 @@ class Tracking:
             self.logger["trackio"].finish()
         if "file" in self.logger:
             self.logger["file"].finish()
+
+    def __del__(self):
+        self.finish()
 
 
 class ClearMLLogger:
