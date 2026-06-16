@@ -193,6 +193,17 @@ def compute_advantage_for_multi_trajectories(
     return data
 
 
+def _final_segment_local_indices(keys: list[str]) -> list[int]:
+    """Row index of each session's final segment, from {uid}_{session_id}_{index} keys."""
+    best: dict[str, tuple[int, int]] = {}
+    for row, key in enumerate(keys):
+        uid, session_id, index = key.rsplit("_", 2)
+        session_key = f"{uid}_{session_id}"
+        if session_key not in best or best[session_key][0] < int(index):
+            best[session_key] = (int(index), row)
+    return [row for _, row in best.values()]
+
+
 class ReplayBuffer:
     """Replay buffer periodically polls metadata from transfer queue.
 
@@ -1817,6 +1828,11 @@ class PPOTrainer:
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
         # 1. collect necessary fields from TransferQueue for computing metrics
         non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool)
+        # One row per trajectory = each session's final segment. Trajectory-level metrics
+        # (reward, num_turns) must use these, else they are weighted by segment count.
+        mb_keys = [k for k, keep in zip(batch.keys, non_padding_mask) if keep]
+        final_seg_idx = _final_segment_local_indices(mb_keys)
+        multi_segment = 0 < len(final_seg_idx) < len(mb_keys)
         fields = [
             "prompts",
             "responses",
@@ -1860,6 +1876,12 @@ class PPOTrainer:
         # 2. compute metrics
         metrics.update({"training/global_step": global_steps, "training/epoch": epoch})
         metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
+        if multi_segment:
+            # score/reward are per-trajectory; recompute their stats over final segments only.
+            per_traj = compute_data_metrics(batch=metrics_batch.select_idxs(final_seg_idx), use_critic=self.use_critic)
+            metrics.update(
+                {k: v for k, v in per_traj.items() if k.startswith(("critic/score/", "critic/rewards/"))}
+            )
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
         n_gpus = self.resource_pool_manager.get_n_gpus()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
@@ -1869,6 +1891,8 @@ class PPOTrainer:
         # 3. other auxiliary metrics
         if non_padding_mask.any():
             num_turns = num_turns[non_padding_mask]
+        if multi_segment:
+            num_turns = num_turns[final_seg_idx]  # per-trajectory (one per session)
         metrics.update(
             {
                 "training/num_turns/mean": num_turns.mean(),
