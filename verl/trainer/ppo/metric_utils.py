@@ -636,8 +636,9 @@ def process_validation_metrics(
             var_dict = uid_dict.setdefault(uid, {})
 
             for var_name, var_vals in var2vals.items():
-                # skip empty or string values
-                if not var_vals or isinstance(var_vals[0], str):
+                # skip empty, all-None, or string values (first non-None: errored rollouts pad None)
+                non_null = next((v for v in var_vals if v is not None), None)
+                if non_null is None or isinstance(non_null, str):
                     continue
 
                 # compute mean and std
