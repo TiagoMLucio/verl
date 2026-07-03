@@ -30,7 +30,7 @@ from omegaconf import DictConfig
 
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils.ray_utils import auto_await
-from verl.utils.rollout_trace import rollout_trace_op
+from verl.utils.rollout_trace import register_langfuse_op, rollout_trace_op
 from verl.workers.rollout.replica import RolloutReplica, TokenOutput, get_rollout_replica_class
 from verl.workers.rollout.utils import update_prometheus_config
 
@@ -141,6 +141,10 @@ class GlobalRequestLoadBalancer:
             "active_servers": len(self._inflight_requests),
             "registered_handles": list(self._servers.keys()),
         }
+
+
+# raw token-id I/O; readable decoded spans are emitted by the caller
+register_langfuse_op("LLMServerClient.generate", skip=True)
 
 
 class LLMServerClient:

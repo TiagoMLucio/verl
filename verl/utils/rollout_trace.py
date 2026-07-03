@@ -27,6 +27,30 @@ from verl.utils.ray_utils import get_event_loop
 _trace_enabled: ContextVar[bool] = ContextVar("_trace_enabled", default=True)
 _trace_attributes: ContextVar[dict | None] = ContextVar("_trace_attributes", default=None)
 
+# Per-op Langfuse rendering, registered by the modules defining traced ops (see register_langfuse_op).
+_LANGFUSE_OPS: dict[str, dict] = {}
+
+
+def register_langfuse_op(qualname, *, skip=False, no_io=False, as_type="span", root=False, name=None, output_fn=None):
+    """Customize how an ``@rollout_trace_op``-decorated op renders in Langfuse.
+
+    Args:
+        skip: Emit no span (e.g. raw token-id I/O with no tokenizer in scope).
+        no_io: Keep the span but drop input/output (payloads that stall the UI).
+        as_type: Langfuse observation type (default "span").
+        root: This op is the trace root; it sets the trace identity.
+        name: Span name (default: the qualname).
+        output_fn: Maps the op result to the span output.
+    """
+    _LANGFUSE_OPS[qualname] = {
+        "skip": skip,
+        "no_io": no_io,
+        "as_type": as_type,
+        "root": root,
+        "name": name or qualname,
+        "output_fn": output_fn,
+    }
+
 
 class RolloutTraceConfig:
     """Configuration for rollout tracing with various backends.
@@ -107,6 +131,11 @@ class RolloutTraceConfig:
             if context_vars.current_run.get() is None:
                 trackio.init(project=project_name, name=experiment_name, config={"framework": "verl"})
             config.client = trackio
+        elif backend == "langfuse":
+            from langfuse import Langfuse
+
+            # LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_HOST come from env.
+            config.client = Langfuse()
         else:
             config.client = None
 
@@ -191,6 +220,17 @@ def rollout_trace_attr(
                 yield
         finally:
             _trace_attributes.reset(token)
+    elif backend == "langfuse":
+        # no wrapper span: the registered root op sets the trace identity; just stash attrs + flush
+        client = RolloutTraceConfig.get_client()
+        try:
+            yield
+        finally:
+            try:
+                if client is not None:
+                    client.flush()
+            finally:
+                _trace_attributes.reset(token)
     else:
         try:
             yield
@@ -315,6 +355,122 @@ def _current_trace_attributes():
     return {**(_trace_attributes.get() or {})}
 
 
+def _apply_trace_identity(client):
+    """Set the trace identity (name/session/metadata/tags) from the stashed rollout attributes."""
+    attrs = _trace_attributes.get() or {}
+    si = attrs.get("sample_index")
+    metadata = {k: v for k, v in attrs.items() if k != "validate"}
+    tags = ["validate" if attrs.get("validate") else "train"]
+    try:
+        client.update_current_trace(
+            name="agent_loop",
+            session_id=str(si) if si is not None else None,
+            metadata=metadata,
+            tags=tags,
+        )
+    except Exception:
+        pass
+
+
+@contextlib.contextmanager
+def _langfuse_op_span(cfg, qualname, inputs):
+    """Open the langfuse span for a traced op per its registered rendering (shared by both wrappers)."""
+    client = RolloutTraceConfig.get_client()
+    seg = (_trace_attributes.get() or {}).get("segment_index")
+    with client.start_as_current_observation(
+        as_type=cfg.get("as_type", "span"),
+        name=cfg.get("name", qualname),
+        input=None if cfg.get("no_io") else inputs,
+        metadata={"segment_index": seg} if seg is not None else None,
+    ) as span:
+        if cfg.get("root"):
+            _apply_trace_identity(client)
+        try:
+            yield span
+        except Exception as e:
+            span.update(level="ERROR", status_message=str(e))
+            raise
+
+
+def rollout_trace_set_attr(key, value):
+    """Set an attribute on the active rollout trace (surfaces as langfuse span metadata)."""
+    attrs = dict(_trace_attributes.get() or {})
+    attrs[key] = value
+    _trace_attributes.set(attrs)
+
+
+def rollout_trace_event(name, metadata=None, input=None, output=None):
+    """Emit a zero-duration event observation on the active trace (langfuse only)."""
+    if RolloutTraceConfig.get_backend() != "langfuse":
+        return
+    client = RolloutTraceConfig.get_client()
+    if client is None:
+        return
+    try:
+        client.create_event(name=name, input=input, output=output, metadata=metadata)
+    except Exception:
+        pass
+
+
+def rollout_trace_tool(name, command=None, observation=None, status=None, execution_time=None):
+    """Record a decoded tool-call span on the active trace (langfuse only)."""
+    if RolloutTraceConfig.get_backend() != "langfuse":
+        return
+    client = RolloutTraceConfig.get_client()
+    if client is None:
+        return
+    with client.start_as_current_observation(as_type="tool", name=f"tool:{name}", input=command) as span:
+        try:
+            upd = {"output": observation, "metadata": {"status": status, "execution_time": execution_time}}
+            if status is not None and status != "ok":
+                upd["level"] = "ERROR"
+                upd["status_message"] = str(status)
+            span.update(**upd)
+        except Exception:
+            pass
+
+
+def rollout_trace_generation(name, model=None, input=None, output=None, usage=None):
+    """Record an LLM call as a generation observation with chat I/O and token usage (langfuse only)."""
+    if RolloutTraceConfig.get_backend() != "langfuse":
+        return
+    client = RolloutTraceConfig.get_client()
+    if client is None:
+        return
+    with client.start_as_current_observation(as_type="generation", name=name, model=model, input=input) as gen:
+        try:
+            upd = {}
+            if output is not None:
+                upd["output"] = output
+            if usage is not None:
+                upd["usage_details"] = usage
+            if upd:
+                gen.update(**upd)
+        except Exception:
+            pass
+
+
+def rollout_trace_score(name, value, comment=None, data_type=None):
+    """Attach a typed score to the active trace (langfuse only; never raises)."""
+    if RolloutTraceConfig.get_backend() != "langfuse":
+        return
+    client = RolloutTraceConfig.get_client()
+    if client is None:
+        return
+    kw = {"name": name, "value": value}
+    if comment is not None:
+        kw["comment"] = comment
+    if data_type is not None:
+        kw["data_type"] = data_type
+    try:
+        if hasattr(client, "score_current_trace"):
+            client.score_current_trace(**kw)
+        else:
+            client.create_score(trace_id=client.get_current_trace_id(), **kw)
+    except Exception:
+        pass
+
+
 def rollout_trace_op(func):
     @functools.wraps(func)
     async def async_wrapper(self, *args, **kwargs):
@@ -397,6 +553,23 @@ def rollout_trace_op(func):
                 _log_trackio_trace(func.__qualname__, inputs, exception=e)
                 raise e
 
+        elif backend == "langfuse":
+            cfg = _LANGFUSE_OPS.get(func.__qualname__) or {}
+            if cfg.get("skip"):
+                return await func(self, *args, **kwargs)
+            with _langfuse_op_span(cfg, func.__qualname__, inputs) as span:
+                result = await func(self, *args, **kwargs)
+                output_fn = cfg.get("output_fn")
+                if cfg.get("no_io"):
+                    pass
+                elif output_fn is not None:
+                    span.update(output=output_fn(result))
+                elif enable_token2text:
+                    span.update(output=await add_token2text(self, result))
+                else:
+                    span.update(output=result)
+                return result
+
         else:
             return await func(self, *args, **kwargs)
 
@@ -439,6 +612,20 @@ def rollout_trace_op(func):
             except Exception as e:
                 _log_trackio_trace(func.__qualname__, inputs, exception=e)
                 raise e
+        elif backend == "langfuse":
+            cfg = _LANGFUSE_OPS.get(func.__qualname__) or {}
+            if cfg.get("skip"):
+                return func(self, *args, **kwargs)
+            with _langfuse_op_span(cfg, func.__qualname__, inputs) as span:
+                result = func(self, *args, **kwargs)
+                output_fn = cfg.get("output_fn")
+                if cfg.get("no_io"):
+                    pass
+                elif output_fn is not None:
+                    span.update(output=output_fn(result))
+                else:
+                    span.update(output=result)
+                return result
         else:
             return func(self, *args, **kwargs)
 
