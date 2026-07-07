@@ -38,7 +38,7 @@ from verl.trainer.ppo.utils import need_reward_model
 from verl.utils import normalize_token_ids
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.profiler import marked_timer
-from verl.utils.rollout_trace import rollout_trace_op
+from verl.utils.rollout_trace import register_langfuse_op, rollout_trace_op
 from verl.utils.skip import SkipManager
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
@@ -47,6 +47,10 @@ from verl.workers.rollout.utils import update_prometheus_config
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+# raw token-id I/O, same as the parent (skip registrations do not inherit across qualnames)
+register_langfuse_op("FullyAsyncLLMServerClient.generate", skip=True)
 
 
 class FullyAsyncLLMServerClient(LLMServerClient):
