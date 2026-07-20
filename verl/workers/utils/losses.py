@@ -157,7 +157,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     return policy_loss, metrics
 
 
-def _sdpo_response_topk_indices_to_no_padding(data: TensorDict, logits: torch.Tensor) -> Optional[torch.Tensor]:
+def _sdpo_response_topk_indices_to_no_padding(
+    data: TensorDict, logits: torch.Tensor, logits_keep_idx: Optional[torch.Tensor] = None
+) -> Optional[torch.Tensor]:
     """Map padded response top-k indices onto the flattened no-padding sequence."""
     topk_indices = tu.get(data, "student_topk_indices", default=None)
     if topk_indices is None:
@@ -179,6 +181,8 @@ def _sdpo_response_topk_indices_to_no_padding(data: TensorDict, logits: torch.Te
 
     indices = tu.get_non_tensor_data(data=data, key="indices", default=None)
     gathered_indices = index_first_axis(rearrange(full_topk_indices, "b s k -> (b s) k"), indices)
+    if logits_keep_idx is not None:
+        gathered_indices = gathered_indices[logits_keep_idx]
     sp_size = tu.get_non_tensor_data(data=data, key="sp_size", default=1)
     if sp_size > 1:
         from verl.utils.ulysses import slice_input_tensor
@@ -204,13 +208,20 @@ def _sdpo_logits_processor(student_logits: torch.Tensor, sdpo_config) -> dict:
 def _sdpo_teacher_extractor(
     student_logits: Optional[torch.Tensor] = None,
     data=None,
+    logits_keep_idx: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> dict | tuple[torch.Tensor, dict]:
-    """Teacher logits processor for full-vocab or student-top-k SDPO targets."""
+    """Teacher logits processor for full-vocab or student-top-k SDPO targets.
+
+    With ``logits_keep_idx``, ``student_logits`` holds only those packed positions
+    (span-only lm_head) and the top-k index map is subset accordingly.
+    """
     if student_logits is None:
         return torch.tensor(1.0, device=get_device_name()), {}
     logits = student_logits.squeeze(0)
-    topk_indices = _sdpo_response_topk_indices_to_no_padding(data=data, logits=logits)
+    topk_indices = _sdpo_response_topk_indices_to_no_padding(
+        data=data, logits=logits, logits_keep_idx=logits_keep_idx
+    )
     if topk_indices is None:
         return {"all_logps": torch.log_softmax(logits, dim=-1)}
     topk_logits = torch.gather(logits, dim=-1, index=topk_indices)
@@ -331,13 +342,17 @@ def sdpo_ppo_loss(
     entropy = model_output.get("entropy", None)
     if entropy is not None:
         entropy = no_padding_2_padding(entropy, data)
+        # span-only update: entropy exists only at hinted-span positions, so average there
+        entropy_mask = response_mask
+        if "logits_keep_positions" in data.keys() and self_distillation_mask is not None and self_distillation_mask.dim() > 1:
+            entropy_mask = response_mask * self_distillation_mask
         # a 0 batch_num_tokens would make entropy_loss inf with NaN grads (entropy connects to the graph unmasked)
         entropy_gbi = dict(config.global_batch_info or {})
         if not entropy_gbi.get("batch_num_tokens"):
-            entropy_gbi["batch_num_tokens"] = response_mask.sum().clamp(min=1.0)
+            entropy_gbi["batch_num_tokens"] = entropy_mask.sum().clamp(min=1.0)
         entropy_loss = agg_loss(
             loss_mat=entropy,
-            loss_mask=response_mask,
+            loss_mask=entropy_mask,
             loss_agg_mode=config.loss_agg_mode,
             **entropy_gbi,
         )

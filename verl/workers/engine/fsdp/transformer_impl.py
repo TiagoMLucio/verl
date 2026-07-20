@@ -1010,6 +1010,20 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 "position_ids": position_ids_rmpad,
             }
 
+            # Row-relative positions to keep at the lm_head; HF's tensor `logits_to_keep`
+            # indexes the packed sequence dim.
+            keep_positions = micro_batch.get("logits_keep_positions", None)
+            if keep_positions is not None:
+                assert not self.use_ulysses_sp, "logits_keep_positions does not support ulysses sp"
+                assert not use_fused_kernels, "logits_keep_positions does not support fused kernels"
+                offsets = input_ids.offsets()
+                keep_idx = keep_positions.values() + offsets[:-1].repeat_interleave(
+                    keep_positions.offsets().diff()
+                )
+                model_inputs["logits_to_keep"] = keep_idx
+                output_args["logits_keep_idx"] = keep_idx
+                output_args["total_nnz"] = int(offsets[-1])
+
         else:
             if pad_mode == DatasetPadMode.NO_PADDING:
                 input_ids = micro_batch["input_ids"]
@@ -1112,7 +1126,14 @@ class FSDPEngineWithLMHead(FSDPEngine):
                                 v = gather_outputs_and_unpad(v, gather_dim=0, unpad_dim=0, padding_size=pad_size)
                             model_output[field_name] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
             else:
-                logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                keep_idx = output_args.get("logits_keep_idx")
+                labels_rmpad = input_ids_rmpad_rolled
+                if keep_idx is not None:
+                    assert not calculate_sum_pi_squared, "logits_keep_positions does not support sum_pi_squared"
+                    temperature_rmpad = temperature_rmpad[keep_idx]
+                    labels_rmpad = labels_rmpad[keep_idx]
+
+                logits_rmpad = output.logits.squeeze(0)  # (total_nnz or n_keep, vocab_size)
                 logits_rmpad.div_(temperature_rmpad.clamp(min=1e-8).unsqueeze(-1).to(logits_rmpad.dtype))
 
                 # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
@@ -1121,9 +1142,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     inplace_backward = False
                 log_probs = logprobs_from_logits(
                     logits=logits_rmpad,
-                    labels=input_ids_rmpad_rolled,
+                    labels=labels_rmpad,
                     inplace_backward=inplace_backward,
                 )
+                if keep_idx is not None:
+                    log_probs = log_probs.new_zeros(output_args["total_nnz"]).index_copy_(0, keep_idx, log_probs)
 
                 # compute entropy
                 if calculate_entropy:
@@ -1133,6 +1156,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         entropy_rmpad = torch.utils.checkpoint.checkpoint(
                             self.compute_entropy_from_logits, logits_rmpad
                         )
+                    if keep_idx is not None:
+                        entropy_rmpad = entropy_rmpad.new_zeros(output_args["total_nnz"]).index_copy_(
+                            0, keep_idx, entropy_rmpad
+                        )
 
                 # compute sum_pi_squared (Σπ²) for optimal-baseline advantage estimators
                 if calculate_sum_pi_squared:
@@ -1140,10 +1167,15 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
                 # logits_processor_func return tensors with shape (1, total_nnz/sp_size)
                 if distillation_use_topk:
-                    outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
+                    processor_kwargs = {} if keep_idx is None else {"logits_keep_idx": keep_idx}
+                    outputs = logits_processor_func(
+                        student_logits=logits_rmpad.unsqueeze(0), data=micro_batch, **processor_kwargs
+                    )
                     cu_seqlens = input_ids.offsets()
                     for k, v in outputs.items():
                         v = v.squeeze(0)
+                        if keep_idx is not None:
+                            v = v.new_zeros((output_args["total_nnz"], *v.shape[1:])).index_copy_(0, keep_idx, v)
                         assert v.shape[0] == log_probs.shape[0], (
                             f"log_probs shape: {log_probs.shape}, {k} shape: {v.shape}"
                         )

@@ -119,6 +119,17 @@ def construct_minimal_padding_template(
     else:
         template_sample.pop("routed_experts", None)
 
+    # SDPO teacher fields precede balancing; a real row's spans on the 1-token stub poison the turn-mode teacher scatter
+    if "teacher_input_ids" in template_sample:
+        template_sample["teacher_input_ids"] = input_ids.clone()
+    if "teacher_seq_meta" in template_sample:
+        template_sample["teacher_seq_meta"] = torch.tensor([1, 0, 0, 1], dtype=torch.int64)
+    if "self_distillation_mask" in template_sample:
+        sd_mask = template_sample["self_distillation_mask"]
+        template_sample["self_distillation_mask"] = (
+            torch.zeros_like(sd_mask) if sd_mask.dim() == 0 else torch.zeros(1, dtype=sd_mask.dtype)
+        )
+
     # Padding flag is deployed to protect metrics calculation (e.g. response length, score, reward).
     template_tag.update(is_padding=True, prompt_len=1, response_len=1, seq_len=2)
     return template_sample, template_tag

@@ -99,12 +99,22 @@ def explode_turn_teacher_rows(
     mask_list = response_mask.unbind()
 
     sub_seqs, sub_resps, sub_masks, parents, spans = [], [], [], [], []
+    resp_list = responses.unbind()
+    assert len(seq_list) == len(resp_list), (
+        f"teacher rows ({len(seq_list)}) and responses ({len(resp_list)}) disagree on batch size"
+    )
     for i, (seq, meta) in enumerate(zip(seq_list, meta_list, strict=True)):
         flat = meta.tolist()
         body_len, triples = flat[0], flat[1:]
         assert len(triples) % 3 == 0 and 0 < body_len <= seq.shape[0], (
             f"teacher_seq_meta malformed for sample {i}: body_len {body_len}, "
             f"seq len {seq.shape[0]}, {len(triples)} span ints"
+        )
+        span_ends = triples[2::3]
+        assert not span_ends or max(span_ends) <= resp_list[i].shape[0], (
+            f"teacher_seq_meta spans exceed the response row for sample {i}: "
+            f"max span end {max(span_ends)} > response len {resp_list[i].shape[0]} "
+            f"(meta {flat}, response lens {[r.shape[0] for r in resp_list]})"
         )
         sub_seqs.append(seq)
         sub_resps.append(seq[-body_len:])
@@ -121,6 +131,44 @@ def explode_turn_teacher_rows(
     )
 
 
+def _keep_positions(prefix_lens: torch.Tensor, spans_per_row: list[list[tuple[int, int]]]) -> torch.Tensor:
+    """Row-relative logits positions for (offset, length) spans past each row's prefix,
+    shifted -1 because position k predicts token k+1 (matches no_padding_2_padding)."""
+    rows = []
+    for prefix_len, row_spans in zip(prefix_lens.tolist(), spans_per_row, strict=True):
+        rows.append(
+            torch.cat([torch.arange(prefix_len + off - 1, prefix_len + off - 1 + length) for off, length in row_spans])
+        )
+    return torch.nested.nested_tensor(rows, layout=torch.jagged)
+
+
+def turn_keep_positions(
+    sub_seqs: torch.Tensor, sub_resps: torch.Tensor, spans: list[list[tuple[int, int, int]]]
+) -> torch.Tensor:
+    """Logits positions scoring the hinted spans on the spliced teacher rows."""
+    prefix_lens = sub_seqs.offsets().diff() - sub_resps.offsets().diff()
+    return _keep_positions(prefix_lens, [[(bs, e - s) for bs, s, e in triples] for triples in spans])
+
+
+def response_keep_positions(
+    input_ids: torch.Tensor, responses: torch.Tensor, teacher_seq_meta: torch.Tensor
+) -> torch.Tensor:
+    """Logits positions scoring the hinted spans on the student's own prompt+response rows."""
+    prefix_lens = input_ids.offsets().diff() - responses.offsets().diff()
+    spans = []
+    for meta in teacher_seq_meta.unbind():
+        triples = meta.tolist()[1:]
+        spans.append([(s, e - s) for s, e in zip(triples[1::3], triples[2::3])])
+    return _keep_positions(prefix_lens, spans)
+
+
+def attach_response_keep_positions(data) -> None:
+    """Mark the SDPO update pass for span-only logits when turn-mode teacher meta is present."""
+    turn_meta = data.get("teacher_seq_meta", None)
+    if turn_meta is not None and turn_meta.is_nested:
+        data["logits_keep_positions"] = response_keep_positions(data["input_ids"], data["responses"], turn_meta)
+
+
 def scatter_turn_teacher_outputs(
     sub_outputs: torch.Tensor,
     parents: list[int],
@@ -135,6 +183,13 @@ def scatter_turn_teacher_outputs(
     full = sub_outputs.new_zeros((batch_size, response_length, *sub_outputs.shape[2:]))
     for j, (parent, triples) in enumerate(zip(parents, spans, strict=True)):
         for body_start, start, end in triples:
+            if parent >= batch_size or end > response_length or sub_outputs.dim() < 2:
+                raise RuntimeError(
+                    "scatter_turn_teacher_outputs misalignment: "
+                    f"row j={j} parent={parent} span=({body_start},{start},{end}) vs "
+                    f"grid=({batch_size},{response_length}) sub_outputs={tuple(sub_outputs.shape)} "
+                    f"n_parents={len(parents)} all_spans={spans}"
+                )
             full[parent, start:end] = sub_outputs[j, body_start : body_start + (end - start)]
     return full
 

@@ -56,10 +56,12 @@ from verl.workers.utils.losses import _sdpo_teacher_extractor, ppo_loss, sdpo_pp
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 from verl.workers.utils.sdpo import (
     TrustRegionTeacher,
+    attach_response_keep_positions,
     explode_turn_teacher_rows,
     has_non_empty_multi_modal_inputs,
     reconstruct_padded_teacher_from_nested,
     scatter_turn_teacher_outputs,
+    turn_keep_positions,
 )
 
 logger = logging.getLogger(__file__)
@@ -703,6 +705,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         from verl.utils.debug_breakpoints import should_break
         if should_break("update_actor"): breakpoint()
 
+        if self.sdpo_enabled:
+            attach_response_keep_positions(data)
+
         output = self.actor.train_mini_batch(data=data)
         if self.sdpo_enabled and tu.get_non_tensor_data(output, "did_update", default=True):
             self._update_teacher_ema()
@@ -825,6 +830,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             "distillation_use_topk": use_logits_processor,
         }
         tu.assign_non_tensor(teacher_td, **default_keys)
+
+        # Span-only lm_head: only hinted-span positions are ever consumed in turn mode.
+        if parents is not None:
+            teacher_td["logits_keep_positions"] = turn_keep_positions(sub_seqs, sub_resps, spans)
 
         # When full-logit distillation is on (top-k or all-vocab), run the teacher
         # extractor as the engine's logits processor; otherwise only plain log_probs

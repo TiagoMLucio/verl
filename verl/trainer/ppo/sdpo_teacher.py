@@ -137,6 +137,30 @@ def select_hinted_turns(
     return hinted
 
 
+# Render-suffix over this probe yields the exact mid-conversation fragment (auto system blocks cancel in the prefix).
+_TEMPLATE_PROBE = [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}]
+
+
+def _template_suffix(tokenizer, messages=(), add_generation_prompt=False) -> str:
+    base = tokenizer.apply_chat_template(_TEMPLATE_PROBE, tokenize=False, add_generation_prompt=False)
+    full = tokenizer.apply_chat_template(
+        _TEMPLATE_PROBE + list(messages), tokenize=False, add_generation_prompt=add_generation_prompt
+    )
+    assert full.startswith(base), "chat template does not render conversations as extendable prefixes"
+    return full[len(base) :]
+
+
+def assistant_header_ids(tokenizer) -> list[int]:
+    """Token ids of the template's assistant generation header (e.g. ``<|im_start|>assistant\\n``)."""
+    return tokenizer.encode(_template_suffix(tokenizer, add_generation_prompt=True), add_special_tokens=False)
+
+
+def hint_user_turn_ids(tokenizer, hint_text: str) -> list[int]:
+    """Token ids of ``hint_text`` rendered as a full user turn of the tokenizer's chat template."""
+    suffix = _template_suffix(tokenizer, messages=[{"role": "user", "content": hint_text}])
+    return tokenizer.encode(suffix, add_special_tokens=False)
+
+
 def build_spliced_teacher_row(
     prompt_ids: torch.Tensor,
     response_ids: torch.Tensor,
@@ -157,20 +181,34 @@ def build_spliced_teacher_row(
     response span [start, end) to its position inside the body, and the fallback count.
     """
     prefix = prompt_ids if prompt_ids.shape[0] <= max_prefix_len else prompt_ids[-max_prefix_len:]
+    h = header_ids.shape[0]
     chunks: list[torch.Tensor] = []
     meta: list[int] = []
-    cursor = body_len = 0
+    cursor = body_len = fallbacks = 0
     for (_, start, end, _), hint_ids in zip(hinted_turns, hint_ids_list, strict=True):
         assert cursor <= start, f"hinted turns must be ordered and disjoint: cursor {cursor} > start {start}"
-        chunks.append(response_ids[cursor:start])
-        body_len += start - cursor
-        chunks.append(hint_ids.to(response_ids.dtype))
-        body_len += hint_ids.shape[0]
+        hint_ids = hint_ids.to(response_ids.dtype)
+        if start - h >= cursor and torch.equal(response_ids[start - h : start], header_ids):
+            insert_at = start - h
+        elif start == cursor == 0 and prefix.shape[0] >= h and torch.equal(prefix[-h:], header_ids):
+            # first turn: its assistant header is the prompt tail, so the hint joins the prefix
+            prefix = torch.cat([prefix[:-h], hint_ids, prefix[-h:]])
+            insert_at = None
+        else:
+            insert_at = start
+            fallbacks += 1
+        if insert_at is not None:
+            chunks.append(response_ids[cursor:insert_at])
+            body_len += insert_at - cursor
+            chunks.append(hint_ids)
+            body_len += hint_ids.shape[0]
+            chunks.append(response_ids[insert_at:start])
+            body_len += start - insert_at
         meta.extend([body_len, start, end])
         chunks.append(response_ids[start:end])
         body_len += end - start
         cursor = end
-    return torch.cat([prefix, *chunks]), [body_len, *meta]
+    return torch.cat([prefix, *chunks]), [body_len, *meta], fallbacks
 
 
 def turn_token_mask(response_len: int, hinted_turns: list[tuple[int, int, int, str]]) -> torch.Tensor:
