@@ -60,6 +60,8 @@ def reconstruct_padded_teacher_from_nested(
     teacher_prompt_mask = torch.zeros((batch_size, max_prompt_len), device=device, dtype=mask_dtype)
     responses_padded = torch.full((batch_size, max_response_len), pad_token_id, device=device, dtype=id_dtype)
     response_mask_padded = torch.zeros((batch_size, max_response_len), device=device, dtype=mask_dtype)
+    # presence, not loss, mask: the teacher must attend to tool-observation tokens that response_mask zeroes
+    response_presence_padded = torch.zeros((batch_size, max_response_len), device=device, dtype=mask_dtype)
 
     for i in range(batch_size):
         prompt_len, response_len = prompt_lens[i], response_lens[i]
@@ -69,12 +71,72 @@ def reconstruct_padded_teacher_from_nested(
         # right-pad the response, mirroring the rollout response layout
         responses_padded[i, :response_len] = response_list[i]
         response_mask_padded[i, :response_len] = response_mask_list[i]
+        response_presence_padded[i, :response_len] = 1
 
     teacher_input_ids = torch.cat([teacher_prompt_padded, responses_padded], dim=1)
-    teacher_attention_mask = torch.cat([teacher_prompt_mask, response_mask_padded], dim=1)
+    teacher_attention_mask = torch.cat([teacher_prompt_mask, response_presence_padded], dim=1)
     teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
 
     return teacher_input_ids, teacher_attention_mask, teacher_position_ids, responses_padded, response_mask_padded
+
+
+def explode_turn_teacher_rows(
+    teacher_input_ids: torch.Tensor,
+    teacher_seq_meta: torch.Tensor,
+    responses: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int], list[list[tuple[int, int, int]]]]:
+    """Unpack per-sample spliced teacher rows into the sub-batch the teacher forward scores.
+
+    ``teacher_seq_meta`` is flat per sample: [body_len, then (body_start, start, end) per scored
+    span]. The body (the sequence's verbatim tail: response chunks with hints spliced before
+    their turns) becomes the sub-row's response, so the padded-reconstruction contract holds.
+    Returns nested sequences / bodies / body masks plus, per sub-row, the parent sample index
+    and its span triples mapping body positions to the response grid.
+    """
+    seq_list = teacher_input_ids.unbind()
+    meta_list = teacher_seq_meta.unbind()
+    mask_list = response_mask.unbind()
+
+    sub_seqs, sub_resps, sub_masks, parents, spans = [], [], [], [], []
+    for i, (seq, meta) in enumerate(zip(seq_list, meta_list, strict=True)):
+        flat = meta.tolist()
+        body_len, triples = flat[0], flat[1:]
+        assert len(triples) % 3 == 0 and 0 < body_len <= seq.shape[0], (
+            f"teacher_seq_meta malformed for sample {i}: body_len {body_len}, "
+            f"seq len {seq.shape[0]}, {len(triples)} span ints"
+        )
+        sub_seqs.append(seq)
+        sub_resps.append(seq[-body_len:])
+        sub_masks.append(mask_list[i].new_ones(body_len))
+        parents.append(i)
+        spans.append([(triples[k], triples[k + 1], triples[k + 2]) for k in range(0, len(triples), 3)])
+
+    return (
+        torch.nested.nested_tensor(sub_seqs, layout=torch.jagged),
+        torch.nested.nested_tensor(sub_resps, layout=torch.jagged),
+        torch.nested.nested_tensor(sub_masks, layout=torch.jagged),
+        parents,
+        spans,
+    )
+
+
+def scatter_turn_teacher_outputs(
+    sub_outputs: torch.Tensor,
+    parents: list[int],
+    spans: list[list[tuple[int, int, int]]],
+    batch_size: int,
+    response_length: int,
+) -> torch.Tensor:
+    """Scatter padded spliced-body teacher outputs back onto the (batch, response) grid.
+
+    Positions outside the scored spans stay zero; the per-token distillation mask excludes them.
+    """
+    full = sub_outputs.new_zeros((batch_size, response_length, *sub_outputs.shape[2:]))
+    for j, (parent, triples) in enumerate(zip(parents, spans, strict=True)):
+        for body_start, start, end in triples:
+            full[parent, start:end] = sub_outputs[j, body_start : body_start + (end - start)]
+    return full
 
 
 def has_non_empty_multi_modal_inputs(data) -> bool:

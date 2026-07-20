@@ -1213,6 +1213,7 @@ def compute_self_distillation_loss(
     self_distillation_mask: Optional[torch.Tensor] = None,
     loss_agg_mode: str = "token-mean",
     rollout_is_weights: Optional[torch.Tensor] = None,
+    global_batch_info: Optional[dict[str, Any]] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Compute the SDPO distillation loss for actor updates.
 
@@ -1226,7 +1227,8 @@ def compute_self_distillation_loss(
         teacher_all_log_probs: Optional teacher full-vocab log-probabilities for full-logit distillation.
         student_topk_log_probs: Optional student top-k log-probabilities for top-k distillation.
         teacher_topk_log_probs: Optional teacher top-k log-probabilities for top-k distillation.
-        self_distillation_mask: Optional per-sample SDPO mask; masked samples are excluded from distillation.
+        self_distillation_mask: Optional SDPO mask, per-sample (batch_size,) or per-token
+            (batch_size, response_length); masked positions are excluded from distillation.
         loss_agg_mode: Loss aggregation mode.
         rollout_is_weights: Optional rollout correction IS weights.
 
@@ -1240,7 +1242,10 @@ def compute_self_distillation_loss(
 
     loss_mask = response_mask
     if self_distillation_mask is not None:
-        loss_mask = loss_mask * self_distillation_mask.unsqueeze(1)
+        # per-sample scalar (batch,) or per-token (batch, response_len) from turn-feedback mode
+        if self_distillation_mask.dim() == 1:
+            self_distillation_mask = self_distillation_mask.unsqueeze(1)
+        loss_mask = loss_mask * self_distillation_mask
 
     distill_variant = "rkl_token"
     if self_distillation_config.full_logit_distillation:
@@ -1327,12 +1332,16 @@ def compute_self_distillation_loss(
     if rollout_is_weights is not None:
         per_token_loss = per_token_loss * rollout_is_weights
 
-    loss = agg_loss(
-        loss_mat=per_token_loss,
-        loss_mask=loss_mask,
-        loss_agg_mode=loss_agg_mode,
-        batch_num_tokens=loss_mask.sum().clamp(min=1.0),
-    )
+    # truthiness: zero-supervised minis all-reduce batch_num_tokens to 0; the clamped fallback yields 0 loss, not NaN
+    if global_batch_info is not None and global_batch_info.get("batch_num_tokens"):
+        loss = agg_loss(loss_mat=per_token_loss, loss_mask=loss_mask, loss_agg_mode=loss_agg_mode, **global_batch_info)
+    else:
+        loss = agg_loss(
+            loss_mat=per_token_loss,
+            loss_mask=loss_mask,
+            loss_agg_mode=loss_agg_mode,
+            batch_num_tokens=loss_mask.sum().clamp(min=1.0),
+        )
     metrics.update(
         {
             "self_distillation/loss": loss.detach().item(),

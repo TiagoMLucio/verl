@@ -442,13 +442,69 @@ def rollout_trace_set_attr(key, value):
     _trace_attributes.set(attrs)
 
 
+def _langfuse_client():
+    """The langfuse client when tracing is active, else None. All rollout_trace_* helpers
+    are no-ops without it and swallow client errors: tracing must never break a rollout."""
+    if not _trace_enabled.get() or RolloutTraceConfig.get_backend() != "langfuse":
+        return None
+    return RolloutTraceConfig.get_client()
+
+
+def _drop_none(**kwargs):
+    return {k: v for k, v in kwargs.items() if v is not None}
+
+
+def rollout_trace_update_trace(input=None, output=None, metadata=None, tags=None):
+    """Update the active trace's input/output/metadata/tags."""
+    client = _langfuse_client()
+    kw = _drop_none(input=input, output=output, metadata=metadata, tags=tags)
+    if client is None or not kw:
+        return
+    try:
+        client.update_current_trace(**kw)
+    except Exception:
+        pass
+
+
+def rollout_trace_update_span(input=None, output=None, metadata=None):
+    """Update the active span's input/output/metadata."""
+    client = _langfuse_client()
+    kw = _drop_none(input=input, output=output, metadata=metadata)
+    if client is None or not kw:
+        return
+    try:
+        client.update_current_span(**kw)
+    except Exception:
+        pass
+
+
+@contextlib.contextmanager
+def rollout_trace_span(name, input=None, metadata=None, as_type="span"):
+    """Open an observation for an inline block. Yields the span, or None when untraced;
+    callers may ``span.update(output=...)``. Exceptions mark the span ERROR and propagate."""
+    client = _langfuse_client()
+    if client is None:
+        yield None
+        return
+    try:
+        cm = client.start_as_current_observation(as_type=as_type, name=name, input=input, metadata=metadata)
+    except Exception:
+        yield None
+        return
+    with cm as span:
+        try:
+            yield span
+        except Exception as e:
+            try:
+                span.update(level="ERROR", status_message=str(e))
+            except Exception:
+                pass
+            raise
+
+
 def rollout_trace_event(name, metadata=None, input=None, output=None):
-    """Emit a zero-duration event observation on the active trace (langfuse only)."""
-    if not _trace_enabled.get():
-        return
-    if RolloutTraceConfig.get_backend() != "langfuse":
-        return
-    client = RolloutTraceConfig.get_client()
+    """Emit a zero-duration event observation on the active trace."""
+    client = _langfuse_client()
     if client is None:
         return
     try:
@@ -458,21 +514,13 @@ def rollout_trace_event(name, metadata=None, input=None, output=None):
 
 
 def rollout_trace_generation(name, model=None, input=None, output=None, usage=None):
-    """Record an LLM call as a generation observation with chat I/O and token usage (langfuse only)."""
-    if not _trace_enabled.get():
-        return
-    if RolloutTraceConfig.get_backend() != "langfuse":
-        return
-    client = RolloutTraceConfig.get_client()
+    """Record an LLM call as a generation observation with chat I/O and token usage."""
+    client = _langfuse_client()
     if client is None:
         return
     try:
         with client.start_as_current_observation(as_type="generation", name=name, model=model, input=input) as gen:
-            upd = {}
-            if output is not None:
-                upd["output"] = output
-            if usage is not None:
-                upd["usage_details"] = usage
+            upd = _drop_none(output=output, usage_details=usage)
             if upd:
                 gen.update(**upd)
     except Exception:
@@ -480,19 +528,11 @@ def rollout_trace_generation(name, model=None, input=None, output=None, usage=No
 
 
 def rollout_trace_score(name, value, comment=None, data_type=None):
-    """Attach a typed score to the active trace (langfuse only; never raises)."""
-    if not _trace_enabled.get():
-        return
-    if RolloutTraceConfig.get_backend() != "langfuse":
-        return
-    client = RolloutTraceConfig.get_client()
+    """Attach a typed score to the active trace."""
+    client = _langfuse_client()
     if client is None:
         return
-    kw = {"name": name, "value": value}
-    if comment is not None:
-        kw["comment"] = comment
-    if data_type is not None:
-        kw["data_type"] = data_type
+    kw = {"name": name, "value": value, **_drop_none(comment=comment, data_type=data_type)}
     try:
         if hasattr(client, "score_current_trace"):
             client.score_current_trace(**kw)

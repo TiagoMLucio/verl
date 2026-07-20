@@ -56,8 +56,10 @@ from verl.workers.utils.losses import _sdpo_teacher_extractor, ppo_loss, sdpo_pp
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 from verl.workers.utils.sdpo import (
     TrustRegionTeacher,
+    explode_turn_teacher_rows,
     has_non_empty_multi_modal_inputs,
     reconstruct_padded_teacher_from_nested,
+    scatter_turn_teacher_outputs,
 )
 
 logger = logging.getLogger(__file__)
@@ -729,7 +731,41 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # sequence as a nested (no-padding) tensor and we rebuild the padded layout here, while
         # the legacy path already carries the padded teacher tensors (and precomputed mask/pos).
         teacher_input_ids = data["teacher_input_ids"]
-        if teacher_input_ids.is_nested:
+        turn_meta = tu.get(data, "teacher_seq_meta", default=None)
+        parents = spans = None
+        if teacher_input_ids.is_nested and turn_meta is not None:
+            # Turn mode: score each spliced sequence's body, then scatter the span outputs back to the response grid.
+            batch_size = data["responses"].size(0)
+            full_response_length = max(r.shape[0] for r in data["responses"].unbind())
+            sub_seqs, sub_resps, sub_masks, parents, spans = explode_turn_teacher_rows(
+                teacher_input_ids=teacher_input_ids,
+                teacher_seq_meta=turn_meta,
+                responses=data["responses"],
+                response_mask=data["response_mask"],
+            )
+            (
+                teacher_input_ids,
+                teacher_attention_mask,
+                teacher_position_ids,
+                responses,
+                response_mask,
+            ) = reconstruct_padded_teacher_from_nested(
+                teacher_input_ids=sub_seqs,
+                responses=sub_resps,
+                response_mask=sub_masks,
+                pad_token_id=tu.get_non_tensor_data(data=data, key="pad_token_id", default=0),
+            )
+            if student_topk_indices is not None:
+                sub_indices = student_topk_indices.new_zeros(
+                    (len(parents), responses.shape[1], student_topk_indices.shape[-1])
+                )
+                for j, (parent, triples) in enumerate(zip(parents, spans, strict=True)):
+                    for body_start, start, end in triples:
+                        sub_indices[j, body_start : body_start + (end - start)] = student_topk_indices[
+                            parent, start:end
+                        ]
+                student_topk_indices = sub_indices
+        elif teacher_input_ids.is_nested:
             (
                 teacher_input_ids,
                 teacher_attention_mask,
@@ -781,7 +817,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             ),
             "use_dynamic_bsz": False,
             "max_token_len_per_gpu": None,
-            "micro_batch_size_per_gpu": data.batch_size[0],
+            "micro_batch_size_per_gpu": responses.shape[0],
             "use_fused_kernels": tu.get_non_tensor_data(
                 data=data, key="use_fused_kernels", default=self.ref.engine_config.use_fused_kernels
             ),
@@ -798,11 +834,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with self.ref.engine.eval_mode(disable_auto_offload=False):
             output = self.ref.engine.infer_batch(teacher_td, loss_function=loss_function)
         model_output = output["model_output"]
-        result = {"teacher_log_probs": no_padding_2_padding(model_output["log_probs"], teacher_td).float()}
+
+        def to_response_grid(values: torch.Tensor) -> torch.Tensor:
+            padded = no_padding_2_padding(values, teacher_td).float()
+            if parents is None:
+                return padded
+            return scatter_turn_teacher_outputs(padded, parents, spans, batch_size, full_response_length)
+
+        result = {"teacher_log_probs": to_response_grid(model_output["log_probs"])}
         if return_all_logps:
-            result["teacher_all_log_probs"] = no_padding_2_padding(model_output["all_logps"], teacher_td).float()
+            result["teacher_all_log_probs"] = to_response_grid(model_output["all_logps"])
         elif student_topk_indices is not None:
-            result["teacher_topk_log_probs"] = no_padding_2_padding(model_output["topk_logps"], teacher_td).float()
+            result["teacher_topk_log_probs"] = to_response_grid(model_output["topk_logps"])
         return result
 
     def _update_teacher_ema(self) -> None:

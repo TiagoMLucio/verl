@@ -39,6 +39,9 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
     dp_size = data["dp_size"]
     batch_num_tokens = data["batch_num_tokens"]
+    if not batch_num_tokens:
+        # zero-supervised mini: 0/0 would NaN the loss value (its grads are already zero)
+        batch_num_tokens = 1
 
     log_prob = model_output["log_probs"]
 
@@ -251,9 +254,8 @@ def sdpo_ppo_loss(
     old_log_probs = tu.get(padded, "old_log_probs", default=None)
     rollout_is_weights = tu.get(padded, "rollout_is_weights", default=None)
 
-    # The per-sample self-distillation mask is stored as a scalar field in the transfer queue,
-    # which can materialize as (batch,) or (batch, 1); collapse it to (batch,) as the legacy path.
-    if self_distillation_mask is not None and self_distillation_mask.dim() > 1:
+    # collapse the TQ-materialized (batch, 1) scalar mask; per-token (batch, response_len) masks pass through
+    if self_distillation_mask is not None and self_distillation_mask.dim() > 1 and self_distillation_mask.shape[1] == 1:
         self_distillation_mask = self_distillation_mask.reshape(self_distillation_mask.shape[0])
 
     full_logit_distillation = sdpo_config.full_logit_distillation
@@ -287,6 +289,12 @@ def sdpo_ppo_loss(
     if full_logit_distillation and distill_topk is None and teacher_all_logps is None:
         raise ValueError("SDPO: teacher_all_log_probs missing for full-logit distillation.")
 
+    # batch_num_tokens is the global supervised-token count: the SDPO update ships loss_mask = supervised mask
+    config.global_batch_info["dp_size"] = data["dp_size"]
+    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
+    config.global_batch_info["global_batch_size"] = data["global_batch_size"]
+    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
+
     loss, metrics = compute_self_distillation_loss(
         student_log_probs=student_log_probs,
         teacher_log_probs=teacher_log_probs,
@@ -300,15 +308,11 @@ def sdpo_ppo_loss(
         self_distillation_mask=self_distillation_mask,
         loss_agg_mode=config.loss_agg_mode,
         rollout_is_weights=rollout_is_weights,
+        global_batch_info=config.global_batch_info,
     )
     metrics["self_distillation/empty_target_batch"] = (
         self_distillation_mask.sum().item() == 0 if self_distillation_mask is not None else False
     )
-
-    config.global_batch_info["dp_size"] = data["dp_size"]
-    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
-    config.global_batch_info["global_batch_size"] = data["global_batch_size"]
-    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
 
     if (
         data["dp_size"] > 1
@@ -327,11 +331,15 @@ def sdpo_ppo_loss(
     entropy = model_output.get("entropy", None)
     if entropy is not None:
         entropy = no_padding_2_padding(entropy, data)
+        # a 0 batch_num_tokens would make entropy_loss inf with NaN grads (entropy connects to the graph unmasked)
+        entropy_gbi = dict(config.global_batch_info or {})
+        if not entropy_gbi.get("batch_num_tokens"):
+            entropy_gbi["batch_num_tokens"] = response_mask.sum().clamp(min=1.0)
         entropy_loss = agg_loss(
             loss_mat=entropy,
             loss_mask=response_mask,
             loss_agg_mode=config.loss_agg_mode,
-            **config.global_batch_info,
+            **entropy_gbi,
         )
         policy_loss -= config.entropy_coeff * entropy_loss
         metrics["actor/entropy_loss"] = Metric(value=entropy_loss, aggregation=metric_aggregation)

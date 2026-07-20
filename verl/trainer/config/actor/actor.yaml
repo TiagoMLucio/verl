@@ -320,6 +320,15 @@ self_distillation:
   # Use feedback only when no successful demonstration is available
   environment_feedback_only_without_solution: true
 
+  # Per-turn reflector hints: teacher scores each hinted turn on [context<t + hint]
+  use_turn_feedback: false
+
+  # Template for one injected hint; spliced immediately before the hinted turn's tokens
+  turn_feedback_template: "[Hindsight from a previous failed attempt that reached this exact state: {diagnosis}]\n"
+
+  # Cap on hinted turns per sample (keeps the first ones; null = all)
+  max_hinted_turns: null
+
 # Router replay configuration for MoE models
 router_replay:
 

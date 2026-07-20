@@ -79,6 +79,14 @@ class SelfDistillationConfig(BaseConfig):
             in reprompting for wrong attempts.
         environment_feedback_only_without_solution (bool): If True, only use feedback
             when no solution is available (ignore feedback when solution exists).
+        use_turn_feedback (bool): Build one spliced teacher sequence per sample from
+            reflection hints (``extra_fields["turn_spans"]``/``["turn_feedback"]``), each hint
+            inserted right before its turn; samples without hints keep the whole-response
+            reprompt teacher.
+        turn_feedback_template (str): Template for one injected hint, spliced immediately
+            before the hinted turn's tokens. Uses the {diagnosis} placeholder.
+        max_hinted_turns (Optional[int]): Cap on hinted turns per sample (keeps the first
+            ones, earliest before the trajectory loses coherence); None hints every diagnosed turn.
     """
 
     full_logit_distillation: bool = True
@@ -99,6 +107,9 @@ class SelfDistillationConfig(BaseConfig):
     feedback_template: str = "\nThe following is feedback from your unsuccessful earlier attempt:\n\n{feedback_raw}\n\n"
     include_environment_feedback: bool = False
     environment_feedback_only_without_solution: bool = False
+    use_turn_feedback: bool = False
+    turn_feedback_template: str = "[Hindsight from a previous failed attempt that reached this exact state: {diagnosis}]\n"
+    max_hinted_turns: Optional[int] = None
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
@@ -127,6 +138,19 @@ class SelfDistillationConfig(BaseConfig):
             )
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
+        if self.use_turn_feedback:
+            try:
+                self.turn_feedback_template.format(diagnosis="")
+            except (KeyError, IndexError) as exc:
+                raise ValueError(
+                    f"self_distillation.turn_feedback_template must format on {{diagnosis}} alone, "
+                    f"got {self.turn_feedback_template!r}"
+                ) from exc
+            if "{diagnosis}" not in self.turn_feedback_template:
+                raise ValueError(
+                    "self_distillation.turn_feedback_template must contain the {diagnosis} "
+                    f"placeholder or the hint is silently dropped, got {self.turn_feedback_template!r}"
+                )
 
 
 @dataclass

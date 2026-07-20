@@ -12,9 +12,9 @@ import os
 
 GROUPS = {
     "trainer": {"taskrunner", "init_workers", "fit", "actor_init_model", "compute_log_prob", "compute_ref_log_prob"},
-    "sdpo": {"sdpo_teacher_loss", "update_actor"},
-    "rollout": {"agent_loop", "vllm_server"},
-    "agent": {"agent_run", "tool", "reward"},
+    "sdpo": {"sdpo_teacher_loss", "update_actor", "teacher_build"},
+    "rollout": {"agent_loop", "vllm_server", "postprocess"},
+    "agent": {"agent_run", "tool", "reward", "reflection", "condense"},
 }
 GROUPS["all"] = set().union(*GROUPS.values())
 GROUPS["all_but_vllm"] = GROUPS["all"] - {"vllm_server"}

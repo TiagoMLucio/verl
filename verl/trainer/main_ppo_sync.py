@@ -26,7 +26,6 @@ import json
 import logging
 import math
 import os
-import re
 import threading
 import time
 import uuid
@@ -34,7 +33,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pprint import pprint
-from typing import Any, Optional
+from typing import Any
 
 import hydra
 import numpy as np
@@ -71,7 +70,7 @@ from verl.single_controller.ray import (
 )
 from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler, run_ppo
-from verl.trainer.ppo import core_algos
+from verl.trainer.ppo import core_algos, sdpo_teacher
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
@@ -393,7 +392,12 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             for i in range(n):
                 task = asyncio.create_task(
                     self._run_agent_loop(
-                        run_sampling_params, trajectory=trajectory, trace=trace, session_id=i, **prompt
+                        run_sampling_params,
+                        trajectory=trajectory,
+                        trace=trace,
+                        session_id=i,
+                        validate=trajectory["validate"],
+                        **prompt,
                     )
                 )
                 tasks.append(task)
@@ -407,6 +411,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
     ) -> None:
         """Put agent loop outputs into TransferQueue."""
+        from verl.utils.debug_breakpoints import should_break
+        if should_break("postprocess"): breakpoint()
         uid, session_id = kwargs["uid"], kwargs["session_id"]
         outputs = output if isinstance(output, list) else [output]
         if not outputs:
@@ -912,6 +918,9 @@ class PPOTrainer:
 
         for batch_dict in self.val_dataloader:
             # 1. put batch to agent loop manager
+            n_prompts = len(batch_dict["raw_prompt"])
+            val_n = self.config.actor_rollout_ref.rollout.val_kwargs.n
+            logger.info(f"validation dispatch: {n_prompts} prompts x n={val_n} = {n_prompts * val_n} agent loops")
             batch_dict["uid"] = np.array(
                 [str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object
             )
@@ -1138,7 +1147,7 @@ class PPOTrainer:
     def _log_rollout_data(self, batch: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
         """Fetch rollout data from TransferQueue and dump sorted by uid."""
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-            fields = ["uid", "prompts", "responses", "rm_scores", "reward_model"]
+            fields = ["uid", "prompts", "responses", "rm_scores", "reward_model", "extra_fields"]
             data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
             data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
             data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
@@ -1170,6 +1179,14 @@ class PPOTrainer:
             scores = [scores[i] for i in sorted_indices]
 
             reward_extra_infos_dict = {"uid": [batch.keys[i] for i in sorted_indices]}
+            # downstream hint analysis reads turn_feedback/turn_spans from the dump, not trace exports
+            extra_fields = data.pop("extra_fields", None)
+            if extra_fields is not None:
+                ef = extra_fields.tolist()
+                for key in ("turn_feedback", "turn_spans"):
+                    reward_extra_infos_dict[key] = [
+                        json.dumps((ef[i] or {}).get(key)) for i in sorted_indices
+                    ]
 
             self._dump_generations(
                 inputs=inputs,
@@ -1182,6 +1199,10 @@ class PPOTrainer:
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns) -> dict[str, float]:
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+        # with multiple sources (e.g. difficulty bands) also log the combined total under "all"
+        if len(set(data_sources)) > 1:
+            merged = process_validation_metrics(["all"] * len(data_sources), sample_uids, reward_extra_infos_dict)
+            data_src2var2metric2val.update(merged)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
@@ -1294,61 +1315,6 @@ class PPOTrainer:
             extra_info=batch.extra_info,
         )
 
-    @staticmethod
-    def _collect_feedback(
-        include_environment_feedback: bool,
-        reward_extra_infos_dict: Optional[dict[str, Any]],
-        batch_size: int,
-    ) -> list[Any]:
-        """Collect non-empty textual environment feedback from reward extras."""
-        feedback_list: list[Any] = [None] * batch_size
-        if include_environment_feedback and reward_extra_infos_dict is not None:
-            raw_feedback = reward_extra_infos_dict.get("feedback", [])
-            if isinstance(raw_feedback, np.ndarray):
-                raw_feedback = raw_feedback.tolist()
-            for i in range(min(len(raw_feedback), batch_size)):
-                if isinstance(raw_feedback[i], str) and raw_feedback[i].strip():
-                    feedback_list[i] = raw_feedback[i]
-        return feedback_list
-
-    def _collect_solutions_by_uid(
-        self, uids: list[Any], reward_tensor: torch.Tensor, success_reward_threshold: float
-    ) -> dict[Any, list[int]]:
-        """Collect successful sample indices per UID based on sequence-level reward threshold."""
-        seq_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
-        success_by_uid: dict[Any, list[int]] = defaultdict(list)
-        for idx, uid in enumerate(uids):
-            if seq_scores[idx] >= success_reward_threshold:
-                success_by_uid[uid].append(idx)
-        return success_by_uid
-
-    @staticmethod
-    def _remove_thinking_trace(text: str) -> str:
-        """Remove <think>...</think> sections from a demonstration."""
-        return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
-
-    def _get_solution(
-        self,
-        idx: int,
-        success_by_uid: dict[Any, list[int]],
-        uids: list[Any],
-        response_texts: list[str],
-        dont_reprompt_on_self_success: bool = False,
-        remove_thinking_from_demonstration: bool = False,
-    ) -> Optional[str]:
-        """Select a successful demonstration for one sample from its UID group."""
-        uid = uids[idx]
-        solution_idxs = success_by_uid[uid]
-        if dont_reprompt_on_self_success:
-            solution_idxs = [j for j in solution_idxs if j != idx]
-        if len(solution_idxs) == 0:
-            return None
-        solution_idx = solution_idxs[0]
-        solution_str = response_texts[solution_idx]
-        if remove_thinking_from_demonstration:
-            solution_str = self._remove_thinking_trace(solution_str)
-        return solution_str
-
     def _maybe_build_self_distillation_batch(self, batch: KVBatchMeta, metrics: dict) -> None:
         """Build SDPO teacher inputs and distillation masks when loss_mode is set to ``sdpo``.
 
@@ -1359,16 +1325,24 @@ class PPOTrainer:
         prompt + response) and ``self_distillation_mask`` are written back to TQ instead of
         returned. The teacher attention mask / position ids are derived and recomputed inside the
         actor worker (see ``reconstruct_padded_teacher_from_nested``).
+
+        With ``use_turn_feedback``, samples carrying reflection hints instead ship one spliced
+        teacher sequence (hints inserted before their turns, with ``teacher_seq_meta`` mapping
+        hinted spans back to the response grid) and a per-token distillation mask over those spans.
         """
         self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
         if self_distillation_cfg is None or loss_mode != "sdpo":
             return
 
+        turn_mode = bool(self_distillation_cfg.get("use_turn_feedback", False))
+        select_fields = ["responses", "rm_scores", "raw_prompt", "uid", "extra_fields", "response_mask"]
+        if turn_mode:
+            select_fields.append("prompts")
         data = tq.kv_batch_get(
             keys=batch.keys,
             partition_id=batch.partition_id,
-            select_fields=["responses", "rm_scores", "raw_prompt", "uid", "extra_fields"],
+            select_fields=select_fields,
         )
 
         if "raw_prompt" not in data:
@@ -1390,147 +1364,160 @@ class PPOTrainer:
         response_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in responses.unbind()]
         raw_prompts = list(data["raw_prompt"])
 
-        prompt_texts: list[str] = []
-        for messages in raw_prompts:
-            if len(messages) == 0:
-                prompt_texts.append("")
-                continue
-            content = messages[-1].get("content", "")
-            if not isinstance(content, str):
-                raise ValueError("SDPO currently only supports textual single-turn prompts.")
-            prompt_texts.append(content)
+        prompt_texts = [sdpo_teacher.extract_prompt_text(raw_prompt) for raw_prompt in raw_prompts]
 
-        feedback_list = self._collect_feedback(
+        feedback_list = sdpo_teacher.collect_feedback(
             include_environment_feedback=self_distillation_cfg.include_environment_feedback,
             reward_extra_infos_dict=reward_extra_infos_dict,
             batch_size=batch_size,
         )
 
-        success_by_uid = self._collect_solutions_by_uid(
+        success_by_uid = sdpo_teacher.collect_solutions_by_uid(
             uids,
             reward_tensor,
             success_reward_threshold=self_distillation_cfg.success_reward_threshold,
         )
-        solution_strs = [
-            self._get_solution(
-                i,
-                success_by_uid,
-                uids,
-                response_texts,
-                self_distillation_cfg.dont_reprompt_on_self_success,
-                self_distillation_cfg.get("remove_thinking_from_demonstration", False),
+        extra_fields_list = list(data["extra_fields"])
+        contexts = [
+            sdpo_teacher.TeacherSampleContext(
+                raw_prompt=raw_prompts[i],
+                prompt_text=prompt_texts[i],
+                solution=sdpo_teacher.select_solution(
+                    i,
+                    success_by_uid,
+                    uids,
+                    response_texts,
+                    self_distillation_cfg.dont_reprompt_on_self_success,
+                    self_distillation_cfg.get("remove_thinking_from_demonstration", False),
+                ),
+                feedback=feedback_list[i],
+                extra_fields=extra_fields_list[i] if isinstance(extra_fields_list[i], dict) else {},
             )
             for i in range(batch_size)
         ]
 
-        extra_fields_list = list(data["extra_fields"])
-
-        def _build_teacher_message(i: int) -> list[dict]:
-            has_solution = solution_strs[i] is not None
-            has_feedback = feedback_list[i] is not None
-            feedback_only_without_solution = self_distillation_cfg.get(
-                "environment_feedback_only_without_solution",
-                False,
+        # Hinted samples get a spliced per-sample teacher sequence; the rest keep the legacy reprompt context.
+        response_list = responses.unbind()
+        hinted_per_row = [
+            sdpo_teacher.select_hinted_turns(
+                ctx.extra_fields, response_list[i].shape[0], self_distillation_cfg.get("max_hinted_turns")
             )
-            use_feedback = has_feedback and (not feedback_only_without_solution or not has_solution)
+            if turn_mode
+            else []
+            for i, ctx in enumerate(contexts)
+        ]
+        reprompt_rows = [i for i in range(batch_size) if not hinted_per_row[i]]
 
-            solution_section = ""
-            if has_solution:
-                solution_section = self_distillation_cfg.solution_template.format(
-                    successful_previous_attempt=solution_strs[i]
+        messages = [sdpo_teacher.build_teacher_messages(contexts[i], self_distillation_cfg) for i in reprompt_rows]
+        stripped_prompts: dict[int, torch.Tensor] = {}
+        if messages:
+            apply_kwargs = dict(self.config.data.get("apply_chat_template_kwargs", {}))
+            chat_template_kwargs = dict(
+                tokenize=True,
+                return_tensors="pt",
+                return_dict=True,
+                add_generation_prompt=True,
+                max_length=self_distillation_cfg.max_reprompt_len,
+                padding=True,
+                truncation=True,
+                **apply_kwargs,
+            )
+            try:
+                teacher_prompt = self.tokenizer.apply_chat_template(
+                    messages,
+                    continue_final_message=False,
+                    **chat_template_kwargs,
                 )
+            except TypeError:
+                teacher_prompt = self.tokenizer.apply_chat_template(messages, **chat_template_kwargs)
 
-            feedback_section = ""
-            if use_feedback:
-                feedback_section = self_distillation_cfg.feedback_template.format(feedback_raw=feedback_list[i])
-
-            # Per-segment teacher context: a condensation segment (segment_index > 0) was
-            # generated from a *condensed history*, not the original task. Build its teacher
-            # from that history + an appended augmentation turn, so teacher and student share
-            # the same context (differing only by feedback/solution). Segment 0 (and the
-            # no-condensation case) keeps the original single-turn reconstruction below.
-            ef = extra_fields_list[i] if isinstance(extra_fields_list[i], dict) else {}
-            segment_prompt = ef.get("segment_prompt")
-            if segment_prompt and ef.get("segment_index", 0):
-                if not (use_feedback or has_solution):
-                    return list(segment_prompt)
-                aug_text = self_distillation_cfg.reprompt_template.format(
-                    prompt="",
-                    solution=solution_section,
-                    feedback=feedback_section,
-                )
-                return list(segment_prompt) + [{"role": "user", "content": aug_text}]
-
-            system_messages = raw_prompts[i][:-1]
-            if use_feedback or has_solution:
-                reprompt_text = self_distillation_cfg.reprompt_template.format(
-                    prompt=prompt_texts[i],
-                    solution=solution_section,
-                    feedback=feedback_section,
-                )
+            if isinstance(teacher_prompt, torch.Tensor):
+                teacher_prompt_input_ids = teacher_prompt
+                pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+                teacher_prompt_attention_mask = (teacher_prompt_input_ids != pad_token_id).to(dtype=torch.long)
             else:
-                reprompt_text = prompt_texts[i]
+                teacher_prompt_input_ids = teacher_prompt["input_ids"]
+                teacher_prompt_attention_mask = teacher_prompt.get("attention_mask")
+                if teacher_prompt_attention_mask is None:
+                    teacher_prompt_attention_mask = torch.ones_like(teacher_prompt_input_ids, dtype=torch.long)
+            stripped_prompts = {
+                row: teacher_prompt_input_ids[j][teacher_prompt_attention_mask[j].bool()]
+                for j, row in enumerate(reprompt_rows)
+            }
 
-            return system_messages + [{"role": "user", "content": reprompt_text}]
-
-        messages = [_build_teacher_message(i) for i in range(batch_size)]
-        apply_kwargs = dict(self.config.data.get("apply_chat_template_kwargs", {}))
-        chat_template_kwargs = dict(
-            tokenize=True,
-            return_tensors="pt",
-            return_dict=True,
-            add_generation_prompt=True,
-            max_length=self_distillation_cfg.max_reprompt_len,
-            padding=True,
-            truncation=True,
-            **apply_kwargs,
-        )
-        try:
-            teacher_prompt = self.tokenizer.apply_chat_template(
-                messages,
-                continue_final_message=False,
-                **chat_template_kwargs,
-            )
-        except TypeError:
-            teacher_prompt = self.tokenizer.apply_chat_template(messages, **chat_template_kwargs)
-
-        if isinstance(teacher_prompt, torch.Tensor):
-            teacher_prompt_input_ids = teacher_prompt
-            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-            teacher_prompt_attention_mask = (teacher_prompt_input_ids != pad_token_id).to(dtype=torch.long)
-        else:
-            teacher_prompt_input_ids = teacher_prompt["input_ids"]
-            teacher_prompt_attention_mask = teacher_prompt.get("attention_mask")
-            if teacher_prompt_attention_mask is None:
-                teacher_prompt_attention_mask = torch.ones_like(teacher_prompt_input_ids, dtype=torch.long)
+        feedback_used = [sdpo_teacher.feedback_used(ctx, self_distillation_cfg) for ctx in contexts]
+        legacy_mask = [ctx.solution is not None or used for ctx, used in zip(contexts, feedback_used, strict=True)]
 
         # The legacy trainer builds teacher_input_ids = cat(teacher_prompt, responses) together with
         # the teacher attention mask and position ids. Here we store only the no-padding teacher
         # sequence per sample (the teacher prompt, stripped of its left padding, followed by the real
         # response tokens); the actor worker re-pads it and recomputes the mask / position ids.
-        response_list = responses.unbind()
-        teacher_input_ids = torch.nested.nested_tensor(
-            [
-                torch.cat([teacher_prompt_input_ids[i][teacher_prompt_attention_mask[i].bool()], response_list[i]])
-                for i in range(batch_size)
-            ],
-            layout=torch.jagged,
-        )
+        if turn_mode:
+            # meta [body_len, (body_start, start, end)...] maps spliced positions back to the response grid
+            prompt_list = data["prompts"].unbind()
+            hint_template = self_distillation_cfg.turn_feedback_template
+            header_ids = torch.tensor(sdpo_teacher.assistant_header_ids(self.tokenizer), dtype=torch.int64)
+            teacher_seqs, seq_meta, mask_rows = [], [], []
+            hint_fallbacks = 0
+            from verl.utils.debug_breakpoints import should_break
+            for i in range(batch_size):
+                response_ids = response_list[i]
+                if hinted_per_row[i]:
+                    if should_break("teacher_build"): breakpoint()
+                    hint_ids = [
+                        torch.tensor(
+                            sdpo_teacher.hint_user_turn_ids(self.tokenizer, hint_template.format(diagnosis=text)),
+                            dtype=response_ids.dtype,
+                        )
+                        for *_, text in hinted_per_row[i]
+                    ]
+                    seq, meta, fallbacks = sdpo_teacher.build_spliced_teacher_row(
+                        prompt_list[i],
+                        response_ids,
+                        hinted_per_row[i],
+                        hint_ids,
+                        self_distillation_cfg.max_reprompt_len,
+                        header_ids,
+                    )
+                    hint_fallbacks += fallbacks
+                    mask_row = sdpo_teacher.turn_token_mask(response_ids.shape[0], hinted_per_row[i])
+                else:
+                    seq = torch.cat([stripped_prompts[i], response_ids])
+                    meta = [response_ids.shape[0], 0, 0, response_ids.shape[0]]
+                    mask_row = torch.full((response_ids.shape[0],), float(legacy_mask[i]), dtype=torch.float32)
+                teacher_seqs.append(seq)
+                seq_meta.append(torch.tensor(meta, dtype=torch.int64))
+                mask_rows.append(mask_row)
+            teacher_fields = {
+                "teacher_input_ids": torch.nested.nested_tensor(teacher_seqs, layout=torch.jagged),
+                "teacher_seq_meta": torch.nested.nested_tensor(seq_meta, layout=torch.jagged),
+                "self_distillation_mask": torch.nested.nested_tensor(mask_rows, layout=torch.jagged),
+            }
+        else:
+            teacher_input_ids = torch.nested.nested_tensor(
+                [torch.cat([stripped_prompts[i], response_list[i]]) for i in range(batch_size)],
+                layout=torch.jagged,
+            )
+            teacher_fields = {
+                "teacher_input_ids": teacher_input_ids,
+                "self_distillation_mask": torch.tensor(legacy_mask, dtype=torch.float32),
+            }
 
-        feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
-        feedback_used = [
-            feedback_list[i] is not None and (not feedback_only_without_solution or solution_strs[i] is None)
-            for i in range(batch_size)
-        ]
-        self_distillation_mask = torch.tensor(
-            [solution_strs[i] is not None or feedback_used[i] for i in range(batch_size)],
-            dtype=torch.float32,
-        )
+        # loss_mask = supervised mask: batch_num_tokens all-reduces to the global supervised-token count
+        response_mask_list = data["response_mask"].unbind()
+        if turn_mode:
+            loss_mask_rows = [
+                response_mask_list[i] * mask_rows[i].to(response_mask_list[i].dtype) for i in range(batch_size)
+            ]
+        else:
+            loss_mask_rows = [response_mask_list[i] * int(legacy_mask[i]) for i in range(batch_size)]
+        teacher_fields["loss_mask"] = torch.nested.nested_tensor(loss_mask_rows, layout=torch.jagged)
 
         unique_uids = set(uids)
         num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
         num_with_feedback_used = sum(1 for f in feedback_used if f)
-        num_with_solution = sum(1 for s in solution_strs if s is not None)
+        num_with_solution = sum(1 for ctx in contexts if ctx.solution is not None)
+        num_supervised = sum(1 for hinted, legacy in zip(hinted_per_row, legacy_mask, strict=True) if hinted or legacy)
         metrics.update(
             {
                 "self_distillation/success_group_fraction": len(
@@ -1540,20 +1527,25 @@ class PPOTrainer:
                 "self_distillation/success_sample_fraction": num_with_solution / batch_size,
                 "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,
                 "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
-                "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
+                "self_distillation/reprompt_sample_fraction": num_supervised / batch_size,
             }
         )
+        if turn_mode:
+            num_hinted = sum(1 for hinted in hinted_per_row if hinted)
+            metrics.update(
+                {
+                    "self_distillation/hinted_sample_fraction": num_hinted / batch_size,
+                    "self_distillation/hinted_turns_per_sample": (
+                        sum(len(hinted) for hinted in hinted_per_row) / num_hinted if num_hinted else 0.0
+                    ),
+                    "self_distillation/hint_injection_fallbacks": hint_fallbacks,
+                }
+            )
 
         tq.kv_batch_put(
             keys=batch.keys,
             partition_id=batch.partition_id,
-            fields=TensorDict(
-                {
-                    "teacher_input_ids": teacher_input_ids,
-                    "self_distillation_mask": self_distillation_mask,
-                },
-                batch_size=batch_size,
-            ),
+            fields=TensorDict(teacher_fields, batch_size=batch_size),
         )
 
     def _get_required_batch_multiple(self, dp_size: int) -> int:
