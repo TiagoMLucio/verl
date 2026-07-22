@@ -1326,9 +1326,11 @@ class PPOTrainer:
         returned. The teacher attention mask / position ids are derived and recomputed inside the
         actor worker (see ``reconstruct_padded_teacher_from_nested``).
 
-        With ``use_turn_feedback``, samples carrying reflection hints instead ship one spliced
-        teacher sequence (hints inserted before their turns, with ``teacher_seq_meta`` mapping
-        hinted spans back to the response grid) and a per-token distillation mask over those spans.
+        With ``use_turn_feedback``, supervision is hints-only: samples carrying reflection hints
+        ship one spliced teacher sequence (hints inserted before their turns, with
+        ``teacher_seq_meta`` mapping hinted spans back to the response grid) and a per-token
+        distillation mask over those spans; un-hinted samples are not trained at all (span-less
+        teacher stub, zero mask).
         """
         self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
@@ -1396,7 +1398,8 @@ class PPOTrainer:
             for i in range(batch_size)
         ]
 
-        # Hinted samples get a spliced per-sample teacher sequence; the rest keep the legacy reprompt context.
+        # Turn mode is hints-only: hinted samples get a spliced per-sample teacher sequence, the
+        # rest a span-less stub (untrained). Non-turn mode keeps the legacy reprompt context.
         response_list = responses.unbind()
         hinted_per_row = [
             sdpo_teacher.select_hinted_turns(
@@ -1406,7 +1409,8 @@ class PPOTrainer:
             else []
             for i, ctx in enumerate(contexts)
         ]
-        reprompt_rows = [i for i in range(batch_size) if not hinted_per_row[i]]
+        # Hints-only in turn mode: un-hinted rows are not trained, so no reprompt context is built.
+        reprompt_rows = [] if turn_mode else list(range(batch_size))
 
         messages = [sdpo_teacher.build_teacher_messages(contexts[i], self_distillation_cfg) for i in reprompt_rows]
         stripped_prompts: dict[int, torch.Tensor] = {}
@@ -1482,9 +1486,10 @@ class PPOTrainer:
                     hint_fallbacks += fallbacks
                     mask_row = sdpo_teacher.turn_token_mask(response_ids.shape[0], hinted_per_row[i])
                 else:
-                    seq = torch.cat([stripped_prompts[i], response_ids])
-                    meta = [response_ids.shape[0], 0, 0, response_ids.shape[0]]
-                    mask_row = torch.full((response_ids.shape[0],), float(legacy_mask[i]), dtype=torch.float32)
+                    # hints-only: span-less stub, the teacher skips it and the mask zeroes the row
+                    seq = response_ids[:1]
+                    meta = [1]
+                    mask_row = torch.zeros(response_ids.shape[0], dtype=torch.float32)
                 teacher_seqs.append(seq)
                 seq_meta.append(torch.tensor(meta, dtype=torch.int64))
                 mask_rows.append(mask_row)
@@ -1517,7 +1522,11 @@ class PPOTrainer:
         num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
         num_with_feedback_used = sum(1 for f in feedback_used if f)
         num_with_solution = sum(1 for ctx in contexts if ctx.solution is not None)
-        num_supervised = sum(1 for hinted, legacy in zip(hinted_per_row, legacy_mask, strict=True) if hinted or legacy)
+        num_supervised = sum(
+            1
+            for hinted, legacy in zip(hinted_per_row, legacy_mask, strict=True)
+            if hinted or (not turn_mode and legacy)
+        )
         metrics.update(
             {
                 "self_distillation/success_group_fraction": len(

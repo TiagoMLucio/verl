@@ -13,7 +13,9 @@
 # limitations under the License.
 """Span-only teacher lm_head: computing values only at ``turn_keep_positions`` and
 scattering them back to the packed layout must reproduce the full-computation grid
-(including the -1 next-token shift shared with ``no_padding_2_padding``)."""
+(including the -1 next-token shift shared with ``no_padding_2_padding``). Span-less
+rows (un-hinted / padding stubs) are excluded from the teacher and keep one dummy
+student position under the hints-only contract."""
 
 import torch
 from tensordict import TensorDict
@@ -39,12 +41,12 @@ def make_rows():
         "teacher_input_ids": torch.arange(260, dtype=torch.long),
         "teacher_seq_meta": torch.tensor([200, 10, 10, 40, 120, 120, 200], dtype=torch.int64),
     }
-    # padding stub
+    # span-less stub (un-hinted or padding row): not distilled
     stub = {
         "responses": torch.tensor([11], dtype=torch.long),
         "response_mask": torch.zeros(1),
-        "teacher_input_ids": torch.tensor([8, 11], dtype=torch.long),
-        "teacher_seq_meta": torch.tensor([1, 0, 0, 1], dtype=torch.int64),
+        "teacher_input_ids": torch.tensor([11], dtype=torch.long),
+        "teacher_seq_meta": torch.tensor([1], dtype=torch.int64),
     }
     return hinted, stub
 
@@ -57,6 +59,8 @@ def test_keep_positions_match_consumed_positions():
         responses=njt([hinted["responses"], stub["responses"]]),
         response_mask=njt([hinted["response_mask"], stub["response_mask"]]),
     )
+    # the span-less stub must not reach the teacher
+    assert parents == [0]
     keep = turn_keep_positions(sub_seqs, sub_resps, spans)
 
     seq_lens = sub_seqs.offsets().diff()
@@ -72,7 +76,7 @@ def test_keep_positions_match_consumed_positions():
             "prompts": njt([seq[: seq_lens[j] - body_lens[j]] for j, seq in enumerate(sub_seqs.unbind())]),
             "responses": sub_resps,
         },
-        batch_size=2,
+        batch_size=len(parents),
     )
     batch_size, response_length = 2, 200
 
@@ -90,6 +94,20 @@ def test_keep_positions_match_consumed_positions():
     assert torch.equal(grid_full, grid_reduced), "span-only computation must reproduce the consumed grid"
     # sanity: the grid actually carries the span values (scatter is not a no-op)
     assert grid_full[0, 10:40].abs().sum() > 0
+    # the stub row never received teacher values
+    assert grid_full[1].abs().sum() == 0
+
+
+def test_all_spanless_rows_yield_no_teacher_rows():
+    _, stub = make_rows()
+    sub_seqs, sub_resps, sub_masks, parents, spans = explode_turn_teacher_rows(
+        teacher_input_ids=njt([stub["teacher_input_ids"]]),
+        teacher_seq_meta=njt([stub["teacher_seq_meta"]]),
+        responses=njt([stub["responses"]]),
+        response_mask=njt([stub["response_mask"]]),
+    )
+    assert parents == [] and spans == []
+    assert sub_seqs is None and sub_resps is None and sub_masks is None
 
 
 def test_student_keep_positions_cover_masked_grid():
@@ -99,6 +117,10 @@ def test_student_keep_positions_cover_masked_grid():
     meta = njt([hinted["teacher_seq_meta"], stub["teacher_seq_meta"]])
 
     keep = response_keep_positions(input_ids, responses, meta)
+
+    # span-less row keeps exactly one dummy position (graph connectivity), at its prefix boundary
+    assert keep.offsets().diff().tolist() == [110, 1]
+    assert keep.unbind()[1].tolist() == [0]
 
     offsets = input_ids.offsets()
     total_nnz = int(offsets[-1])
@@ -116,7 +138,6 @@ def test_student_keep_positions_cover_masked_grid():
 
     span_mask = torch.zeros(2, 200, dtype=torch.bool)
     span_mask[0, 10:40] = span_mask[0, 120:200] = True
-    span_mask[1, 0:1] = True
 
     grid_full, grid_reduced = to_grid(values_full), to_grid(values_reduced)
     assert torch.equal(grid_full[span_mask], grid_reduced[span_mask]), (

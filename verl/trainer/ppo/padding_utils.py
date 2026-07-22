@@ -123,7 +123,8 @@ def construct_minimal_padding_template(
     if "teacher_input_ids" in template_sample:
         template_sample["teacher_input_ids"] = input_ids.clone()
     if "teacher_seq_meta" in template_sample:
-        template_sample["teacher_seq_meta"] = torch.tensor([1, 0, 0, 1], dtype=torch.int64)
+        # span-less: the teacher skips padding rows entirely (hints-only contract)
+        template_sample["teacher_seq_meta"] = torch.tensor([1], dtype=torch.int64)
     if "self_distillation_mask" in template_sample:
         sd_mask = template_sample["self_distillation_mask"]
         template_sample["self_distillation_mask"] = (

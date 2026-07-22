@@ -60,6 +60,9 @@ def run_teacher_grid_path(micro):
         responses=micro["responses"],
         response_mask=micro["response_mask"],
     )
+    if not parents:
+        # mirror the worker's hints-only guard: no teacher forward, zero grid
+        return torch.zeros(batch_size, full_response_length)
     max_body = max(r.shape[0] for r in sub_resps.unbind())
     fake_outputs = torch.randn(len(parents), max_body)
     return scatter_turn_teacher_outputs(fake_outputs, parents, spans, batch_size, full_response_length)
@@ -76,7 +79,7 @@ def test_micro_splits_stay_row_aligned():
         "responses": torch.tensor([11], dtype=torch.long),
         "response_mask": torch.zeros(1),
         "teacher_input_ids": torch.tensor([8, 11], dtype=torch.long),
-        "teacher_seq_meta": torch.tensor([1, 0, 0, 1], dtype=torch.int64),
+        "teacher_seq_meta": torch.tensor([1], dtype=torch.int64),
     }
     td = to_td([make_hinted_sample(), stub])
     run_teacher_grid_path(td)
@@ -110,7 +113,7 @@ def test_padding_template_rebuilds_teacher_fields():
     )
     template, tag = construct_minimal_padding_template(source, {"seq_len": 9050}, eos_token_id=2)
 
-    assert template["teacher_seq_meta"].tolist() == [1, 0, 0, 1]
+    assert template["teacher_seq_meta"].tolist() == [1]
     assert template["teacher_input_ids"].shape[0] == 2
     assert template["self_distillation_mask"].tolist() == [0.0]
     assert tag["is_padding"]

@@ -91,8 +91,10 @@ def explode_turn_teacher_rows(
     ``teacher_seq_meta`` is flat per sample: [body_len, then (body_start, start, end) per scored
     span]. The body (the sequence's verbatim tail: response chunks with hints spliced before
     their turns) becomes the sub-row's response, so the padded-reconstruction contract holds.
+    Rows with no span triples (un-hinted or padding stubs) are not distilled and get no sub-row.
     Returns nested sequences / bodies / body masks plus, per sub-row, the parent sample index
-    and its span triples mapping body positions to the response grid.
+    and its span triples mapping body positions to the response grid; the nested returns are
+    ``None`` when no row carries spans.
     """
     seq_list = teacher_input_ids.unbind()
     meta_list = teacher_seq_meta.unbind()
@@ -110,6 +112,8 @@ def explode_turn_teacher_rows(
             f"teacher_seq_meta malformed for sample {i}: body_len {body_len}, "
             f"seq len {seq.shape[0]}, {len(triples)} span ints"
         )
+        if not triples:
+            continue
         span_ends = triples[2::3]
         assert not span_ends or max(span_ends) <= resp_list[i].shape[0], (
             f"teacher_seq_meta spans exceed the response row for sample {i}: "
@@ -122,6 +126,8 @@ def explode_turn_teacher_rows(
         parents.append(i)
         spans.append([(triples[k], triples[k + 1], triples[k + 2]) for k in range(0, len(triples), 3)])
 
+    if not parents:
+        return None, None, None, [], []
     return (
         torch.nested.nested_tensor(sub_seqs, layout=torch.jagged),
         torch.nested.nested_tensor(sub_resps, layout=torch.jagged),
@@ -133,12 +139,19 @@ def explode_turn_teacher_rows(
 
 def _keep_positions(prefix_lens: torch.Tensor, spans_per_row: list[list[tuple[int, int]]]) -> torch.Tensor:
     """Row-relative logits positions for (offset, length) spans past each row's prefix,
-    shifted -1 because position k predicts token k+1 (matches no_padding_2_padding)."""
+    shifted -1 because position k predicts token k+1 (matches no_padding_2_padding).
+    Span-less rows keep one dummy position so an all-unhinted micro-batch still yields
+    a graph-connected (zero-contribution) loss."""
     rows = []
     for prefix_len, row_spans in zip(prefix_lens.tolist(), spans_per_row, strict=True):
-        rows.append(
-            torch.cat([torch.arange(prefix_len + off - 1, prefix_len + off - 1 + length) for off, length in row_spans])
-        )
+        if row_spans:
+            rows.append(
+                torch.cat(
+                    [torch.arange(prefix_len + off - 1, prefix_len + off - 1 + length) for off, length in row_spans]
+                )
+            )
+        else:
+            rows.append(torch.tensor([prefix_len - 1], dtype=torch.int64))
     return torch.nested.nested_tensor(rows, layout=torch.jagged)
 
 
