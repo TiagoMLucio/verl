@@ -240,7 +240,7 @@ def test_sdpo_teacher_topk_extractor_supports_logits_processor_and_eval_loss_cal
 
     outputs = _sdpo_teacher_extractor(student_logits=logits, data=data)
     loss, metrics = _sdpo_teacher_extractor(model_output={"log_probs": torch.zeros(1)})
-    padded_topk_logps = no_padding_2_padding(outputs["topk_logps"], data)
+    padded_topk_logps = no_padding_2_padding(outputs["topk_logps"].squeeze(0), data)
     expected_token0 = torch.log_softmax(logits[0, 1], dim=-1)[torch.tensor([2, 0])]
     expected_token1 = torch.log_softmax(logits[0, 2], dim=-1)[torch.tensor([1, 3])]
 
@@ -267,8 +267,8 @@ def test_sdpo_student_topk_is_computed_from_student_logits():
     ).unsqueeze(0)
 
     outputs = _sdpo_logits_processor(student_logits=logits, sdpo_config=cfg)
-    padded_topk_logps = no_padding_2_padding(outputs["topk_logps"], data)
-    padded_topk_indices = no_padding_2_padding(outputs["topk_indices"], data)
+    padded_topk_logps = no_padding_2_padding(outputs["topk_logps"].squeeze(0), data)
+    padded_topk_indices = no_padding_2_padding(outputs["topk_indices"].squeeze(0), data)
     expected_token0_indices = torch.tensor([0, 3])
     expected_token1_indices = torch.tensor([1, 2])
     expected_token0 = torch.log_softmax(logits[0, 1], dim=-1)[expected_token0_indices]
@@ -288,6 +288,6 @@ def test_sdpo_teacher_all_logps_extractor_supports_logits_processor_and_eval_los
     outputs = _sdpo_teacher_extractor(student_logits=logits, data=empty_data)
     loss, metrics = _sdpo_teacher_extractor(model_output={"log_probs": torch.zeros(1)})
 
-    torch.testing.assert_close(outputs["all_logps"].exp().sum(dim=-1), torch.ones(1))
+    torch.testing.assert_close(outputs["all_logps"].squeeze(0).exp().sum(dim=-1), torch.ones(1))
     assert loss.shape == torch.Size([])
     assert metrics == {}

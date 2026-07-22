@@ -144,3 +144,23 @@ def test_student_keep_positions_cover_masked_grid():
         "student span-only values must match the full computation on every masked position"
     )
     assert grid_full[span_mask].abs().sum() > 0
+
+
+def test_single_keep_position_processor_contract():
+    """n_keep == 1 (all-unhinted micro): processor outputs keep the leading batch dim, so the
+    engine's squeeze(0) + scatter still see (n_keep, k) rows."""
+    from types import SimpleNamespace
+
+    from verl.workers.utils.losses import sdpo_ppo_loss
+
+    logits = torch.randn(1, 1, 32)  # (1, n_keep=1, vocab)
+    cfg = SimpleNamespace(distillation_topk=5)
+    outputs = sdpo_ppo_loss(
+        config=None, sdpo_config=cfg, student_logits=logits, data=None, logits_keep_idx=torch.tensor([4])
+    )
+    assert outputs["topk_logps"].shape == (1, 1, 5)
+
+    v = outputs["topk_logps"].squeeze(0)  # engine unbatching
+    total_nnz, keep_idx = 13, torch.tensor([4])
+    full = v.new_zeros((total_nnz, *v.shape[1:])).index_copy_(0, keep_idx, v)
+    assert full.shape == (13, 5) and full[4].abs().sum() > 0

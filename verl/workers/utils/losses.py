@@ -192,8 +192,11 @@ def _sdpo_response_topk_indices_to_no_padding(
 
 
 def _sdpo_logits_processor(student_logits: torch.Tensor, sdpo_config) -> dict:
-    """Logits-processor call during actor forward: compute student top-k or full logps."""
-    logits = student_logits.squeeze(0)  # (total_nnz, vocab_size)
+    """Logits-processor call during actor forward: compute student top-k or full logps.
+
+    Keeps the (1, total_nnz, ...) leading batch dim so the engine's squeeze(0) stays
+    unambiguous when only a single packed position is kept."""
+    logits = student_logits  # (1, total_nnz, vocab_size)
     distill_topk = sdpo_config.distillation_topk
     if distill_topk is not None:
         topk = min(distill_topk, logits.shape[-1])
@@ -222,11 +225,12 @@ def _sdpo_teacher_extractor(
     topk_indices = _sdpo_response_topk_indices_to_no_padding(
         data=data, logits=logits, logits_keep_idx=logits_keep_idx
     )
+    # outputs keep the (1, total_nnz, ...) batch dim: engine contract shared with _sdpo_logits_processor
     if topk_indices is None:
-        return {"all_logps": torch.log_softmax(logits, dim=-1)}
+        return {"all_logps": torch.log_softmax(logits, dim=-1).unsqueeze(0)}
     topk_logits = torch.gather(logits, dim=-1, index=topk_indices)
     logsumexp = torch.logsumexp(logits, dim=-1, keepdim=True)
-    return {"topk_logps": topk_logits - logsumexp}
+    return {"topk_logps": (topk_logits - logsumexp).unsqueeze(0)}
 
 
 def sdpo_ppo_loss(
@@ -237,9 +241,12 @@ def sdpo_ppo_loss(
     model_output: Optional[dict] = None,
     data: Optional[TensorDict] = None,
     dp_group=None,
+    logits_keep_idx: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]] | dict:
     """SDPO loss function used as both logits processor and final policy loss."""
     if student_logits is not None:
+        # span-only passes already subset student_logits; logits_keep_idx is only needed
+        # by the teacher extractor's top-k index map
         return _sdpo_logits_processor(student_logits=student_logits, sdpo_config=sdpo_config)
 
     student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
