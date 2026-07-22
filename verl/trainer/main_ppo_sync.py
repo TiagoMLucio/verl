@@ -1329,8 +1329,9 @@ class PPOTrainer:
         With ``use_turn_feedback``, supervision is hints-only: samples carrying reflection hints
         ship one spliced teacher sequence (hints inserted before their turns, with
         ``teacher_seq_meta`` mapping hinted spans back to the response grid) and a per-token
-        distillation mask over those spans; un-hinted samples are not trained at all (span-less
-        teacher stub, zero mask).
+        distillation mask over those spans; un-hinted samples are not trained at all (degenerate
+        1-token teacher row, zero mask — the teacher still scores them so dp collectives stay
+        in lockstep).
         """
         self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
@@ -1399,7 +1400,7 @@ class PPOTrainer:
         ]
 
         # Turn mode is hints-only: hinted samples get a spliced per-sample teacher sequence, the
-        # rest a span-less stub (untrained). Non-turn mode keeps the legacy reprompt context.
+        # rest a degenerate 1-token row (untrained). Non-turn mode keeps the legacy reprompt context.
         response_list = responses.unbind()
         hinted_per_row = [
             sdpo_teacher.select_hinted_turns(
@@ -1486,9 +1487,10 @@ class PPOTrainer:
                     hint_fallbacks += fallbacks
                     mask_row = sdpo_teacher.turn_token_mask(response_ids.shape[0], hinted_per_row[i])
                 else:
-                    # hints-only: span-less stub, the teacher skips it and the mask zeroes the row
-                    seq = response_ids[:1]
-                    meta = [1]
+                    # hints-only: degenerate 1-token teacher row (padding-template pattern), zero mask.
+                    # The teacher must still score every row so dp-group collectives stay in lockstep.
+                    seq = torch.cat([prompt_list[i][-1:], response_ids[:1]])
+                    meta = [1, 0, 0, 1]
                     mask_row = torch.zeros(response_ids.shape[0], dtype=torch.float32)
                 teacher_seqs.append(seq)
                 seq_meta.append(torch.tensor(meta, dtype=torch.int64))

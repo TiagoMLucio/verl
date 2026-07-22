@@ -748,21 +748,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 responses=data["responses"],
                 response_mask=data["response_mask"],
             )
-            if not parents:
-                # hints-only supervision: nothing to score in this micro-batch
-                if return_all_logps:
-                    raise NotImplementedError(
-                        "turn-mode full-vocab distillation cannot synthesize teacher targets for a "
-                        "micro-batch without hinted rows; use distillation_topk."
-                    )
-                device = data["responses"].values().device
-                zeros = torch.zeros(batch_size, full_response_length, dtype=torch.float32, device=device)
-                result = {"teacher_log_probs": zeros}
-                if student_topk_indices is not None:
-                    result["teacher_topk_log_probs"] = zeros.unsqueeze(-1).expand(
-                        -1, -1, student_topk_indices.shape[-1]
-                    )
-                return result
             (
                 teacher_input_ids,
                 teacher_attention_mask,

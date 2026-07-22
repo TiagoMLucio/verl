@@ -41,12 +41,12 @@ def make_rows():
         "teacher_input_ids": torch.arange(260, dtype=torch.long),
         "teacher_seq_meta": torch.tensor([200, 10, 10, 40, 120, 120, 200], dtype=torch.int64),
     }
-    # span-less stub (un-hinted or padding row): not distilled
+    # degenerate stub (un-hinted or padding row): 1-token teacher body, zero mask
     stub = {
         "responses": torch.tensor([11], dtype=torch.long),
         "response_mask": torch.zeros(1),
-        "teacher_input_ids": torch.tensor([11], dtype=torch.long),
-        "teacher_seq_meta": torch.tensor([1], dtype=torch.int64),
+        "teacher_input_ids": torch.tensor([8, 11], dtype=torch.long),
+        "teacher_seq_meta": torch.tensor([1, 0, 0, 1], dtype=torch.int64),
     }
     return hinted, stub
 
@@ -59,8 +59,8 @@ def test_keep_positions_match_consumed_positions():
         responses=njt([hinted["responses"], stub["responses"]]),
         response_mask=njt([hinted["response_mask"], stub["response_mask"]]),
     )
-    # the span-less stub must not reach the teacher
-    assert parents == [0]
+    # every row keeps a teacher sub-row (dp-collective lockstep); the stub's is 1 token
+    assert parents == [0, 1]
     keep = turn_keep_positions(sub_seqs, sub_resps, spans)
 
     seq_lens = sub_seqs.offsets().diff()
@@ -94,20 +94,25 @@ def test_keep_positions_match_consumed_positions():
     assert torch.equal(grid_full, grid_reduced), "span-only computation must reproduce the consumed grid"
     # sanity: the grid actually carries the span values (scatter is not a no-op)
     assert grid_full[0, 10:40].abs().sum() > 0
-    # the stub row never received teacher values
-    assert grid_full[1].abs().sum() == 0
+    # the stub row only carries its degenerate first-position value (masked in the loss)
+    assert grid_full[1, 1:].abs().sum() == 0
 
 
-def test_all_spanless_rows_yield_no_teacher_rows():
+def test_meta_without_triples_keeps_dummy_positions():
+    """Defensive: a span-less meta still yields a dummy keep position (graph connectivity)
+    and a teacher sub-row that scatters nothing."""
     _, stub = make_rows()
-    sub_seqs, sub_resps, sub_masks, parents, spans = explode_turn_teacher_rows(
+    sub_seqs, sub_resps, _, parents, spans = explode_turn_teacher_rows(
         teacher_input_ids=njt([stub["teacher_input_ids"]]),
-        teacher_seq_meta=njt([stub["teacher_seq_meta"]]),
+        teacher_seq_meta=njt([torch.tensor([1], dtype=torch.int64)]),
         responses=njt([stub["responses"]]),
         response_mask=njt([stub["response_mask"]]),
     )
-    assert parents == [] and spans == []
-    assert sub_seqs is None and sub_resps is None and sub_masks is None
+    assert parents == [0] and spans == [[]]
+    keep = turn_keep_positions(sub_seqs, sub_resps, spans)
+    assert keep.unbind()[0].tolist() == [0]
+    grid = scatter_turn_teacher_outputs(torch.ones(1, 1), parents, spans, 1, 1)
+    assert grid.abs().sum() == 0
 
 
 def test_student_keep_positions_cover_masked_grid():

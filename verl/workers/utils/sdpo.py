@@ -91,10 +91,10 @@ def explode_turn_teacher_rows(
     ``teacher_seq_meta`` is flat per sample: [body_len, then (body_start, start, end) per scored
     span]. The body (the sequence's verbatim tail: response chunks with hints spliced before
     their turns) becomes the sub-row's response, so the padded-reconstruction contract holds.
-    Rows with no span triples (un-hinted or padding stubs) are not distilled and get no sub-row.
-    Returns nested sequences / bodies / body masks plus, per sub-row, the parent sample index
-    and its span triples mapping body positions to the response grid; the nested returns are
-    ``None`` when no row carries spans.
+    Every row gets a sub-row (un-hinted rows ship degenerate 1-token bodies, [1, 0, 0, 1]):
+    the teacher forward must run on every rank every micro-batch so its dp-group collectives
+    stay in lockstep. Returns nested sequences / bodies / body masks plus, per sub-row, the
+    parent sample index and its span triples mapping body positions to the response grid.
     """
     seq_list = teacher_input_ids.unbind()
     meta_list = teacher_seq_meta.unbind()
@@ -112,8 +112,6 @@ def explode_turn_teacher_rows(
             f"teacher_seq_meta malformed for sample {i}: body_len {body_len}, "
             f"seq len {seq.shape[0]}, {len(triples)} span ints"
         )
-        if not triples:
-            continue
         span_ends = triples[2::3]
         assert not span_ends or max(span_ends) <= resp_list[i].shape[0], (
             f"teacher_seq_meta spans exceed the response row for sample {i}: "
@@ -126,8 +124,6 @@ def explode_turn_teacher_rows(
         parents.append(i)
         spans.append([(triples[k], triples[k + 1], triples[k + 2]) for k in range(0, len(triples), 3)])
 
-    if not parents:
-        return None, None, None, [], []
     return (
         torch.nested.nested_tensor(sub_seqs, layout=torch.jagged),
         torch.nested.nested_tensor(sub_resps, layout=torch.jagged),
