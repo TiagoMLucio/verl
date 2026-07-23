@@ -175,8 +175,7 @@ actor_rollout_ref:
       include_environment_feedback: true
       environment_feedback_only_without_solution: true
       use_turn_feedback: false
-      turn_feedback_template: '[Hindsight from a previous failed attempt that reached
-        this exact state: {diagnosis}]
+      turn_feedback_template: '[Guidance for your next action: {diagnosis}]
 
         '
       max_hinted_turns: null

@@ -324,7 +324,7 @@ self_distillation:
   use_turn_feedback: false
 
   # Template for one injected hint; spliced immediately before the hinted turn's tokens
-  turn_feedback_template: "[Hindsight from a previous failed attempt that reached this exact state: {diagnosis}]\n"
+  turn_feedback_template: "[Guidance for your next action: {diagnosis}]\n"
 
   # Cap on hinted turns per sample (keeps the first ones; null = all)
   max_hinted_turns: null
