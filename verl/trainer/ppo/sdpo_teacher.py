@@ -198,14 +198,15 @@ def build_spliced_teacher_row(
             insert_at = start
             fallbacks += 1
         if insert_at is not None:
-            chunks.append(response_ids[cursor:insert_at])
+            chunks.append(response_ids[cursor:insert_at])  # untouched context since the previous span
             body_len += insert_at - cursor
-            chunks.append(hint_ids)
+            chunks.append(hint_ids)  # the hint, a rendered user turn
             body_len += hint_ids.shape[0]
-            chunks.append(response_ids[insert_at:start])
+            chunks.append(response_ids[insert_at:start])  # the turn's assistant header (empty on fallback)
             body_len += start - insert_at
+        # body_len here = the span's offset inside the body (recorded before appending it)
         meta.extend([body_len, start, end])
-        chunks.append(response_ids[start:end])
+        chunks.append(response_ids[start:end])  # the hinted span itself: the tokens the teacher scores
         body_len += end - start
         cursor = end
     return torch.cat([prefix, *chunks]), [body_len, *meta], fallbacks
