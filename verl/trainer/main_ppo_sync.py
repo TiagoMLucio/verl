@@ -1483,7 +1483,9 @@ class PPOTrainer:
                         response_ids,
                         hinted_per_row[i],
                         hint_ids,
-                        self_distillation_cfg.max_reprompt_len,
+                        # the spliced prefix is the student's real prompt (segment rows reach ~24k):
+                        # cap with the student's own prompt budget, not the legacy reprompt one
+                        self.config.data.max_prompt_length,
                         header_ids,
                     )
                     hint_fallbacks += fallbacks
