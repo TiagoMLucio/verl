@@ -1337,6 +1337,8 @@ class PPOTrainer:
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
         if self_distillation_cfg is None or loss_mode != "sdpo":
             return
+        from verl.utils.debug_breakpoints import should_break
+        if should_break("teacher_build"): breakpoint()
 
         turn_mode = bool(self_distillation_cfg.get("use_turn_feedback", False))
         select_fields = ["responses", "rm_scores", "raw_prompt", "uid", "extra_fields", "response_mask"]
