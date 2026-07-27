@@ -466,7 +466,7 @@ def test_compute_self_distillation_loss_topk_and_masking():
         self_distillation_mask=zero_mask,
     )
     assert torch.allclose(loss_masked, torch.tensor(0.0, dtype=loss_masked.dtype, device=loss_masked.device))
-    assert metrics_masked["self_distillation/mask_fraction"] == 0.0
+    assert metrics_masked["self_distillation/supervised_token_fraction"] == 0.0
 
 
 def test_compute_self_distillation_loss_optional_is_clip():

@@ -1178,7 +1178,8 @@ def agg_loss(
         if global_batch_size is None:
             if dp_size > 1:
                 raise ValueError("global_batch_size is required when dp_size > 1")
-            global_batch_size = seq_mask.sum()
+            # all-masked micro (zero-supervision fallback path): avoid 0/0 -> NaN
+            global_batch_size = seq_mask.sum().clamp(min=1.0)
         loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
         if loss_agg_mode == "seq-mean-token-sum-norm":
             if loss_scale_factor is None:
@@ -1192,7 +1193,8 @@ def agg_loss(
         if global_batch_size is None:
             if dp_size > 1:
                 raise ValueError("global_batch_size is required when dp_size > 1")
-            global_batch_size = seq_mask.sum()
+            # all-masked micro (zero-supervision fallback path): avoid 0/0 -> NaN
+            global_batch_size = seq_mask.sum().clamp(min=1.0)
         loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
     else:
         raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
@@ -1349,7 +1351,9 @@ def compute_self_distillation_loss(
             "self_distillation/full_logit_distillation": float(self_distillation_config.full_logit_distillation),
             "self_distillation/use_topk": float(self_distillation_config.distillation_topk is not None),
             "self_distillation/topk_value": float(self_distillation_config.distillation_topk or 0),
-            "self_distillation/mask_fraction": loss_mask.float().mean().item(),
+            "self_distillation/supervised_token_fraction": (
+                loss_mask.sum() / response_mask.sum().clamp(min=1)
+            ).item(),
             "self_distillation/variant_code": {
                 "rkl_token": 3.0,
                 "full_logit_topk": 1.0,
