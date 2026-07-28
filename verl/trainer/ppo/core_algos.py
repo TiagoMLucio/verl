@@ -1315,7 +1315,7 @@ SDPO_RATIO_METRICS = (
         "self_distillation/inert_rows__sum",
         "self_distillation/supervised_rows__sum",
     ),
-    ("actor/entropy_hinted_span", "actor/entropy_hinted__sum", "actor/entropy_hinted_tokens__sum"),
+    ("entropy_hinted_span", "entropy_hinted__sum", "entropy_hinted_tokens__sum"),
 )
 
 

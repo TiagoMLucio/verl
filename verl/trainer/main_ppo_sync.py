@@ -1683,6 +1683,14 @@ class PPOTrainer:
         out["traj_time/unattributed_mean"] = sum(residual) / len(residual)
         out["traj_time/total_mean"] = sum(totals) / len(totals)
         out["traj_time/total_max"] = max(totals)
+        # the spread between these is the idle tail: the phase lasts as long as the max
+        ordered = sorted(totals)
+        out["traj_time/total_p50"] = ordered[len(ordered) // 2]
+        out["traj_time/total_p90"] = ordered[min(len(ordered) - 1, int(0.9 * len(ordered)))]
+        # the slowest trajectory sets the step's wall clock, so its own split is what matters
+        slowest = rows[max(range(len(rows)), key=lambda i: totals[i])]
+        for key in parts + ("loop_wall", "env_setup", "reward_eval", "reflect"):
+            out[f"traj_time/slowest_{key}"] = float(slowest.get(key, 0.0))
         out["traj_time/unattributed_share"] = sum(residual) / max(sum(totals), 1e-6)
         for key in ("eval_completed", "patch_apply_failed"):
             vals = [float(t[key]) for t in rows if key in t]  # absent means never measured, not OK
