@@ -1585,6 +1585,14 @@ class PPOTrainer:
             )
         )
         metrics.update(self._trajectory_timing_metrics(extra_fields_list))
+        # decode throughput needs the generated count: response_length also holds the observations
+        # fed back to the agent, which are ~3x the tokens the model actually produced
+        generated = sum(
+            sum(int(span[2]) - int(span[1]) for span in (ef if isinstance(ef, dict) else {}).get("turn_spans") or [])
+            for ef in extra_fields_list
+        )
+        metrics["rollout/generated_tokens"] = float(generated)
+        metrics["rollout/generated_tokens_per_trace"] = generated / n_traces if n_traces else 0.0
         if turn_mode:
             num_hinted = sum(1 for hinted in hinted_per_row if hinted)
             hinted_traces = {traj_of_row[i] for i, hinted in enumerate(hinted_per_row) if hinted}
@@ -2062,6 +2070,12 @@ class PPOTrainer:
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
         n_gpus = self.resource_pool_manager.get_n_gpus()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+        # decode throughput: only assistant spans are generated, so response_length (which counts
+        # the observations the agent was fed) overstates it several-fold
+        gen_tokens = metrics.get("rollout/generated_tokens")
+        gen_s = timing_raw.get("gen")
+        if gen_tokens and gen_s:
+            metrics["perf/gen_tokens_per_s"] = gen_tokens / gen_s / max(n_gpus, 1)
         gradient_norm = metrics.get("actor/grad_norm", None)
         metrics.update(compute_variance_proxy_metrics(batch=metrics_batch, gradient_norm=gradient_norm))
 
