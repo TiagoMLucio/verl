@@ -24,6 +24,8 @@ from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
 
+import warnings
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -1144,6 +1146,7 @@ def agg_loss(
     batch_num_tokens: Optional[int] = None,
     global_batch_size: Optional[int] = None,
     loss_scale_factor: Optional[int] = None,
+    seq_weights: Optional[torch.Tensor] = None,
 ):
     """
     Aggregate the loss across global batch to ensure the loss is invariant to fsdp/megatron parallelism.
@@ -1161,11 +1164,25 @@ def agg_loss(
         global_batch_size: global batch size
         loss_scale_factor: scale factor for "seq-mean-token-sum-norm" mode. If None, uses loss_mask.shape[-1].
             Set this to a constant value to ensure consistent normalization throughout training.
+        seq_weights: optional per-sequence weight (bs,) for the seq-mean modes. A condensed
+            trajectory ships one row per segment; weighting each row by its share of that
+            trajectory's supervised tokens makes the trajectory count once in total (a token-mean
+            within it, a plain mean across trajectories). The denominator stays the row count, so
+            a batch with more condensation carries slightly less total weight.
 
     Returns:
         loss: `a scalar torch.Tensor`
             aggregated loss
     """
+    if seq_weights is not None and loss_agg_mode != "seq-mean-token-mean":
+        # token-mean is already segmentation-invariant; the token-sum modes keep a trajectory's
+        # segments additive, so a per-row share would corrupt them
+        warnings.warn(
+            f"seq_weights is ignored for loss_agg_mode={loss_agg_mode!r}; "
+            "per-trajectory weighting only applies to seq-mean-token-mean",
+            stacklevel=2,
+        )
+        seq_weights = None
     if loss_agg_mode == "token-mean":
         if batch_num_tokens is None:
             if dp_size > 1:
@@ -1190,6 +1207,10 @@ def agg_loss(
         seq_mask = torch.sum(loss_mask, dim=-1)  # per-sequence token count
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / (seq_mask + 1e-8)  # token-mean
         seq_mask = (seq_mask > 0).float()  # exclude fully masked sequences
+        if seq_weights is not None:
+            seq_mask = seq_mask * seq_weights.to(device=seq_mask.device, dtype=seq_mask.dtype).reshape(
+                seq_mask.shape
+            )
         if global_batch_size is None:
             if dp_size > 1:
                 raise ValueError("global_batch_size is required when dp_size > 1")
@@ -1200,6 +1221,119 @@ def agg_loss(
         raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
 
     return loss
+
+
+@torch.no_grad()
+def _distillation_signal_metrics(
+    per_token_loss: torch.Tensor,
+    loss_mask: torch.Tensor,
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    student_topk_log_probs: Optional[torch.Tensor] = None,
+    teacher_topk_log_probs: Optional[torch.Tensor] = None,
+    inert_threshold: float = 0.01,
+) -> dict[str, float]:
+    """How much signal the hints carry, as summable numerator/denominator pairs.
+
+    Sums with a stable key set: a mean would be diluted by the un-hinted micro-batches (the
+    majority in turn mode) and a conditional key set breaks dp aggregation. Ratios are taken
+    once, after summing over micro-batches and ranks.
+    """
+    out = dict.fromkeys(
+        (
+            "self_distillation/gap__sum",
+            "self_distillation/absgap__sum",
+            "self_distillation/absgap_top_decile__sum",
+            "self_distillation/teacher_higher__sum",
+            "self_distillation/loss_p50__sum",
+            "self_distillation/loss_p90__sum",
+            "self_distillation/teacher_prefers_other__sum",
+            "self_distillation/supervised_tokens__sum",
+            "self_distillation/inert_rows__sum",
+            "self_distillation/supervised_rows__sum",
+        ),
+        0.0,
+    )
+    sel = loss_mask.bool()
+    n_tok = int(sel.sum())
+    if n_tok == 0:
+        return out
+    gap = torch.nan_to_num((teacher_log_probs - student_log_probs).detach()[sel], 0.0, 0.0, 0.0)
+    loss_q = torch.nan_to_num(per_token_loss.detach()[sel].float(), 0.0, 0.0, 0.0)
+    absgap = gap.abs()
+    top_decile = torch.argsort(absgap, descending=True)[: max(1, n_tok // 10)]
+    row_tokens = loss_mask.sum(dim=-1)
+    row_gap = ((teacher_log_probs - student_log_probs).detach().abs() * loss_mask).sum(dim=-1) / row_tokens.clamp(
+        min=1
+    )
+    supervised_rows = row_tokens > 0
+    out.update(
+        {
+            "self_distillation/gap__sum": gap.sum().item(),
+            "self_distillation/absgap__sum": absgap.sum().item(),
+            "self_distillation/absgap_top_decile__sum": absgap[top_decile].sum().item(),
+            "self_distillation/teacher_higher__sum": float((gap > 0).sum()),
+            # token-weighted so the ratio stays a per-token statistic after summing
+            "self_distillation/loss_p50__sum": torch.quantile(loss_q, 0.5).item() * n_tok,
+            "self_distillation/loss_p90__sum": torch.quantile(loss_q, 0.9).item() * n_tok,
+            "self_distillation/supervised_tokens__sum": float(n_tok),
+            "self_distillation/supervised_rows__sum": float(int(supervised_rows.sum())),
+        }
+    )
+    if supervised_rows.any():
+        rows = torch.nan_to_num(row_gap[supervised_rows], 0.0, 0.0, 0.0)
+        out["self_distillation/inert_rows__sum"] = float(int((rows < inert_threshold).sum()))
+    if student_topk_log_probs is not None and teacher_topk_log_probs is not None:
+        s_top = student_topk_log_probs.detach().argmax(dim=-1)[sel]
+        t_top = teacher_topk_log_probs.detach().argmax(dim=-1)[sel]
+        out["self_distillation/teacher_prefers_other__sum"] = float((s_top != t_top).sum())
+    return out
+
+
+# (metric, numerator, denominator): finalized after summing over micro-batches and ranks
+SDPO_RATIO_METRICS = (
+    ("self_distillation/gap_mean", "self_distillation/gap__sum", "self_distillation/supervised_tokens__sum"),
+    (
+        "self_distillation/gap_concentration",
+        "self_distillation/absgap_top_decile__sum",
+        "self_distillation/absgap__sum",
+    ),
+    (
+        "self_distillation/frac_teacher_higher",
+        "self_distillation/teacher_higher__sum",
+        "self_distillation/supervised_tokens__sum",
+    ),
+    ("self_distillation/loss_p50", "self_distillation/loss_p50__sum", "self_distillation/supervised_tokens__sum"),
+    ("self_distillation/loss_p90", "self_distillation/loss_p90__sum", "self_distillation/supervised_tokens__sum"),
+    (
+        "self_distillation/teacher_prefers_other_token",
+        "self_distillation/teacher_prefers_other__sum",
+        "self_distillation/supervised_tokens__sum",
+    ),
+    (
+        "self_distillation/inert_row_fraction",
+        "self_distillation/inert_rows__sum",
+        "self_distillation/supervised_rows__sum",
+    ),
+    ("actor/entropy_hinted_span", "actor/entropy_hinted__sum", "actor/entropy_hinted_tokens__sum"),
+)
+
+
+def finalize_ratio_metrics(metrics: dict, prefix: str = "") -> dict:
+    """Turn summed numerator/denominator pairs into ratios and drop the raw sums."""
+    out = dict(metrics)
+    for name, num_key, den_key in SDPO_RATIO_METRICS:
+        num, den = out.get(prefix + num_key), out.get(prefix + den_key)
+        if num is None or den is None:
+            continue
+        out[prefix + name] = float(num) / float(den) if den else 0.0
+    tokens = out.get(prefix + "self_distillation/supervised_tokens__sum")
+    if tokens is not None:
+        out[prefix + "self_distillation/supervised_tokens"] = float(tokens)
+    for _, num_key, den_key in SDPO_RATIO_METRICS:  # denominators are shared, so drop them last
+        out.pop(prefix + num_key, None)
+        out.pop(prefix + den_key, None)
+    return out
 
 
 def compute_self_distillation_loss(
@@ -1216,6 +1350,7 @@ def compute_self_distillation_loss(
     loss_agg_mode: str = "token-mean",
     rollout_is_weights: Optional[torch.Tensor] = None,
     global_batch_info: Optional[dict[str, Any]] = None,
+    seq_weights: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Compute the SDPO distillation loss for actor updates.
 
@@ -1336,14 +1471,31 @@ def compute_self_distillation_loss(
 
     # truthiness: zero-supervised minis all-reduce batch_num_tokens to 0; the clamped fallback yields 0 loss, not NaN
     if global_batch_info is not None and global_batch_info.get("batch_num_tokens"):
-        loss = agg_loss(loss_mat=per_token_loss, loss_mask=loss_mask, loss_agg_mode=loss_agg_mode, **global_batch_info)
+        loss = agg_loss(
+            loss_mat=per_token_loss,
+            loss_mask=loss_mask,
+            loss_agg_mode=loss_agg_mode,
+            seq_weights=seq_weights,
+            **global_batch_info,
+        )
     else:
         loss = agg_loss(
             loss_mat=per_token_loss,
             loss_mask=loss_mask,
             loss_agg_mode=loss_agg_mode,
             batch_num_tokens=loss_mask.sum().clamp(min=1.0),
+            seq_weights=seq_weights,
         )
+    metrics.update(
+        _distillation_signal_metrics(
+            per_token_loss=per_token_loss,
+            loss_mask=loss_mask,
+            student_log_probs=student_log_probs,
+            teacher_log_probs=teacher_log_probs,
+            student_topk_log_probs=student_topk_log_probs,
+            teacher_topk_log_probs=teacher_topk_log_probs,
+        )
+    )
     metrics.update(
         {
             "self_distillation/loss": loss.detach().item(),

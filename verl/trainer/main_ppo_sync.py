@@ -71,7 +71,7 @@ from verl.single_controller.ray import (
 from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler, run_ppo
 from verl.trainer.ppo import core_algos, sdpo_teacher
-from verl.trainer.ppo.core_algos import agg_loss
+from verl.trainer.ppo.core_algos import agg_loss, finalize_ratio_metrics
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -1524,14 +1524,47 @@ class PPOTrainer:
             loss_mask_rows = [response_mask_list[i] * int(legacy_mask[i]) for i in range(batch_size)]
         teacher_fields["loss_mask"] = torch.nested.nested_tensor(loss_mask_rows, layout=torch.jagged)
 
+        # A condensed trajectory ships one row per segment; segment_index==0 marks it once so
+        # fractions count trajectories rather than segments (long, failing traces split most).
+        num_segments_per_row = [
+            max(1, int((ef or {}).get("num_segments", 1) or 1)) if isinstance(ef, dict) else 1
+            for ef in extra_fields_list
+        ]
+        first_seg = [
+            i
+            for i, ef in enumerate(extra_fields_list)
+            if not isinstance(ef, dict) or int(ef.get("segment_index", 0) or 0) == 0
+        ]
+        # A trajectory counts once in total, and its segments split that weight by how much
+        # supervision each carries: the loss is then a token-mean within a trajectory and a plain
+        # mean across trajectories. Splitting evenly instead would over-weight a segment that only
+        # holds one short hinted turn. Keys are '{sample}_{session}_{segment}'.
+        supervised_per_row = [float(mask.sum()) for mask in loss_mask_rows]
+        traj_of_row = [tuple(key.rsplit("_", 2)[:2]) for key in batch.keys]
+        n_traces = len(set(traj_of_row))
+        traj_supervised: dict[tuple, float] = defaultdict(float)
+        for traj, n_supervised in zip(traj_of_row, supervised_per_row, strict=True):
+            traj_supervised[traj] += n_supervised
+        shares = [
+            n_supervised / traj_supervised[traj] if traj_supervised[traj] > 0 else 0.0
+            for traj, n_supervised in zip(traj_of_row, supervised_per_row, strict=True)
+        ]
+        # Renormalize to the supervised-row count: the shares sum to the number of supervised
+        # trajectories, which would otherwise shrink the update by the average segments-per-
+        # trajectory (~0.6x at our condensation rate) and confound comparisons across runs.
+        n_supervised_rows = sum(1 for n in supervised_per_row if n > 0)
+        total_share = sum(shares)
+        scale = (n_supervised_rows / total_share) if total_share > 0 else 1.0
+        teacher_fields["trace_weight"] = torch.tensor(
+            [share * scale for share in shares], dtype=torch.float32
+        ).unsqueeze(-1)
+
         unique_uids = set(uids)
-        num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
-        num_with_feedback_used = sum(1 for f in feedback_used if f)
-        num_with_solution = sum(1 for ctx in contexts if ctx.solution is not None)
+        num_with_feedback_available = sum(1 for i in first_seg if feedback_list[i] is not None)
+        num_with_feedback_used = sum(1 for i in first_seg if feedback_used[i])
+        num_with_solution = sum(1 for i in first_seg if contexts[i].solution is not None)
         num_supervised = sum(
-            1
-            for hinted, legacy in zip(hinted_per_row, legacy_mask, strict=True)
-            if hinted or (not turn_mode and legacy)
+            1 for i in range(batch_size) if hinted_per_row[i] or (not turn_mode and legacy_mask[i])
         )
         metrics.update(
             {
@@ -1539,29 +1572,157 @@ class PPOTrainer:
                     [uid for uid in unique_uids if len(success_by_uid[uid]) > 0]
                 )
                 / len(unique_uids),
-                "self_distillation/success_sample_fraction": num_with_solution / batch_size,
-                "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,
-                "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
+                "self_distillation/success_sample_fraction": num_with_solution / n_traces,
+                "self_distillation/feedback_available_fraction": num_with_feedback_available / n_traces,
+                "self_distillation/feedback_used_fraction": num_with_feedback_used / n_traces,
                 "self_distillation/reprompt_sample_fraction": num_supervised / batch_size,
             }
         )
+        metrics.update(
+            self._condensation_metrics(
+                extra_fields_list, num_segments_per_row, reward_tensor, traj_of_row,
+                self_distillation_cfg.success_reward_threshold,
+            )
+        )
+        metrics.update(self._trajectory_timing_metrics(extra_fields_list))
         if turn_mode:
             num_hinted = sum(1 for hinted in hinted_per_row if hinted)
+            hinted_traces = {traj_of_row[i] for i, hinted in enumerate(hinted_per_row) if hinted}
             metrics.update(
                 {
                     "self_distillation/hinted_sample_fraction": num_hinted / batch_size,
+                    "self_distillation/hinted_trace_fraction": len(hinted_traces) / n_traces,
                     "self_distillation/hinted_turns_per_sample": (
                         sum(len(hinted) for hinted in hinted_per_row) / num_hinted if num_hinted else 0.0
+                    ),
+                    "self_distillation/hinted_turns_per_trace": (
+                        sum(len(hinted) for hinted in hinted_per_row) / len(hinted_traces) if hinted_traces else 0.0
                     ),
                     "self_distillation/hint_injection_fallbacks": hint_fallbacks,
                 }
             )
+            metrics.update(self._hint_position_metrics(hinted_per_row, extra_fields_list, traj_of_row))
 
         tq.kv_batch_put(
             keys=batch.keys,
             partition_id=batch.partition_id,
             fields=TensorDict(teacher_fields, batch_size=batch_size),
         )
+
+    @staticmethod
+    def _condensation_metrics(
+        extra_fields_list, num_segments_per_row, reward_tensor, traj_of_row, success_threshold
+    ) -> dict:
+        """Condensation reach and whether it predicts the outcome.
+
+        Rows are segments; a trajectory is its segment_index==0 row, and all its segments carry
+        the same reward, so per-trace stats read off the first-segment rows.
+        """
+        seq_scores = reward_tensor.sum(dim=-1).detach().cpu().tolist()
+        traces, turns_by_seg = [], defaultdict(list)
+        for i, ef in enumerate(extra_fields_list):
+            ef = ef if isinstance(ef, dict) else {}
+            seg_idx = int(ef.get("segment_index", 0) or 0)
+            spans = ef.get("turn_spans") or []
+            if spans:  # failed rollouts ship empty rows; counting them as 0 turns skews the mean
+                turns_by_seg[min(seg_idx, 3)].append(len(spans))
+            if seg_idx == 0:
+                traces.append((num_segments_per_row[i], seq_scores[i], ef.get("traj_exit_reason")))
+        if not traces:
+            return {}
+        n = len(traces)
+        solved = lambda score: score >= success_threshold  # noqa: E731
+        out = {
+            "rollout/condensed_trace_fraction": sum(1 for s, _, _ in traces if s > 1) / n,
+            "rollout/segments_per_trace": sum(s for s, _, _ in traces) / n,
+        }
+        for bucket in (1, 2, 3):
+            sel = [sc for s, sc, _ in traces if (s == bucket if bucket < 3 else s >= 3)]
+            name = f"{bucket}seg" if bucket < 3 else "3plusseg"
+            if sel:
+                out[f"rollout/solve_rate_{name}"] = sum(1 for sc in sel if solved(sc)) / len(sel)
+                out[f"rollout/trace_fraction_{name}"] = len(sel) / n
+        reasons = [r for _, _, r in traces if r]
+        for reason in set(reasons):
+            sub = [sc for _, sc, r in traces if r == reason]
+            out[f"rollout/exit_{reason}_fraction"] = len(sub) / n
+            out[f"rollout/solve_rate_exit_{reason}"] = sum(1 for sc in sub if solved(sc)) / len(sub)
+        for seg_idx, counts in sorted(turns_by_seg.items()):
+            name = str(seg_idx) if seg_idx < 3 else "3plus"
+            out[f"rollout/turns_in_segment_{name}"] = sum(counts) / len(counts)
+        return out
+
+    @staticmethod
+    def _trajectory_timing_metrics(extra_fields_list) -> dict:
+        """Per-trajectory time split. The residual (loop_wall minus the parts) is the in-loop
+        overhead we have not attributed yet; step wall clock is set by the slowest trajectory,
+        so the max matters more than the mean."""
+        rows = [
+            (ef or {}).get("timings") or {}
+            for ef in extra_fields_list
+            if isinstance(ef, dict) and int((ef or {}).get("segment_index", 0) or 0) == 0
+        ]
+        rows = [t for t in rows if t.get("loop_wall")]
+        if not rows:
+            return {}
+        parts = ("generate_sequences", "tool_calls", "condense", "parse_action", "tokenize_observations")
+        out = {}
+        for key in parts + ("loop_wall", "env_setup", "reward_eval", "reflect"):
+            vals = [float(t.get(key, 0.0)) for t in rows]
+            out[f"traj_time/{key}_mean"] = sum(vals) / len(vals)
+        residual = [
+            max(0.0, float(t.get("loop_wall", 0.0)) - sum(float(t.get(k, 0.0)) for k in parts)) for t in rows
+        ]
+        totals = [
+            float(t.get("loop_wall", 0.0))
+            + float(t.get("env_setup", 0.0))
+            + float(t.get("reward_eval", 0.0))
+            + float(t.get("reflect", 0.0))
+            for t in rows
+        ]
+        out["traj_time/unattributed_mean"] = sum(residual) / len(residual)
+        out["traj_time/total_mean"] = sum(totals) / len(totals)
+        out["traj_time/total_max"] = max(totals)
+        out["traj_time/unattributed_share"] = sum(residual) / max(sum(totals), 1e-6)
+        for key in ("eval_completed", "patch_apply_failed"):
+            vals = [float(t[key]) for t in rows if key in t]  # absent means never measured, not OK
+            if vals:
+                out[f"reward_health/{key}_fraction"] = sum(vals) / len(vals)
+        return out
+
+    @staticmethod
+    def _hint_position_metrics(hinted_per_row, extra_fields_list, traj_of_row) -> dict:
+        """Where in a trajectory the hints land: late hints supervise turns nothing can still fix.
+
+        Step ranges are pooled per trajectory, since a condensed trace splits its turns across
+        rows and a per-row range would call every segment-final hint a last-turn hint.
+        """
+        traj_steps = defaultdict(list)
+        for traj, ef in zip(traj_of_row, extra_fields_list, strict=True):
+            spans = (ef if isinstance(ef, dict) else {}).get("turn_spans") or []
+            traj_steps[traj].extend(int(span[0]) for span in spans)
+        rel, gaps, last_two = [], [], 0
+        for hinted, traj in zip(hinted_per_row, traj_of_row, strict=True):
+            steps = sorted(traj_steps.get(traj) or [0])
+            lo, hi = steps[0], steps[-1]
+            span_len = max(hi - lo, 1)
+            hinted_steps = sorted(int(step) for step, _, _, _ in hinted)
+            rel.extend((step - lo) / span_len for step in hinted_steps)
+            gaps.extend(b - a for a, b in zip(hinted_steps, hinted_steps[1:]))
+            last_two += sum(1 for step in hinted_steps if step >= hi - 1)
+        if not rel:
+            return {}
+        srt = sorted(rel)
+        return {
+            "self_distillation/hint_position_mean": sum(rel) / len(rel),
+            "self_distillation/hint_position_median": srt[len(srt) // 2],
+            "self_distillation/hint_position_first_half": sum(1 for r in rel if r <= 0.5) / len(rel),
+            "self_distillation/hint_in_last_two_turns": last_two / len(rel),
+            "self_distillation/hint_gap_mean": (sum(gaps) / len(gaps)) if gaps else 0.0,
+            "self_distillation/hint_adjacent_fraction": (
+                (sum(1 for g in gaps if g <= 2) / len(gaps)) if gaps else 0.0
+            ),
+        }
 
     def _get_required_batch_multiple(self, dp_size: int) -> int:
         """Return the global batch multiple required by downstream train steps(e.g. critics, actors)."""
@@ -1827,7 +1988,8 @@ class PPOTrainer:
         output: TensorDict = self.actor_rollout_wg.update_actor(batch)
         output = rename_dict(output["metrics"], "actor/")
         output["perf/mfu/actor"] = output.pop("actor/mfu")
-        actor_metrics = reduce_metrics(output)
+        # after reduce_metrics: the summed pairs are plain floats here, Metric objects before it
+        actor_metrics = finalize_ratio_metrics(reduce_metrics(output), prefix="actor/")
         metrics.update(actor_metrics)
 
         return batch

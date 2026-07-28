@@ -266,6 +266,12 @@ def sdpo_ppo_loss(
         for field in ("response_mask", "self_distillation_mask", "old_log_probs", "rollout_is_weights")
         if field in data
     ]
+    # one row per condensation segment: each row weighs its share of the trajectory's supervised tokens
+    trace_weight = tu.get(data, "trace_weight", default=None)
+    if trace_weight is not None:
+        if trace_weight.is_nested:
+            trace_weight = trace_weight.to_padded_tensor(0.0)
+        trace_weight = trace_weight.reshape(-1).to(torch.float32)
     padded = data.select(*pad_fields).to_padded_tensor()
     response_mask = padded["response_mask"]
     self_distillation_mask = tu.get(padded, "self_distillation_mask", default=None)
@@ -327,6 +333,7 @@ def sdpo_ppo_loss(
         loss_agg_mode=config.loss_agg_mode,
         rollout_is_weights=rollout_is_weights,
         global_batch_info=config.global_batch_info,
+        seq_weights=trace_weight,
     )
     metrics["self_distillation/empty_target_batch"] = (
         self_distillation_mask.sum().item() == 0 if self_distillation_mask is not None else False
@@ -342,7 +349,12 @@ def sdpo_ppo_loss(
     else:
         metric_aggregation = AggregationType.MEAN
 
-    metrics = Metric.from_dict(metrics, aggregation=AggregationType.MEAN)
+    # '__sum' pairs must add across micro-batches; everything else is a per-micro-batch mean
+    summed = {k: v for k, v in metrics.items() if k.endswith("__sum")}
+    metrics = Metric.from_dict(
+        {k: v for k, v in metrics.items() if not k.endswith("__sum")}, aggregation=AggregationType.MEAN
+    )
+    metrics.update(Metric.from_dict(summed, aggregation=AggregationType.SUM))
     metrics["actor/pg_loss"] = Metric(value=loss, aggregation=metric_aggregation)
     policy_loss = loss
 
@@ -365,6 +377,14 @@ def sdpo_ppo_loss(
         )
         policy_loss -= config.entropy_coeff * entropy_loss
         metrics["actor/entropy_loss"] = Metric(value=entropy_loss, aggregation=metric_aggregation)
+        # Is the policy sharpening only where we train it, or everywhere? Summed, not meaned:
+        # un-hinted micro-batches would otherwise drag the average toward zero.
+        metrics["actor/entropy_hinted__sum"] = Metric(
+            value=(entropy.detach() * entropy_mask).sum(), aggregation=AggregationType.SUM
+        )
+        metrics["actor/entropy_hinted_tokens__sum"] = Metric(
+            value=entropy_mask.sum(), aggregation=AggregationType.SUM
+        )
 
     return policy_loss, metrics
 

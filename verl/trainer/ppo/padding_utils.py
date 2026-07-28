@@ -124,6 +124,8 @@ def construct_minimal_padding_template(
         template_sample["teacher_input_ids"] = input_ids.clone()
     if "teacher_seq_meta" in template_sample:
         template_sample["teacher_seq_meta"] = torch.tensor([1, 0, 0, 1], dtype=torch.int64)
+    if "trace_weight" in template_sample:
+        template_sample["trace_weight"] = torch.zeros_like(template_sample["trace_weight"])
     if "self_distillation_mask" in template_sample:
         sd_mask = template_sample["self_distillation_mask"]
         template_sample["self_distillation_mask"] = (

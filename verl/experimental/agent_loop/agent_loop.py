@@ -84,6 +84,18 @@ class AgentLoopMetrics(BaseModel):
     tool_calls: float = 0.0
     compute_score: float = 0.0
     num_preempted: int = -1  # -1 means not available
+    # Everything below the model call: without it a trajectory's wall clock cannot be accounted
+    # for (env setup and reward run outside the turn loop, so loop_wall excludes them). Only the
+    # async trainer aggregates this model; the sync path reads the same values from extra_fields.
+    loop_wall: float = 0.0
+    env_setup: float = 0.0
+    reward_eval: float = 0.0
+    reflect: float = 0.0
+    condense: float = 0.0
+    parse_action: float = 0.0
+    tokenize_observations: float = 0.0
+    eval_completed: float = 1.0
+    patch_apply_failed: float = 0.0
 
 
 class AgentLoopOutput(BaseModel):
