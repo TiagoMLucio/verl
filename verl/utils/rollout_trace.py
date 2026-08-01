@@ -188,10 +188,19 @@ def rollout_trace_attr(
 
     if should_skip:
         token = _trace_enabled.set(False)
+        # langfuse sampling skips this rollout, but the local trace sink still
+        # wants its lane identity: set attributes without touching the backend
+        attrs_token = None
+        if trace_file.enabled():
+            attrs_token = _trace_attributes.set(
+                {"sample_index": sample_index, "step": step, "rollout_n": rollout_n, "validate": validate}
+            )
         try:
             yield
         finally:
             _trace_enabled.reset(token)
+            if attrs_token is not None:
+                _trace_attributes.reset(attrs_token)
         return
 
     # Build attributes for the trace (also for file-only tracing: they carry the
