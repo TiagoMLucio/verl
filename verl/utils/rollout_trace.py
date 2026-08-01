@@ -14,6 +14,7 @@
 
 import contextlib
 import functools
+import time as _time
 import inspect
 import json
 import os
@@ -21,6 +22,8 @@ from contextvars import ContextVar
 from typing import Optional
 
 from pydantic import BaseModel
+
+from verl.utils import trace_file
 
 from verl.utils.ray_utils import get_event_loop
 
@@ -191,9 +194,10 @@ def rollout_trace_attr(
             _trace_enabled.reset(token)
         return
 
-    # Build attributes for the trace
+    # Build attributes for the trace (also for file-only tracing: they carry the
+    # per-rollout lane identity for the local trace sink)
     attributes = {}
-    if backend:
+    if backend or trace_file.enabled():
         if sample_index is not None:
             attributes["sample_index"] = sample_index
         if step is not None:
@@ -201,10 +205,21 @@ def rollout_trace_attr(
         if rollout_n is not None:
             attributes["rollout_n"] = rollout_n
         attributes["validate"] = validate
-        attributes["experiment_name"] = RolloutTraceConfig.get_instance().experiment_name
+        try:
+            attributes["experiment_name"] = RolloutTraceConfig.get_instance().experiment_name
+        except Exception:
+            pass
 
-    if not attributes or backend is None:
+    if not attributes or (backend is None and not trace_file.enabled()):
         yield
+        return
+
+    if backend is None:
+        token = _trace_attributes.set(attributes)
+        try:
+            yield
+        finally:
+            _trace_attributes.reset(token)
         return
 
     token = _trace_attributes.set(attributes)
@@ -481,7 +496,14 @@ def rollout_trace_update_span(input=None, output=None, metadata=None):
 @contextlib.contextmanager
 def rollout_trace_span(name, input=None, metadata=None, as_type="span"):
     """Open an observation for an inline block. Yields the span, or None when untraced;
-    callers may ``span.update(output=...)``. Exceptions mark the span ERROR and propagate."""
+    callers may ``span.update(output=...)``. Exceptions mark the span ERROR and propagate.
+    With VERL_TRACE_DIR set, the wall-clock interval is also appended to the local
+    trace file regardless of backend."""
+    with trace_file.span(name, attrs_getter=_trace_attributes.get):
+        yield from _rollout_trace_span_backend(name, input=input, metadata=metadata, as_type=as_type)
+
+
+def _rollout_trace_span_backend(name, input=None, metadata=None, as_type="span"):
     client = _langfuse_client()
     if client is None:
         yield None
@@ -515,6 +537,13 @@ def rollout_trace_event(name, metadata=None, input=None, output=None):
 
 def rollout_trace_generation(name, model=None, input=None, output=None, usage=None):
     """Record an LLM call as a generation observation with chat I/O and token usage."""
+    if trace_file.enabled() and usage:
+        now = _time.time()
+        trace_file.emit(
+            "llm_generation", now, now, attrs=_trace_attributes.get(),
+            completion_tokens=usage.get("completion_tokens") or usage.get("output") or 0,
+            prompt_tokens=usage.get("prompt_tokens") or usage.get("input") or 0,
+        )
     client = _langfuse_client()
     if client is None:
         return
@@ -542,7 +571,28 @@ def rollout_trace_score(name, value, comment=None, data_type=None):
         pass
 
 
+def _with_file_span(func):
+    """Innermost wall-clock file timing for a traced op (any backend, or none)."""
+    if inspect.iscoroutinefunction(func):
+
+        @functools.wraps(func)
+        async def timed(self, *args, **kwargs):
+            with trace_file.span(func.__qualname__, attrs_getter=_trace_attributes.get):
+                return await func(self, *args, **kwargs)
+
+    else:
+
+        @functools.wraps(func)
+        def timed(self, *args, **kwargs):
+            with trace_file.span(func.__qualname__, attrs_getter=_trace_attributes.get):
+                return func(self, *args, **kwargs)
+
+    return timed
+
+
 def rollout_trace_op(func):
+    func = _with_file_span(func)
+
     @functools.wraps(func)
     async def async_wrapper(self, *args, **kwargs):
         if not _trace_enabled.get():
