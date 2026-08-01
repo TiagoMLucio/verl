@@ -17,12 +17,16 @@ import socket
 import threading
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 
 __all__ = ["enabled", "emit", "span"]
 
 _lock = threading.Lock()
 _file = None
 _dir_checked = False
+# lane inherited by every span in the same asyncio task tree; concurrent tasks
+# without rollout attributes still get distinct rows instead of piling on tid 0
+_lane_cv: ContextVar[int | None] = ContextVar("trace_file_lane", default=None)
 
 
 def enabled() -> bool:
@@ -63,13 +67,21 @@ def _sink():
 
 
 def _lane(attrs: dict | None) -> int:
-    if not attrs:
-        return 0
-    sample = attrs.get("sample_index")
-    if sample is None:
-        return 0
-    # stable row per (sample, rollout_n); offset keeps rollouts clear of tid 0
-    return 10 + int(sample) * 8 + int(attrs.get("rollout_n") or 0) % 8
+    if attrs and attrs.get("sample_index") is not None:
+        # stable row per (sample, rollout_n); offset keeps rollouts clear of tid 0
+        return 10 + int(attrs["sample_index"]) * 8 + int(attrs.get("rollout_n") or 0) % 8
+    inherited = _lane_cv.get()
+    if inherited is not None:
+        return inherited
+    try:
+        import asyncio
+
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    if task is None:
+        return 0  # sync context (trainer): sequential, tid 0 is safe
+    return 1_000_000 + id(task) % 1_000_000
 
 
 def emit(name: str, t_start: float, t_end: float, attrs: dict | None = None, **args) -> None:
@@ -98,6 +110,14 @@ def span(name: str, attrs_getter=None, **args):
         yield
         return
     t_start = time.time()
+    # bind the lane at entry so every nested span (and thread hop) inherits the row
+    attrs_in = None
+    if attrs_getter is not None:
+        try:
+            attrs_in = attrs_getter()
+        except Exception:
+            attrs_in = None
+    token = _lane_cv.set(_lane(attrs_in))
     error = None
     try:
         yield
@@ -114,3 +134,4 @@ def span(name: str, attrs_getter=None, **args):
         if error is not None:
             args = {**args, "error": error}
         emit(name, t_start, time.time(), attrs=attrs, **args)
+        _lane_cv.reset(token)
