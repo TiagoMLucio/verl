@@ -84,12 +84,27 @@ def _lane(attrs: dict | None) -> int:
     return 1_000_000 + id(task) % 1_000_000
 
 
+def _task_id() -> int | None:
+    """Id of the running asyncio task: an exact per-rollout grouping key for trace
+    consumers, surviving even identical attribute tuples (e.g. val repeats)."""
+    try:
+        import asyncio
+
+        task = asyncio.current_task()
+    except RuntimeError:
+        return None
+    return None if task is None else id(task) % 1_000_000
+
+
 def emit(name: str, t_start: float, t_end: float, attrs: dict | None = None, **args) -> None:
     sink = _sink()
     if sink is None:
         return
     if attrs:
         args = {**{k: v for k, v in attrs.items() if k in ("sample_index", "step", "rollout_n", "validate")}, **args}
+    task = _task_id()
+    if task is not None:
+        args.setdefault("task", task)
     event = {
         "name": name,
         "ph": "X",

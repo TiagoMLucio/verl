@@ -1045,12 +1045,12 @@ async def get_trajectory_info(step, index, validate):
         list: trajectory.
     """
     trajectory_info = []
-    rollout_n = 0
+    # count repeats per index across the whole batch: adjacency cannot be assumed
+    # (TransferQueue interleaves repeated rows), and rollout_n must distinguish them
+    counts: dict = {}
     for i in range(len(index)):
-        if i > 0 and index[i - 1] == index[i]:
-            rollout_n += 1
-        else:
-            rollout_n = 0
+        rollout_n = counts.get(index[i], 0)
+        counts[index[i]] = rollout_n + 1
         trajectory_info.append({"step": step, "sample_index": index[i], "rollout_n": rollout_n, "validate": validate})
     return trajectory_info
 
