@@ -1688,6 +1688,16 @@ class PPOTrainer:
             + float(t.get("reflect", 0.0))
             for t in rows
         ]
+        # vLLM preemption count per trajectory: >0 means the KV cache could not hold the
+        # working set, so sequences were evicted and their prefill recomputed (wasted GPU
+        # work that shows up as high utilization with low goodput). -1 = engine did not report.
+        preempted = [float(t.get("num_preempted", -1)) for t in rows]
+        reported = [p for p in preempted if p >= 0]
+        out["rollout/preempted_reported_fraction"] = len(reported) / len(preempted)
+        if reported:
+            out["rollout/preempted_mean"] = sum(reported) / len(reported)
+            out["rollout/preempted_max"] = max(reported)
+            out["rollout/preempted_trace_fraction"] = sum(1 for p in reported if p > 0) / len(reported)
         out["traj_time/unattributed_mean"] = sum(residual) / len(residual)
         out["traj_time/total_mean"] = sum(totals) / len(totals)
         out["traj_time/total_max"] = max(totals)

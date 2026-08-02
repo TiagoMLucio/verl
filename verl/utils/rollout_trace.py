@@ -544,14 +544,20 @@ def rollout_trace_event(name, metadata=None, input=None, output=None):
         pass
 
 
-def rollout_trace_generation(name, model=None, input=None, output=None, usage=None):
-    """Record an LLM call as a generation observation with chat I/O and token usage."""
+def rollout_trace_generation(name, model=None, input=None, output=None, usage=None, num_preempted=None):
+    """Record an LLM call as a generation observation with chat I/O and token usage.
+
+    ``num_preempted`` is the engine's per-request preemption count: >0 means the KV
+    cache could not hold the working set, so the sequence was evicted and its prefill
+    recomputed. Emitted per request so preemption can be correlated with in-flight load.
+    """
     if trace_file.enabled() and usage:
         now = _time.time()
         trace_file.emit(
             "llm_generation", now, now, attrs=_trace_attributes.get(),
             completion_tokens=usage.get("completion_tokens") or usage.get("output") or 0,
             prompt_tokens=usage.get("prompt_tokens") or usage.get("input") or 0,
+            **({"num_preempted": int(num_preempted)} if num_preempted is not None else {}),
         )
     client = _langfuse_client()
     if client is None:
