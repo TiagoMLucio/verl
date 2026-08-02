@@ -539,7 +539,13 @@ class AgentLoopWorker:
 
         # For n rollouts per sample, we trace all n rollouts for selected samples
         # Note: This sampling happens per-worker, so total traces = max_samples_per_worker * num_workers * n
-        if max_samples_per_worker is not None:
+        if batch.meta_info.get("validate", False):
+            # Validation floods the trace backend (n>1, long trajectories, token2text
+            # payloads) and a self-hosted server drops batches under the burst; val
+            # outcomes are already dumped to validation_data_dir, so skip backend
+            # traces for val. File-sink profiler spans are unaffected.
+            traced_indices = set()
+        elif max_samples_per_worker is not None:
             unique_sample_indices = np.unique(index)
             if max_samples_per_worker < len(unique_sample_indices):
                 selected_samples = set(
