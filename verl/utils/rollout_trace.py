@@ -396,16 +396,45 @@ def _current_trace_attributes():
     return {**(_trace_attributes.get() or {})}
 
 
+def trace_clip(text, cap=8000):
+    """Clip a payload for tracing, keeping both ends and saying what was dropped.
+
+    Middle-out: a test log's setup errors are at the top and the failure summary at the
+    bottom, so a tail-only clip loses half the story.
+    """
+    if text is None:
+        return None
+    text = text if isinstance(text, str) else str(text)
+    if cap <= 0 or len(text) <= cap:
+        return text
+    head = cap // 2
+    tail = cap - head
+    return "{}\n...[clipped {} chars]...\n{}".format(text[:head], len(text) - cap, text[-tail:])
+
+
 def _apply_trace_identity(client):
     """Set the trace identity (name/session/metadata/tags) from the stashed rollout attributes."""
     attrs = _trace_attributes.get() or {}
     si = attrs.get("sample_index")
+    cfg = RolloutTraceConfig.get_instance()
+    experiment, project = cfg.experiment_name, cfg.project_name
     metadata = {k: v for k, v in attrs.items() if k != "validate"}
+    if experiment:
+        metadata["experiment"] = experiment
+    if project:
+        metadata["project"] = project
     tags = ["validate" if attrs.get("validate") else "train"]
+    if experiment:
+        tags.append(experiment)
+    # scope the session by run: a bare sample_index groups unrelated runs together,
+    # since the same dataset row is replayed by every experiment
+    session = None
+    if si is not None:
+        session = "{}/{}".format(experiment, si) if experiment else str(si)
     try:
         client.update_current_trace(
             name="agent_loop",
-            session_id=str(si) if si is not None else None,
+            session_id=session,
             metadata=metadata,
             tags=tags,
         )
