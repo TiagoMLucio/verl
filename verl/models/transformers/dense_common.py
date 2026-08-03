@@ -84,6 +84,7 @@ def forward_with_torch_backend(
     logits_to_keep: int | torch.Tensor = 0,
     temperature: float = 1.0,
     shift_labels: Optional[torch.LongTensor] = None,
+    use_fused_kernels: bool = True,
     **loss_kwargs,
 ) -> tuple | CausalLMOutputForPPO:
     from verl.utils.experimental.torch_functional import FusedLinearForPPO
@@ -102,6 +103,19 @@ def forward_with_torch_backend(
     )
 
     hidden_states = outputs[0]
+
+    # The patch is installed on the model class, so every caller shares it. Callers that
+    # need real logits (SDPO reads top-k and a logsumexp off them) opt out per call, while
+    # a log-prob-only pass keeps the fused path and never widens hidden states to vocab.
+    if not use_fused_kernels:
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        return CausalLMOutputWithPast(
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
     if not return_dict:
         raise NotImplementedError("forward_with_torch_backend has to return_dict")
@@ -152,6 +166,7 @@ def forward_with_triton_backend(
     logits_to_keep: int | torch.Tensor = 0,
     temperature: float = 1.0,
     shift_labels: Optional[torch.LongTensor] = None,
+    use_fused_kernels: bool = True,
     **loss_kwargs,
 ) -> tuple | CausalLMOutputForPPO:
     from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
@@ -171,6 +186,19 @@ def forward_with_triton_backend(
     )
 
     hidden_states = outputs[0]
+
+    # The patch is installed on the model class, so every caller shares it. Callers that
+    # need real logits (SDPO reads top-k and a logsumexp off them) opt out per call, while
+    # a log-prob-only pass keeps the fused path and never widens hidden states to vocab.
+    if not use_fused_kernels:
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        return CausalLMOutputWithPast(
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
     if not return_dict:
         raise NotImplementedError("forward_with_triton_backend has to return_dict")

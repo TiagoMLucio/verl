@@ -1111,6 +1111,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
         model_inputs.update(multi_modal_inputs)
         model_inputs.update(extra_args)
+        # the patched forward is class-level; tell it which mode this call wants
+        if self.model_config.use_fused_kernels:
+            model_inputs["use_fused_kernels"] = use_fused_kernels
 
         return model_inputs, output_args
 

@@ -739,6 +739,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def compute_log_prob(self, data: TensorDict) -> TensorDict:
         from verl.utils.debug_breakpoints import should_break
         if should_break("compute_log_prob"): breakpoint()
+        # Log-probs and entropy are all this pass returns, and the fused kernel produces
+        # both straight from the hidden states: a full sequence would otherwise widen to
+        # (tokens x vocab) logits plus a same-sized softmax copy to yield one float
+        # per token (17.5 GiB each at 61k tokens, measured).
+        tu.assign_non_tensor(data, use_fused_kernels=self.actor.engine_config.use_fused_kernels)
         output = self.actor.infer_batch(data)
 
         return output.cpu() if output is not None else None
@@ -752,6 +757,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self.sdpo_enabled:
             attach_response_keep_positions(data)
+        # SDPO reads top-k and a logsumexp off the real logits, which the fused kernel
+        # never materializes; span-only keeps this pass cheap anyway.
+        tu.assign_non_tensor(data, use_fused_kernels=False)
 
         output = self.actor.train_mini_batch(data=data)
         if self.sdpo_enabled and tu.get_non_tensor_data(output, "did_update", default=True):
@@ -868,9 +876,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             "use_dynamic_bsz": False,
             "max_token_len_per_gpu": None,
             "micro_batch_size_per_gpu": responses.shape[0],
-            "use_fused_kernels": tu.get_non_tensor_data(
-                data=data, key="use_fused_kernels", default=self.ref.engine_config.use_fused_kernels
-            ),
+            # the teacher's outputs are top-k logps read off the logits, same as the student
+            "use_fused_kernels": False,
             "calculate_entropy": False,
             "distillation_use_topk": use_logits_processor,
         }
