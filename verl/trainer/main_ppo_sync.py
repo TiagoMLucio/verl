@@ -914,6 +914,7 @@ class PPOTrainer:
         dump_all_inputs: list[str] = []
         dump_all_outputs: list[str] = []
         dump_all_keys: list[str] = []
+        dump_all_indices: list = []
         session_to_sample_idx: dict[str, int] = {}
 
         for batch_dict in self.val_dataloader:
@@ -1009,6 +1010,11 @@ class PPOTrainer:
             dump_all_inputs.extend(all_inputs)
             dump_all_outputs.extend(all_outputs)
             dump_all_keys.extend(batch.keys)
+            # read before the queue is cleared below
+            batch_indices = self._fetch_sample_indices(batch)
+            if batch_indices is None or len(batch_indices) != len(batch.keys):
+                batch_indices = [None] * len(batch.keys)
+            dump_all_indices.extend(batch_indices)
 
             # 5. cleanup transfer queue and replay buffer
             tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
@@ -1029,6 +1035,7 @@ class PPOTrainer:
             dump_all_inputs = [dump_all_inputs[i] for i in sorted_indices]
             dump_all_outputs = [dump_all_outputs[i] for i in sorted_indices]
             dump_all_keys = [dump_all_keys[i] for i in sorted_indices]
+            dump_all_indices = [dump_all_indices[i] for i in sorted_indices]
 
             # For ground truths, scores and reward extra infos, find the values in the
             # lists for the final samples of each session
@@ -1046,7 +1053,8 @@ class PPOTrainer:
                 reward_extra_infos_dict={
                     k: [v[i] for i in session_final_indices] for k, v in reward_extra_infos_dict.items()
                 }
-                | {"uid": dump_all_keys},
+                | {"uid": dump_all_keys}
+                | ({"sample_index": dump_all_indices} if any(i is not None for i in dump_all_indices) else {}),
                 dump_path=val_data_dir,
             )
 
@@ -1144,6 +1152,22 @@ class PPOTrainer:
         self._dump_futures.clear()
         self._dump_executor.shutdown(wait=True)
 
+    @staticmethod
+    def _fetch_sample_indices(batch: KVBatchMeta):
+        """Dataset row ids (`extra_info.index`) for a batch, or None if unavailable.
+
+        Kept as its own read so a missing column degrades the dump instead of taking
+        the training step down with it.
+        """
+        try:
+            got = tq.kv_batch_get(
+                keys=batch.keys, partition_id=batch.partition_id, select_fields=["index"]
+            )["index"]
+            return got.tolist() if hasattr(got, "tolist") else list(got)
+        except Exception as e:  # noqa: BLE001 - dumping is best-effort
+            logger.warning(f"sample_index unavailable for this dump: {e}")
+            return None
+
     def _log_rollout_data(self, batch: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
         """Fetch rollout data from TransferQueue and dump sorted by uid."""
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
@@ -1179,6 +1203,11 @@ class PPOTrainer:
             scores = [scores[i] for i in sorted_indices]
 
             reward_extra_infos_dict = {"uid": [batch.keys[i] for i in sorted_indices]}
+            # rollout traces tag every span with sample_index; carrying it here is what
+            # lets a dumped trajectory be tied back to its own timings
+            sample_indices = self._fetch_sample_indices(batch)
+            if sample_indices is not None and len(sample_indices) == len(batch.keys):
+                reward_extra_infos_dict["sample_index"] = [sample_indices[i] for i in sorted_indices]
             # downstream hint analysis reads turn_feedback/turn_spans from the dump, not trace exports
             extra_fields = data.pop("extra_fields", None)
             if extra_fields is not None:
