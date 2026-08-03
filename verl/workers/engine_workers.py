@@ -14,6 +14,8 @@
 import functools
 import logging
 import os
+import time
+from collections import defaultdict
 from contextlib import nullcontext
 from copy import deepcopy
 from functools import partial
@@ -32,6 +34,7 @@ from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
 from verl.utils import tensordict_utils as tu
+from verl.utils import trace_file
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_device_name, get_torch_device, set_expandable_segments
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
@@ -81,6 +84,47 @@ def _with_routing_replay_flag(enabled: bool):
         return wrapper
 
     return decorator
+
+
+def _trace_mini_batch_groups(batch_idx: int, mini_batch_td) -> None:
+    """Record which trajectories each mini-batch drew rows from.
+
+    Mini-batches are cut from shuffled rows, so a condensed trajectory's segments can land in
+    different optimizer steps while their weights encode a single trajectory's share. This
+    says how often that happens and how large a whole-trajectory group would be.
+    """
+    if not trace_file.enabled():
+        return
+    traj = tu.get(mini_batch_td, "traj_id", default=None)
+    if traj is None:
+        return
+    weight = tu.get(mini_batch_td, "trace_weight", default=None)
+    ids = traj.to_padded_tensor(-1) if traj.is_nested else traj
+    ids = ids.reshape(-1).tolist()
+    if weight is not None:
+        w = (weight.to_padded_tensor(0.0) if weight.is_nested else weight).reshape(-1).tolist()
+    else:
+        w = [0.0] * len(ids)
+    per_traj = defaultdict(float)
+    for t, wt in zip(ids, w):
+        if t >= 0:
+            per_traj[t] += wt
+    supervised = {t for t, wt in per_traj.items() if wt > 0}
+    now = time.time()
+    trace_file.emit(
+        "mini_batch",
+        now,
+        now,
+        batch_idx=batch_idx,
+        rows=len(ids),
+        trajectories=len(per_traj),
+        supervised_trajectories=len(supervised),
+        rows_of_supervised=sum(1 for t in ids if t in supervised),
+        weight_sum=round(sum(per_traj.values()), 4),
+        # the ids themselves: whether one trajectory's segments span several mini-batches
+        # is only answerable by intersecting these across the step
+        supervised_ids=sorted(supervised),
+    )
 
 
 class TrainingWorker(Worker, DistProfilerExtension):
@@ -314,6 +358,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     update_lr_scheduler=batch_idx == total_num_iterations - 1,
                     disable_auto_offload=True,
                 )
+                _trace_mini_batch_groups(batch_idx, mini_batch_td)
                 actor_output = self.train_batch(mini_batch_td)
                 output_lst.append(actor_output)
 

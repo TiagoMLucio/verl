@@ -126,6 +126,10 @@ def construct_minimal_padding_template(
         template_sample["teacher_seq_meta"] = torch.tensor([1, 0, 0, 1], dtype=torch.int64)
     if "trace_weight" in template_sample:
         template_sample["trace_weight"] = torch.zeros_like(template_sample["trace_weight"])
+    if "traj_id" in template_sample:
+        # sentinel: a synthetic row belongs to no trajectory, and inheriting the template's
+        # id would fold it into a real trajectory's group
+        template_sample["traj_id"] = torch.full_like(template_sample["traj_id"], -1)
     if "self_distillation_mask" in template_sample:
         sd_mask = template_sample["self_distillation_mask"]
         template_sample["self_distillation_mask"] = (

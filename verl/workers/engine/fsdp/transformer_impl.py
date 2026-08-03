@@ -18,6 +18,7 @@ The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 import gc
 import logging
 import os
+import time
 import warnings
 from contextlib import nullcontext
 from typing import Callable, ContextManager, Optional
@@ -34,6 +35,7 @@ import verl.utils.torch_functional as verl_F
 from verl.models.transformers.monkey_patch import apply_monkey_patch
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
+from verl.utils import trace_file
 from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.dataset.dataset_utils import DatasetPadMode
@@ -922,6 +924,36 @@ class EngineTrainModeCtx(BaseEngineCtx):
         super().__exit__(exc_type, exc_value, traceback)
 
 
+def _trace_lm_head(logits_rmpad, keep_idx, output_args, input_ids) -> None:
+    """Record what the lm_head actually widened to, per micro-batch.
+
+    Span-only turn mode should keep only hinted-span positions; a run where it silently
+    falls back to the full packed sequence pays vocab-width memory (and its backward grad)
+    on every token instead of a few hundred. Grad-enabled = student update, no-grad = teacher.
+    """
+    if not trace_file.enabled():
+        return
+    now = time.time()
+    n_rows = int(logits_rmpad.shape[0])
+    total_nnz = int(output_args.get("total_nnz") or 0)
+    if not total_nnz:
+        try:
+            total_nnz = int(input_ids.offsets()[-1])
+        except (AttributeError, IndexError, RuntimeError):
+            total_nnz = n_rows
+    trace_file.emit(
+        "lm_head",
+        now,
+        now,
+        role="student" if torch.is_grad_enabled() else "teacher",
+        span_only=keep_idx is not None,
+        n_rows=n_rows,
+        total_nnz=total_nnz,
+        vocab=int(logits_rmpad.shape[-1]),
+        logits_gib=round(logits_rmpad.numel() * logits_rmpad.element_size() / 2**30, 4),
+    )
+
+
 @EngineRegistry.register(model_type="language_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
 class FSDPEngineWithLMHead(FSDPEngine):
     def prepare_model_inputs(self, micro_batch: TensorDict):
@@ -1134,6 +1166,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     labels_rmpad = labels_rmpad[keep_idx]
 
                 logits_rmpad = output.logits.squeeze(0)  # (total_nnz or n_keep, vocab_size)
+                _trace_lm_head(logits_rmpad, keep_idx, output_args, input_ids)
                 logits_rmpad.div_(temperature_rmpad.clamp(min=1e-8).unsqueeze(-1).to(logits_rmpad.dtype))
 
                 # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)

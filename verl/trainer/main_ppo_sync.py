@@ -29,7 +29,7 @@ import os
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pprint import pprint
@@ -1587,6 +1587,35 @@ class PPOTrainer:
         teacher_fields["trace_weight"] = torch.tensor(
             [share * scale for share in shares], dtype=torch.float32
         ).unsqueeze(-1)
+        # Row -> trajectory, as a plain int the update path can carry: mini-batches are cut
+        # from shuffled rows, so a condensed trajectory's supervised segments land in
+        # different optimizer steps even though their weights are a single trajectory's share.
+        traj_ids = {traj: i for i, traj in enumerate(dict.fromkeys(traj_of_row))}
+        teacher_fields["traj_id"] = torch.tensor(
+            [traj_ids[traj] for traj in traj_of_row], dtype=torch.int64
+        ).unsqueeze(-1)
+
+        segs_per_traj = Counter(traj_of_row)
+        sup_segs_per_traj = Counter(traj for traj, n in zip(traj_of_row, supervised_per_row) if n > 0)
+        unsup_rows = [i for i, n in enumerate(supervised_per_row) if n == 0]
+        metrics.update(
+            {
+                "self_distillation/rows_per_step": float(batch_size),
+                "self_distillation/traces_per_step": float(n_traces),
+                "self_distillation/segments_per_trace_max": float(max(segs_per_traj.values(), default=0)),
+                "self_distillation/supervised_segments_per_trace_max": float(
+                    max(sup_segs_per_traj.values(), default=0)
+                ),
+                # rows that run a full student forward+backward for zero gradient
+                "self_distillation/unsupervised_row_fraction": len(unsup_rows) / max(batch_size, 1),
+                "self_distillation/unsupervised_row_tokens": float(
+                    sum(int(response_mask_list[i].sum()) for i in unsup_rows)
+                ),
+                "self_distillation/supervised_row_tokens": float(
+                    sum(int(response_mask_list[i].sum()) for i in range(batch_size) if supervised_per_row[i] > 0)
+                ),
+            }
+        )
 
         unique_uids = set(uids)
         num_with_feedback_available = sum(1 for i in first_seg if feedback_list[i] is not None)
