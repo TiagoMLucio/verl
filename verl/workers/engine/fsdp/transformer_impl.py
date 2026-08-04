@@ -1178,8 +1178,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
         model_inputs.update(multi_modal_inputs)
         model_inputs.update(extra_args)
-        # the patched forward is class-level; tell it which mode this call wants
-        if self.model_config.use_fused_kernels:
+        # the patched forward is class-level and defaults to the fused path, so every call
+        # must state its mode once either flag has installed it
+        if self.model_config.use_fused_kernels or self.model_config.get("use_chunked_lm_head", False):
             model_inputs["use_fused_kernels"] = use_fused_kernels
         distill_topk = tu.get_non_tensor_data(data=micro_batch, key="chunked_distill_topk", default=None)
         if distill_topk is not None:

@@ -160,6 +160,26 @@ def test_eager_path_is_untouched_when_not_chunking():
     assert out.logits.shape == (1, 20, VOCAB)
 
 
+def test_mode_must_be_stated_once_the_patch_is_installed():
+    """The patched forward defaults to the fused path, so a caller that says nothing does
+    not get logits. Engine code has to state its mode on every call; forgetting is what
+    sent the log-prob pass down the fused branch in run 3001809."""
+    model = _tiny_model()
+    input_ids = torch.randint(0, VOCAB, (1, 12))
+    with _patched(model):
+        with torch.no_grad():
+            silent = model(input_ids=input_ids, return_dict=True, use_cache=False, logits_to_keep=0)
+            explicit = model(
+                input_ids=input_ids,
+                return_dict=True,
+                use_cache=False,
+                logits_to_keep=0,
+                use_fused_kernels=False,
+            )
+    assert getattr(silent, "logits", None) is None
+    assert explicit.logits is not None
+
+
 def test_gradients_flow_to_hidden_and_head():
     model = _tiny_model()
     input_ids = torch.randint(0, VOCAB, (1, 24))
