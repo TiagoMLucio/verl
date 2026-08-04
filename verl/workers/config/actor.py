@@ -287,6 +287,10 @@ class ActorConfig(BaseConfig):
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
     use_fused_kernels: bool = False
+
+    # Skip rows the update cannot learn from. They carry no supervision, so seq-mean-token-mean
+    # already gives them zero weight, but they still cost a forward and a backward.
+    drop_unsupervised_rows: bool = False
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     engine: BaseConfig = field(default_factory=BaseConfig)
     rollout_n: int = MISSING  # must be override by sampling config

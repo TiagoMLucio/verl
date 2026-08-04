@@ -2041,6 +2041,41 @@ class PPOTrainer:
 
         return batch
 
+    def _drop_unsupervised_rows(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        """Keep only rows the update can learn from, then re-pad for divisibility.
+
+        A row whose trace_weight is zero contributes no gradient: seq-mean-token-mean drops
+        fully masked sequences and weights the rest by that number. It still costs a full
+        forward and backward, which is a third of the update at our hint rate.
+
+        The per-trajectory weighting is untouched. A row with no supervision has share
+        zero, so neither traj_supervised nor the renormalising scale moves when it goes.
+        """
+        weights = tq.kv_batch_get(
+            keys=batch.keys, partition_id=batch.partition_id, select_fields=["trace_weight"]
+        )["trace_weight"]
+        weights = (weights.to_padded_tensor(0.0) if weights.is_nested else weights).reshape(len(batch.keys), -1)
+        supervised = [bool(w.abs().sum() > 0) for w in weights.unbind()]
+        kept = sum(supervised)
+        metrics["self_distillation/dropped_unsupervised_rows"] = len(supervised) - kept
+        if kept == 0 or kept == len(supervised):
+            return batch
+
+        batch = KVBatchMeta(
+            keys=[k for k, keep in zip(batch.keys, supervised, strict=True) if keep],
+            tags=[t for t, keep in zip(batch.tags, supervised, strict=True) if keep],
+            partition_id=batch.partition_id,
+            fields=batch.fields,
+            extra_info=batch.extra_info,
+        )
+        role, worker_group = "actor", self.actor_rollout_wg
+        if role not in worker_group._dispatch_info:
+            worker_group._dispatch_info[role] = worker_group._query_dispatch_info(role)
+        dp_size = max(worker_group._dispatch_info[role]) + 1
+        return upsample_batch_to_divisible_size(
+            batch, self._get_required_batch_multiple(dp_size), self.tokenizer.eos_token_id
+        )
+
     def _update_actor(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Update the actor network."""
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
@@ -2067,9 +2102,14 @@ class PPOTrainer:
             "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
             "temperature": self.config.actor_rollout_ref.rollout.temperature,
         }
-        batch.extra_info.update(extra_info)
+        # a separate handle: this function's return feeds _compute_metrics, which must still
+        # see every row or reward and length statistics would describe the supervised subset
+        update_batch = batch
+        if self.config.actor_rollout_ref.actor.get("drop_unsupervised_rows", False):
+            update_batch = self._drop_unsupervised_rows(batch, metrics)
+        update_batch.extra_info.update(extra_info)
 
-        output: TensorDict = self.actor_rollout_wg.update_actor(batch)
+        output: TensorDict = self.actor_rollout_wg.update_actor(update_batch)
         output = rename_dict(output["metrics"], "actor/")
         output["perf/mfu/actor"] = output.pop("actor/mfu")
         # after reduce_metrics: the summed pairs are plain floats here, Metric objects before it
