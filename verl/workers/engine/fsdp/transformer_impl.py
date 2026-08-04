@@ -1181,6 +1181,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
         # the patched forward is class-level; tell it which mode this call wants
         if self.model_config.use_fused_kernels:
             model_inputs["use_fused_kernels"] = use_fused_kernels
+        distill_topk = tu.get_non_tensor_data(data=micro_batch, key="chunked_distill_topk", default=None)
+        if distill_topk is not None:
+            model_inputs["distill_topk"] = distill_topk
+            model_inputs["distill_chunk_size"] = self.model_config.get("chunked_lm_head_size", 512)
+            output_args["chunked_distill"] = True
 
         return model_inputs, output_args
 
@@ -1233,6 +1238,24 @@ class FSDPEngineWithLMHead(FSDPEngine):
                                 pad_size = output_args["pad_size"]
                                 v = gather_outputs_and_unpad(v, gather_dim=0, unpad_dim=0, padding_size=pad_size)
                             model_output[field_name] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
+            elif output_args.get("chunked_distill"):
+                # the head already reduced each chunk, so there are no logits to read;
+                # scatter the reductions back onto the packed sequence like the eager path
+                keep_idx = output_args.get("logits_keep_idx")
+                total_nnz = output_args.get("total_nnz")
+                log_probs = output.log_probs.squeeze(0)
+                reductions = {
+                    "topk_logps": output.topk_logps.squeeze(0),
+                    "topk_indices": output.topk_indices.squeeze(0),
+                }
+                if keep_idx is not None:
+                    log_probs = log_probs.new_zeros(total_nnz).index_copy_(0, keep_idx, log_probs)
+                cu_seqlens = input_ids.offsets()
+                for name, value in reductions.items():
+                    if keep_idx is not None:
+                        value = value.new_zeros((total_nnz, *value.shape[1:])).index_copy_(0, keep_idx, value)
+                    model_output[name] = torch.nested.nested_tensor_from_jagged(value, cu_seqlens)
+
             else:
                 keep_idx = output_args.get("logits_keep_idx")
                 labels_rmpad = input_ids_rmpad_rolled

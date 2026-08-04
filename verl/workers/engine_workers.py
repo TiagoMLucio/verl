@@ -747,6 +747,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         return output.cpu() if output is not None else None
 
+    def _chunked_distill_topk(self):
+        """Top-k width when the head should reduce each chunk itself, else None."""
+        if not (self.sdpo_enabled and self.actor.model_config.get("use_chunked_lm_head", False)):
+            return None
+        return self.sdpo_config.distillation_topk
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
@@ -759,6 +765,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # SDPO reads top-k and a logsumexp off the real logits, which the fused kernel
         # never materializes; span-only keeps this pass cheap anyway.
         tu.assign_non_tensor(data, use_fused_kernels=False)
+        if self._chunked_distill_topk() is not None:
+            tu.assign_non_tensor(data, chunked_distill_topk=self._chunked_distill_topk())
 
         output = self.actor.train_mini_batch(data=data)
         if self.sdpo_enabled and tu.get_non_tensor_data(output, "did_update", default=True):
