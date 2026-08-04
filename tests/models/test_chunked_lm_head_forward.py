@@ -19,10 +19,12 @@ Runs under pytest, or as ``python tests/models/test_chunked_lm_head_forward.py``
 """
 
 import contextlib
+import inspect
 
 import torch
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
+from verl.models.transformers.dense_common import forward_with_torch_backend, forward_with_triton_backend
 from verl.models.transformers.monkey_patch import patch_forward_with_backends
 
 VOCAB = 64
@@ -160,24 +162,14 @@ def test_eager_path_is_untouched_when_not_chunking():
     assert out.logits.shape == (1, 20, VOCAB)
 
 
-def test_mode_must_be_stated_once_the_patch_is_installed():
-    """The patched forward defaults to the fused path, so a caller that says nothing does
-    not get logits. Engine code has to state its mode on every call; forgetting is what
-    sent the log-prob pass down the fused branch in run 3001809."""
-    model = _tiny_model()
-    input_ids = torch.randint(0, VOCAB, (1, 12))
-    with _patched(model):
-        with torch.no_grad():
-            silent = model(input_ids=input_ids, return_dict=True, use_cache=False, logits_to_keep=0)
-            explicit = model(
-                input_ids=input_ids,
-                return_dict=True,
-                use_cache=False,
-                logits_to_keep=0,
-                use_fused_kernels=False,
-            )
-    assert getattr(silent, "logits", None) is None
-    assert explicit.logits is not None
+def test_forward_mode_defaults_to_fused():
+    """Once the patch is installed every caller must state its mode, because the default
+    is the fused path rather than the eager one. The engine forgetting this sent the
+    log-prob pass down the fused branch in run 3001809. Asserted on the signature: taking
+    the fused branch for real needs Triton on a device.
+    """
+    for fn in (forward_with_torch_backend, forward_with_triton_backend):
+        assert inspect.signature(fn).parameters["use_fused_kernels"].default is True
 
 
 def test_gradients_flow_to_hidden_and_head():
