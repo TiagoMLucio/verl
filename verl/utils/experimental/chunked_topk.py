@@ -18,16 +18,24 @@ from typing import Optional
 import torch
 
 
+def _slice_temperature(temperature, start: int, end: int):
+    if temperature is None or not isinstance(temperature, torch.Tensor):
+        return temperature
+    return temperature[start:end]
+
+
 def _compute_dtype(dtype: torch.dtype) -> torch.dtype:
     """Half precision is accumulated in fp32; anything wider is left alone, so a float64
     caller (gradcheck) is not silently truncated."""
     return torch.float32 if dtype in (torch.bfloat16, torch.float16) else dtype
 
 
-def _chunk_logits(hidden: torch.Tensor, weight: torch.Tensor, temperature: Optional[torch.Tensor]) -> torch.Tensor:
+def _chunk_logits(hidden: torch.Tensor, weight: torch.Tensor, temperature) -> torch.Tensor:
     logits = (hidden @ weight.t()).to(_compute_dtype(hidden.dtype))
     if temperature is not None:
-        logits = logits / temperature.to(logits.dtype)
+        if isinstance(temperature, torch.Tensor):
+            temperature = temperature.to(logits.dtype)
+        logits = logits / temperature
     return logits
 
 
@@ -50,7 +58,7 @@ class ChunkedTopkLogprobs(torch.autograd.Function):
 
         for start in range(0, num_positions, chunk_size):
             end = min(start + chunk_size, num_positions)
-            temp = None if temperature is None else temperature[start:end]
+            temp = _slice_temperature(temperature, start, end)
             logits = _chunk_logits(hidden[start:end], weight, temp)
             logsumexp = logits.logsumexp(dim=-1, keepdim=True)
             values, indices = logits.topk(k, dim=-1)
@@ -60,7 +68,9 @@ class ChunkedTopkLogprobs(torch.autograd.Function):
                 gathered = logits.gather(-1, labels[start:end].unsqueeze(-1))
                 label_logps[start:end] = (gathered - logsumexp).squeeze(-1)
 
-        ctx.save_for_backward(hidden, weight, topk_indices, labels, temperature)
+        tensor_temperature = temperature if isinstance(temperature, torch.Tensor) else None
+        ctx.save_for_backward(hidden, weight, topk_indices, labels, tensor_temperature)
+        ctx.scalar_temperature = None if tensor_temperature is not None else temperature
         ctx.chunk_size = chunk_size
         ctx.mark_non_differentiable(topk_indices)
         return topk_logps, topk_indices, label_logps
@@ -68,6 +78,8 @@ class ChunkedTopkLogprobs(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_topk_logps, _grad_indices, grad_label_logps):
         hidden, weight, topk_indices, labels, temperature = ctx.saved_tensors
+        if temperature is None:
+            temperature = ctx.scalar_temperature
         chunk_size = ctx.chunk_size
 
         compute_dtype = _compute_dtype(hidden.dtype)
@@ -79,7 +91,7 @@ class ChunkedTopkLogprobs(torch.autograd.Function):
 
         for start in range(0, hidden.shape[0], chunk_size):
             end = min(start + chunk_size, hidden.shape[0])
-            temp = None if temperature is None else temperature[start:end]
+            temp = _slice_temperature(temperature, start, end)
             logits = _chunk_logits(hidden[start:end], weight, temp)
 
             # d(logits[i] - logsumexp)/d(logits) = onehot(i) - softmax(logits), summed over

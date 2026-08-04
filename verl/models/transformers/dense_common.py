@@ -24,6 +24,8 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 class CausalLMOutputForPPO(CausalLMOutputWithPast):
     log_probs: Optional[torch.FloatTensor] = None
     entropy: Optional[torch.FloatTensor] = None
+    topk_logps: Optional[torch.FloatTensor] = None
+    topk_indices: Optional[torch.LongTensor] = None
 
 
 def forward_base_model(
@@ -85,6 +87,8 @@ def forward_with_torch_backend(
     temperature: float = 1.0,
     shift_labels: Optional[torch.LongTensor] = None,
     use_fused_kernels: bool = True,
+    distill_topk: Optional[int] = None,
+    distill_chunk_size: int = 512,
     **loss_kwargs,
 ) -> tuple | CausalLMOutputForPPO:
     from verl.utils.experimental.torch_functional import FusedLinearForPPO
@@ -107,7 +111,7 @@ def forward_with_torch_backend(
     # The patch is installed on the model class, so every caller shares it. Callers that
     # need real logits (SDPO reads top-k and a logsumexp off them) opt out per call, while
     # a log-prob-only pass keeps the fused path and never widens hidden states to vocab.
-    if not use_fused_kernels:
+    if not use_fused_kernels and distill_topk is None:
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         return CausalLMOutputWithPast(
@@ -132,6 +136,35 @@ def forward_with_torch_backend(
         rolled_labels = torch.roll(input_ids, shifts=-1, dims=-1)
     else:
         raise RuntimeError("To use forward_with_torch_backend, either labels or input_ids must be provided.")
+
+    # Chunked distillation head. It has to run here rather than in the engine: FSDP
+    # reshards lm_head.weight as soon as this forward returns, so a caller downstream
+    # would see a shard. Each chunk is projected, reduced to its top-k, the realised
+    # token's log-probability and a logsumexp, then freed, so the peak follows
+    # distill_chunk_size rather than the number of scored positions.
+    if distill_topk is not None:
+        from verl.utils.experimental.chunked_topk import chunked_topk_logprobs
+
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        kept_hidden = hidden_states[:, slice_indices, :].squeeze(0)
+        labels = rolled_labels.squeeze(0) if rolled_labels.dim() > 1 else rolled_labels
+        labels = labels[slice_indices]
+        topk_logps, topk_indices, label_logps = chunked_topk_logprobs(
+            kept_hidden,
+            self.lm_head.weight,
+            distill_topk,
+            labels=labels,
+            temperature=temperature,
+            chunk_size=distill_chunk_size,
+        )
+        return CausalLMOutputForPPO(
+            log_probs=label_logps.unsqueeze(0),
+            topk_logps=topk_logps.unsqueeze(0),
+            topk_indices=topk_indices.unsqueeze(0),
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
     fused_linear_for_ppo = FusedLinearForPPO()
     log_probs, entropy = fused_linear_for_ppo.forward(
@@ -167,6 +200,8 @@ def forward_with_triton_backend(
     temperature: float = 1.0,
     shift_labels: Optional[torch.LongTensor] = None,
     use_fused_kernels: bool = True,
+    distill_topk: Optional[int] = None,
+    distill_chunk_size: int = 512,
     **loss_kwargs,
 ) -> tuple | CausalLMOutputForPPO:
     from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
@@ -190,7 +225,7 @@ def forward_with_triton_backend(
     # The patch is installed on the model class, so every caller shares it. Callers that
     # need real logits (SDPO reads top-k and a logsumexp off them) opt out per call, while
     # a log-prob-only pass keeps the fused path and never widens hidden states to vocab.
-    if not use_fused_kernels:
+    if not use_fused_kernels and distill_topk is None:
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         return CausalLMOutputWithPast(
@@ -213,6 +248,35 @@ def forward_with_triton_backend(
         rolled_labels = torch.roll(input_ids, shifts=-1, dims=-1)
     else:
         raise RuntimeError("To use forward_with_triton_backend, either labels or input_ids must be provided.")
+
+    # Chunked distillation head. It has to run here rather than in the engine: FSDP
+    # reshards lm_head.weight as soon as this forward returns, so a caller downstream
+    # would see a shard. Each chunk is projected, reduced to its top-k, the realised
+    # token's log-probability and a logsumexp, then freed, so the peak follows
+    # distill_chunk_size rather than the number of scored positions.
+    if distill_topk is not None:
+        from verl.utils.experimental.chunked_topk import chunked_topk_logprobs
+
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        kept_hidden = hidden_states[:, slice_indices, :].squeeze(0)
+        labels = rolled_labels.squeeze(0) if rolled_labels.dim() > 1 else rolled_labels
+        labels = labels[slice_indices]
+        topk_logps, topk_indices, label_logps = chunked_topk_logprobs(
+            kept_hidden,
+            self.lm_head.weight,
+            distill_topk,
+            labels=labels,
+            temperature=temperature,
+            chunk_size=distill_chunk_size,
+        )
+        return CausalLMOutputForPPO(
+            log_probs=label_logps.unsqueeze(0),
+            topk_logps=topk_logps.unsqueeze(0),
+            topk_indices=topk_indices.unsqueeze(0),
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
     log_probs, entropy = linear_cross_entropy(
         hidden_states,
