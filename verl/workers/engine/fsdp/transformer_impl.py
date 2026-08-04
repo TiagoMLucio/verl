@@ -949,22 +949,28 @@ class EngineTrainModeCtx(BaseEngineCtx):
 
 
 
+def _scalar(value):
+    """First element of a per-row field, whether it arrives as a tensor or an unwrapped list."""
+    if isinstance(value, torch.Tensor):
+        return int(value.reshape(-1)[0])
+    if isinstance(value, (list, tuple)) and value:
+        return _scalar(value[0]) if isinstance(value[0], (list, tuple, torch.Tensor)) else int(value[0])
+    return None
+
+
 def _micro_batch_args(micro_idx, micro_batch) -> dict:
-    """Identity of a micro-batch: enough to line a slow or fat step up with its trajectory."""
-    args = {"micro": micro_idx}
-    try:
-        args["rows"] = int(len(micro_batch))
-        ids = micro_batch.get("input_ids", None)
-        if ids is not None and ids.is_nested:
+    """Identity of a micro-batch, so a slow or fat step can be traced back to its trajectory."""
+    args = {"micro": micro_idx, "rows": int(len(micro_batch))}
+    keys = set(micro_batch.keys())
+    if "input_ids" in keys:
+        ids = micro_batch.get("input_ids")
+        if ids.is_nested:
             args["total_nnz"] = int(ids.offsets()[-1])
-        traj = tu.get(micro_batch, "traj_id", default=None)
-        if traj is not None:
-            args["traj_id"] = int(traj.reshape(-1)[0])
-        mask = micro_batch.get("loss_mask", None)
-        if mask is not None:
-            args["supervised_tok"] = int(mask.values().sum() if mask.is_nested else mask.sum())
-    except (AttributeError, IndexError, KeyError, RuntimeError, TypeError):
-        pass
+    if "traj_id" in keys:
+        args["traj_id"] = _scalar(tu.get(micro_batch, "traj_id"))
+    if "loss_mask" in keys:
+        mask = micro_batch.get("loss_mask")
+        args["supervised_tok"] = int(mask.values().sum() if mask.is_nested else mask.sum())
     return args
 
 
@@ -974,12 +980,8 @@ def _gb_args(prefix: str, peak: tuple) -> dict:
 
 
 def _trace_lm_head(logits_rmpad, keep_idx, output_args, input_ids) -> None:
-    """Record what the lm_head actually widened to, per micro-batch.
-
-    Span-only turn mode should keep only hinted-span positions; a run where it silently
-    falls back to the full packed sequence pays vocab-width memory (and its backward grad)
-    on every token instead of a few hundred. Grad-enabled = student update, no-grad = teacher.
-    """
+    """Record how wide the lm_head went: span-only keeps hinted positions, a fallback keeps
+    the whole packed sequence and pays vocab-width memory on every token."""
     if not trace_file.enabled():
         return
     now = time.time()
@@ -1259,9 +1261,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # logits_processor_func return tensors with shape (1, total_nnz/sp_size)
                 if distillation_use_topk:
                     processor_kwargs = {} if keep_idx is None else {"logits_keep_idx": keep_idx}
-                    outputs = logits_processor_func(
-                        student_logits=logits_rmpad.unsqueeze(0), data=micro_batch, **processor_kwargs
-                    )
+                    with trace_file.span("update/topk", rows=int(logits_rmpad.shape[0])):
+                        outputs = logits_processor_func(
+                            student_logits=logits_rmpad.unsqueeze(0), data=micro_batch, **processor_kwargs
+                        )
                     cu_seqlens = input_ids.offsets()
                     for k, v in outputs.items():
                         v = v.squeeze(0)
@@ -1415,9 +1418,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
             )
 
             if loss_function is not None:
-                loss, metrics = loss_function(
-                    model_output=model_output, data=micro_batch, dp_group=self.get_data_parallel_group()
-                )
+                with trace_file.span("update/loss"):
+                    loss, metrics = loss_function(
+                        model_output=model_output, data=micro_batch, dp_group=self.get_data_parallel_group()
+                    )
             else:
                 assert forward_only, "forward_only must be True when loss_function is None"
                 loss = torch.tensor(1.0, device=device_name)
