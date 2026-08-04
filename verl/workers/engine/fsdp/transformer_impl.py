@@ -949,28 +949,42 @@ class EngineTrainModeCtx(BaseEngineCtx):
 
 
 
+_MICRO_BATCH_ARGS_WARNED = False
+
+
 def _scalar(value):
-    """First element of a per-row field, whether it arrives as a tensor or an unwrapped list."""
+    """First element of a per-row field, which reaches here as a nested or plain tensor,
+    or as a list once TensorDict has unwrapped a NonTensorStack."""
     if isinstance(value, torch.Tensor):
-        return int(value.reshape(-1)[0])
+        flat = value.values() if value.is_nested else value.reshape(-1)
+        return int(flat[0]) if flat.numel() else None
     if isinstance(value, (list, tuple)) and value:
         return _scalar(value[0]) if isinstance(value[0], (list, tuple, torch.Tensor)) else int(value[0])
     return None
 
 
 def _micro_batch_args(micro_idx, micro_batch) -> dict:
-    """Identity of a micro-batch, so a slow or fat step can be traced back to its trajectory."""
+    """Identity of a micro-batch, so a slow or fat step can be traced back to its trajectory.
+
+    Diagnostics must never take a run down, so a field that cannot be read is dropped and
+    reported once rather than raised."""
+    global _MICRO_BATCH_ARGS_WARNED
     args = {"micro": micro_idx, "rows": int(len(micro_batch))}
     keys = set(micro_batch.keys())
-    if "input_ids" in keys:
-        ids = micro_batch.get("input_ids")
-        if ids.is_nested:
-            args["total_nnz"] = int(ids.offsets()[-1])
-    if "traj_id" in keys:
-        args["traj_id"] = _scalar(tu.get(micro_batch, "traj_id"))
-    if "loss_mask" in keys:
-        mask = micro_batch.get("loss_mask")
-        args["supervised_tok"] = int(mask.values().sum() if mask.is_nested else mask.sum())
+    try:
+        if "input_ids" in keys:
+            ids = micro_batch.get("input_ids")
+            if ids.is_nested:
+                args["total_nnz"] = int(ids.offsets()[-1])
+        if "traj_id" in keys:
+            args["traj_id"] = _scalar(tu.get(micro_batch, "traj_id"))
+        if "loss_mask" in keys:
+            mask = micro_batch.get("loss_mask")
+            args["supervised_tok"] = int(mask.values().sum() if mask.is_nested else mask.sum())
+    except Exception as exc:  # noqa: BLE001
+        if not _MICRO_BATCH_ARGS_WARNED:
+            _MICRO_BATCH_ARGS_WARNED = True
+            print(f"trace: micro-batch args partially unavailable: {type(exc).__name__}: {exc}", flush=True)
     return args
 
 
