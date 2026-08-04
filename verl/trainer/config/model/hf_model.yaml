@@ -66,6 +66,13 @@ fused_kernel_options:
   # the implementation backend for fused kernels.
   impl_backend: torch
 
+# whether to project the output head in chunks of positions, so peak memory follows the
+# chunk size instead of the number of scored positions.
+use_chunked_lm_head: False
+
+# positions projected at once by the chunked head.
+chunked_lm_head_size: 512
+
 # TiledMLP configuration for memory-efficient MLP computation.
 # Reduces peak memory by processing MLP forward/backward in tiles.
 tiled_mlp:
