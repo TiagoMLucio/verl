@@ -1242,6 +1242,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
             elif output_args.get("chunked_distill"):
                 # the head already reduced each chunk, so there are no logits to read;
                 # scatter the reductions back onto the packed sequence like the eager path
+                if calculate_entropy or calculate_sum_pi_squared:
+                    raise NotImplementedError(
+                        "the chunked head returns reductions, not logits, so entropy and "
+                        "sum_pi_squared cannot be derived from it"
+                    )
                 keep_idx = output_args.get("logits_keep_idx")
                 total_nnz = output_args.get("total_nnz")
                 log_probs = output.log_probs.squeeze(0)
