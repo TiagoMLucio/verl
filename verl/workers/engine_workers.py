@@ -36,11 +36,11 @@ from verl.trainer.distillation import distillation_ppo_loss, is_distillation_ena
 from verl.utils import tensordict_utils as tu
 from verl.utils import trace_file
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_device_name, get_torch_device, set_expandable_segments
+from verl.utils.device import get_device_name, set_expandable_segments
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
-from verl.utils.memory_utils import aggressive_empty_cache
+from verl.utils.memory_utils import aggressive_empty_cache, run_peak_bytes
 from verl.utils.metric.utils import Metric
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
 from verl.utils.py_functional import append_to_dict
@@ -265,8 +265,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
             final_metrics["lr"] = lr
 
         # log memory
-        final_metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
-        final_metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+        # run_peak_bytes, not the device counters: per-micro-batch sampling resets them
+        run_peak_allocated, run_peak_reserved = run_peak_bytes()
+        final_metrics["perf/max_memory_allocated_gb"] = run_peak_allocated / (1024**3)
+        final_metrics["perf/max_memory_reserved_gb"] = run_peak_reserved / (1024**3)
         final_metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
         # TODO: confirm the mtp loss IS same across dp
@@ -359,7 +361,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     disable_auto_offload=True,
                 )
                 _trace_mini_batch_groups(batch_idx, mini_batch_td)
-                actor_output = self.train_batch(mini_batch_td)
+                with trace_file.span("update/mini_batch", mini=batch_idx, rows=len(mini_batch_td)):
+                    actor_output = self.train_batch(mini_batch_td)
                 output_lst.append(actor_output)
 
             if self.engine.is_mp_src_rank_with_outputs():
@@ -655,11 +658,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 from verl.workers.config.actor import SelfDistillationConfig
 
                 self.sdpo_config = _to_dc(self.config.actor.self_distillation, SelfDistillationConfig)
-                if self.sdpo_config.full_logit_distillation:
-                    actor_uses_fused_kernels = actor_training_config.engine_config.use_fused_kernels
-                    ref_uses_fused_kernels = self.ref is not None and self.ref.engine_config.use_fused_kernels
-                    if actor_uses_fused_kernels or ref_uses_fused_kernels:
-                        raise ValueError("Logit distillation requires disabling fused kernels.")
                 self.loss_fn = partial(
                     sdpo_ppo_loss,
                     config=actor_config,

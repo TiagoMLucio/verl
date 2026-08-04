@@ -303,3 +303,43 @@ class MemorySnapshotSampler:
             logger.info(f"[memory_visualize] dumped: {path}")
         except Exception as e:
             logger.info(f"[memory_visualize][warn] dump failed: {e}")
+
+
+# Per-micro-batch peaks need reset_peak_memory_stats, which would otherwise walk over the
+# run-level high-water mark that perf/max_memory_allocated_gb reports. Every reset folds the
+# pre-reset peak in here first, so the reported maximum is unchanged whether or not anything
+# is sampling. Reset only ever happens through take_peak().
+_RUN_PEAK_ALLOCATED = 0
+_RUN_PEAK_RESERVED = 0
+
+
+def _fold(allocated: int, reserved: int) -> None:
+    global _RUN_PEAK_ALLOCATED, _RUN_PEAK_RESERVED
+    _RUN_PEAK_ALLOCATED = max(_RUN_PEAK_ALLOCATED, allocated)
+    _RUN_PEAK_RESERVED = max(_RUN_PEAK_RESERVED, reserved)
+
+
+def take_peak() -> tuple[int, int]:
+    """Peak allocated/reserved since the previous call, then restart the window.
+
+    The peak is folded into the run-level maxima before the reset, so callers of
+    run_peak_bytes() never see a lower number than torch would have reported.
+    """
+    device = get_torch_device()
+    if not device.is_available():
+        return 0, 0
+    allocated, reserved = device.max_memory_allocated(), device.max_memory_reserved()
+    _fold(allocated, reserved)
+    device.reset_peak_memory_stats()
+    return allocated, reserved
+
+
+def run_peak_bytes() -> tuple[int, int]:
+    """Run-level peak allocated/reserved, correct across any number of take_peak() resets."""
+    device = get_torch_device()
+    if not device.is_available():
+        return _RUN_PEAK_ALLOCATED, _RUN_PEAK_RESERVED
+    return (
+        max(_RUN_PEAK_ALLOCATED, device.max_memory_allocated()),
+        max(_RUN_PEAK_RESERVED, device.max_memory_reserved()),
+    )

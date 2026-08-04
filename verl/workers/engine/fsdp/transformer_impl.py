@@ -61,6 +61,7 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_optimizer,
     replace_lora_wrapper,
 )
+from verl.utils.memory_utils import take_peak
 from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.torch_functional import logprobs_from_logits
@@ -644,16 +645,39 @@ class FSDPEngine(BaseEngine):
         # and _build_fsdp_module, so self.scaler may not be set.
         scaler = getattr(self, "scaler", None)
 
-        for micro_batch in micro_batches:
+        traced = trace_file.enabled()
+        for micro_idx, micro_batch in enumerate(micro_batches):
+            # Peaks, not before/after differences: the transient that ends a run is raised
+            # inside backward() (2990356 died on an 11.59 GiB allocation there), so a
+            # boundary sample straddles it. take_peak() folds the outgoing peak into the
+            # run-level maxima before resetting, leaving perf/max_memory_allocated_gb intact.
+            mb_start = time.time()
+            if traced:
+                take_peak()
+            fwd_peak = bwd_peak = (0, 0)
             with ctx:
-                loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
+                loss, meta_info = self.forward_step(
+                    micro_batch, loss_function=loss_function, forward_only=forward_only
+                )
+                if traced:
+                    fwd_peak = take_peak()
 
                 if not forward_only:
+                    bwd_start = time.time()
                     if scaler is not None:
                         scaler.scale(loss).backward()
                     else:
                         loss.backward()
+                    if traced:
+                        bwd_peak = take_peak()
+                        trace_file.emit("update/bwd", bwd_start, time.time(), **_gb_args("peak", bwd_peak))
 
+            if traced:
+                trace_file.emit(
+                    "update/micro_batch", mb_start, time.time(),
+                    **_micro_batch_args(micro_idx, micro_batch),
+                    **_gb_args("fwd_peak", fwd_peak), **_gb_args("bwd_peak", bwd_peak),
+                )
             output_lst.append(meta_info)
 
         # postprocess and return
@@ -924,6 +948,31 @@ class EngineTrainModeCtx(BaseEngineCtx):
         super().__exit__(exc_type, exc_value, traceback)
 
 
+
+def _micro_batch_args(micro_idx, micro_batch) -> dict:
+    """Identity of a micro-batch: enough to line a slow or fat step up with its trajectory."""
+    args = {"micro": micro_idx}
+    try:
+        args["rows"] = int(len(micro_batch))
+        ids = micro_batch.get("input_ids", None)
+        if ids is not None and ids.is_nested:
+            args["total_nnz"] = int(ids.offsets()[-1])
+        traj = tu.get(micro_batch, "traj_id", default=None)
+        if traj is not None:
+            args["traj_id"] = int(traj.reshape(-1)[0])
+        mask = micro_batch.get("loss_mask", None)
+        if mask is not None:
+            args["supervised_tok"] = int(mask.values().sum() if mask.is_nested else mask.sum())
+    except (AttributeError, IndexError, KeyError, RuntimeError, TypeError):
+        pass
+    return args
+
+
+def _gb_args(prefix: str, peak: tuple) -> dict:
+    allocated, reserved = peak
+    return {f"{prefix}_alloc_gb": round(allocated / 2**30, 3), f"{prefix}_resv_gb": round(reserved / 2**30, 3)}
+
+
 def _trace_lm_head(logits_rmpad, keep_idx, output_args, input_ids) -> None:
     """Record what the lm_head actually widened to, per micro-batch.
 
@@ -1152,6 +1201,12 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # same model_output keys as the eager logit-processor path.
                 if distillation_use_topk:
                     aux_outputs = getattr(output, "fused_linear_aux", None)
+                    if aux_outputs is None or aux_outputs.distillation_losses is None:
+                        raise ValueError(
+                            "Top-k distillation asked for logits from a fused forward that does not "
+                            "produce them. Pass use_fused_kernels=False on this call (update_actor "
+                            "and the SDPO teacher already do)."
+                        )
                     if aux_outputs is not None and aux_outputs.distillation_losses is not None:
                         cu_seqlens = input_ids.offsets()
                         for field_name in ("distillation_losses", "student_mass", "teacher_mass"):
@@ -1325,6 +1380,12 @@ class FSDPEngineWithLMHead(FSDPEngine):
         return model_output
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
+        # factual, not interpreted: old_log_prob and the SDPO teacher are both forward-only,
+        # and only the enclosing trainer phase tells them apart
+        with trace_file.span("update/fwd", role="inference" if forward_only else "student"):
+            return self._forward_step_inner(micro_batch, loss_function, forward_only)
+
+    def _forward_step_inner(self, micro_batch: TensorDict, loss_function, forward_only):
         device_name = get_device_name()
         # actually, we should avoid assigning like this...
         micro_batch = micro_batch.to(get_device_id())
