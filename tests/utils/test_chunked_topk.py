@@ -27,10 +27,14 @@ HIDDEN = 16
 
 
 def _reference(hidden, weight, k, temperature=None):
-    """What the un-chunked path computes, with the full logits materialized."""
-    logits = (hidden @ weight.t()).float()
+    """The un-chunked path, at the precision the chunked one uses: half accumulates in
+    fp32, wider dtypes pass through. Stated independently here so the comparison tests
+    chunking rather than agreeing with the implementation by construction."""
+    logits = hidden @ weight.t()
+    if logits.dtype in (torch.bfloat16, torch.float16):
+        logits = logits.float()
     if temperature is not None:
-        logits = logits / temperature
+        logits = logits / temperature.to(logits.dtype)
     values, indices = logits.topk(k, dim=-1)
     return values - logits.logsumexp(dim=-1, keepdim=True), indices
 
@@ -49,7 +53,9 @@ def test_forward_matches_reference():
 
 
 def test_chunking_does_not_change_the_result():
-    """Positions are independent at the head, so any partition must agree exactly."""
+    """Positions are independent at the head, so any partition computes the same thing.
+    Not bit-exact: the projection is a different matmul shape per chunk and BLAS rounds
+    it differently, so agreement is to precision rather than to the last bit."""
     torch.manual_seed(1)
     hidden = torch.randn(64, HIDDEN, dtype=torch.float64)
     weight = torch.randn(VOCAB, HIDDEN, dtype=torch.float64)
@@ -57,7 +63,7 @@ def test_chunking_does_not_change_the_result():
     baseline, _ = chunked_topk_logprobs(hidden, weight, K, chunk_size=64)
     for chunk_size in (1, 3, 7, 16, 1024):
         other, _ = chunked_topk_logprobs(hidden, weight, K, chunk_size=chunk_size)
-        torch.testing.assert_close(other, baseline, rtol=0, atol=0)
+        torch.testing.assert_close(other, baseline, rtol=1e-12, atol=1e-12)
 
 
 def test_gradcheck():
@@ -114,7 +120,7 @@ def test_gather_matches_reference():
 
     got = chunked_gather_logprobs(hidden, weight, indices, chunk_size=6)
 
-    logits = (hidden @ weight.t()).float()
+    logits = hidden @ weight.t()
     want = torch.gather(logits, -1, indices) - logits.logsumexp(dim=-1, keepdim=True)
     torch.testing.assert_close(got, want)
 
