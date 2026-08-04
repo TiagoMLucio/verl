@@ -18,10 +18,16 @@ from typing import Optional
 import torch
 
 
+def _compute_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Half precision is accumulated in fp32; anything wider is left alone, so a float64
+    caller (gradcheck) is not silently truncated."""
+    return torch.float32 if dtype in (torch.bfloat16, torch.float16) else dtype
+
+
 def _chunk_logits(hidden: torch.Tensor, weight: torch.Tensor, temperature: Optional[torch.Tensor]) -> torch.Tensor:
-    logits = (hidden @ weight.t()).float()
+    logits = (hidden @ weight.t()).to(_compute_dtype(hidden.dtype))
     if temperature is not None:
-        logits = logits / temperature
+        logits = logits / temperature.to(logits.dtype)
     return logits
 
 
@@ -37,7 +43,8 @@ class ChunkedTopkLogprobs(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, weight, k, temperature=None, chunk_size=512):
         num_positions = hidden.shape[0]
-        topk_logps = hidden.new_empty((num_positions, k), dtype=torch.float32)
+        compute_dtype = _compute_dtype(hidden.dtype)
+        topk_logps = hidden.new_empty((num_positions, k), dtype=compute_dtype)
         topk_indices = hidden.new_empty((num_positions, k), dtype=torch.int64)
 
         for start in range(0, num_positions, chunk_size):
@@ -58,9 +65,10 @@ class ChunkedTopkLogprobs(torch.autograd.Function):
         hidden, weight, topk_indices, temperature = ctx.saved_tensors
         chunk_size = ctx.chunk_size
 
+        compute_dtype = _compute_dtype(hidden.dtype)
         grad_hidden = torch.zeros_like(hidden) if ctx.needs_input_grad[0] else None
-        grad_weight = torch.zeros_like(weight, dtype=torch.float32) if ctx.needs_input_grad[1] else None
-        grad_topk_logps = grad_topk_logps.float()
+        grad_weight = torch.zeros_like(weight, dtype=compute_dtype) if ctx.needs_input_grad[1] else None
+        grad_topk_logps = grad_topk_logps.to(compute_dtype)
 
         for start in range(0, hidden.shape[0], chunk_size):
             end = min(start + chunk_size, hidden.shape[0])
@@ -75,9 +83,9 @@ class ChunkedTopkLogprobs(torch.autograd.Function):
                 grad_chunk = grad_chunk / temp
 
             if grad_hidden is not None:
-                grad_hidden[start:end] = (grad_chunk @ weight.float()).to(hidden.dtype)
+                grad_hidden[start:end] = (grad_chunk @ weight.to(compute_dtype)).to(hidden.dtype)
             if grad_weight is not None:
-                grad_weight += grad_chunk.t() @ hidden[start:end].float()
+                grad_weight += grad_chunk.t() @ hidden[start:end].to(compute_dtype)
 
         if grad_weight is not None:
             grad_weight = grad_weight.to(weight.dtype)
@@ -116,7 +124,7 @@ def chunked_gather_logprobs(
     """Log-probabilities at ``indices``, chunked the same way. For the teacher, which scores
     the student's chosen entries and never needs a gradient."""
     num_positions = hidden.shape[0]
-    out = hidden.new_empty((num_positions, indices.shape[-1]), dtype=torch.float32)
+    out = hidden.new_empty((num_positions, indices.shape[-1]), dtype=_compute_dtype(hidden.dtype))
     for start in range(0, num_positions, chunk_size):
         end = min(start + chunk_size, num_positions)
         temp = None if temperature is None else temperature[start:end]
