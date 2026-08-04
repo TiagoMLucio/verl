@@ -50,6 +50,8 @@ class ChunkedTopkLogprobs(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, hidden, weight, k, labels=None, temperature=None, chunk_size=512):
+        k = min(k, weight.shape[0])
+        chunk_size = max(1, chunk_size)
         num_positions = hidden.shape[0]
         compute_dtype = _compute_dtype(hidden.dtype)
         topk_logps = hidden.new_empty((num_positions, k), dtype=compute_dtype)

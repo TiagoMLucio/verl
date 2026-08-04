@@ -138,6 +138,11 @@ class HFModelConfig(BaseConfig):
     use_fused_kernels: bool = False
     fused_kernel_options: dict = field(default_factory=dict)
 
+    # Project the output head in chunks of positions instead of all at once. Independent of
+    # fused kernels, but shares their patched forward, so either one installs it.
+    use_chunked_lm_head: bool = False
+    chunked_lm_head_size: int = 512
+
     # TiledMLP configuration for memory-efficient MLP computation
     tiled_mlp: dict = field(default_factory=lambda: {"enabled": False, "num_shards": 4})
 

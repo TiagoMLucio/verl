@@ -296,12 +296,14 @@ class FSDPEngine(BaseEngine):
             )
 
             use_fused_kernels = self.model_config.use_fused_kernels
+            use_chunked_lm_head = self.model_config.get("use_chunked_lm_head", False)
             apply_monkey_patch(
                 model=module,
                 use_remove_padding=self.use_remove_padding,
                 ulysses_sp_size=self.ulysses_sequence_parallel_size,
                 use_fused_kernels=use_fused_kernels,
-                fused_kernels_backend=fused_kernels_backend,
+                fused_kernels_backend=fused_kernels_backend or ("torch" if use_chunked_lm_head else None),
+                use_chunked_lm_head=use_chunked_lm_head,
             )
 
             # some parameters may not in torch_dtype
