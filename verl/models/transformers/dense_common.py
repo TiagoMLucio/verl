@@ -121,9 +121,6 @@ def forward_with_torch_backend(
             attentions=outputs.attentions,
         )
 
-    if not return_dict:
-        raise NotImplementedError("forward_with_torch_backend has to return_dict")
-
     # Loss calculations.
     # When the engine has already prepared globally-rolled labels (e.g. the FSDP
     # path under Ulysses SP, see issue #6068), it passes them as `shift_labels`
@@ -165,6 +162,9 @@ def forward_with_torch_backend(
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    if not return_dict:
+        raise NotImplementedError("forward_with_torch_backend has to return_dict")
 
     fused_linear_for_ppo = FusedLinearForPPO()
     log_probs, entropy = fused_linear_for_ppo.forward(
@@ -235,9 +235,6 @@ def forward_with_triton_backend(
             attentions=outputs.attentions,
         )
 
-    if not return_dict:
-        raise NotImplementedError("forward_with_triton_backend has to return_dict")
-
     # Loss calculations. See `forward_with_torch_backend` for why `shift_labels`
     # takes precedence over local `torch.roll` (issue #6068).
     if shift_labels is not None:
@@ -277,6 +274,9 @@ def forward_with_triton_backend(
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    if not return_dict:
+        raise NotImplementedError("forward_with_triton_backend has to return_dict")
 
     log_probs, entropy = linear_cross_entropy(
         hidden_states,
