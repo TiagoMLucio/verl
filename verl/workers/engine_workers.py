@@ -265,8 +265,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
             final_metrics["lr"] = lr
 
         # log memory
-        # run_peak_bytes, not the device counters: per-micro-batch sampling resets them
-        run_peak_allocated, run_peak_reserved = run_peak_bytes()
+        # run_peak_bytes, not the device counters: per-micro-batch sampling resets them,
+        # and the peak that matters is the fleet's, not this rank's
+        run_peak_allocated, run_peak_reserved = run_peak_bytes(group=dp_group)
         final_metrics["perf/max_memory_allocated_gb"] = run_peak_allocated / (1024**3)
         final_metrics["perf/max_memory_reserved_gb"] = run_peak_reserved / (1024**3)
         final_metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)

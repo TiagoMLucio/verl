@@ -22,7 +22,7 @@ from pathlib import Path
 
 import torch
 
-from verl.utils.device import get_torch_device
+from verl.utils.device import get_device_id, get_torch_device
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -334,12 +334,20 @@ def take_peak() -> tuple[int, int]:
     return allocated, reserved
 
 
-def run_peak_bytes() -> tuple[int, int]:
-    """Run-level peak allocated/reserved, correct across any number of take_peak() resets."""
+def run_peak_bytes(group=None) -> tuple[int, int]:
+    """Run-level peak allocated/reserved, correct across any number of take_peak() resets.
+
+    Reduced with MAX over ``group`` when distributed: an OOM happens on whichever rank is
+    hottest, and ranks diverge by tens of GiB because a micro-batch's cost is set by the
+    row it drew. A single rank's peak is not the number that decides whether a run survives.
+    """
     device = get_torch_device()
-    if not device.is_available():
-        return _RUN_PEAK_ALLOCATED, _RUN_PEAK_RESERVED
-    return (
-        max(_RUN_PEAK_ALLOCATED, device.max_memory_allocated()),
-        max(_RUN_PEAK_RESERVED, device.max_memory_reserved()),
-    )
+    allocated, reserved = _RUN_PEAK_ALLOCATED, _RUN_PEAK_RESERVED
+    if device.is_available():
+        allocated = max(allocated, device.max_memory_allocated())
+        reserved = max(reserved, device.max_memory_reserved())
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        peaks = torch.tensor([allocated, reserved], dtype=torch.int64, device=get_device_id())
+        torch.distributed.all_reduce(peaks, op=torch.distributed.ReduceOp.MAX, group=group)
+        allocated, reserved = (int(x) for x in peaks.tolist())
+    return allocated, reserved
