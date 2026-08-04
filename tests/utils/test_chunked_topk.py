@@ -26,7 +26,7 @@ VOCAB = 50
 HIDDEN = 16
 
 
-def _reference(hidden, weight, k, temperature=None):
+def _reference(hidden, weight, k, labels=None, temperature=None):
     """The un-chunked path, at the precision the chunked one uses: half accumulates in
     fp32, wider dtypes pass through. Stated independently here so the comparison tests
     chunking rather than agreeing with the implementation by construction."""
@@ -35,8 +35,12 @@ def _reference(hidden, weight, k, temperature=None):
         logits = logits.float()
     if temperature is not None:
         logits = logits / temperature.to(logits.dtype)
+    logsumexp = logits.logsumexp(dim=-1, keepdim=True)
     values, indices = logits.topk(k, dim=-1)
-    return values - logits.logsumexp(dim=-1, keepdim=True), indices
+    label_logps = None
+    if labels is not None:
+        label_logps = (logits.gather(-1, labels.unsqueeze(-1)) - logsumexp).squeeze(-1)
+    return values - logsumexp, indices, label_logps
 
 
 def test_forward_matches_reference():
@@ -45,8 +49,8 @@ def test_forward_matches_reference():
         hidden = torch.randn(num_positions, HIDDEN, dtype=torch.float64)
         weight = torch.randn(VOCAB, HIDDEN, dtype=torch.float64)
 
-        got_logps, got_indices = chunked_topk_logprobs(hidden, weight, K, chunk_size=chunk_size)
-        want_logps, want_indices = _reference(hidden, weight, K)
+        got_logps, got_indices, _ = chunked_topk_logprobs(hidden, weight, K, chunk_size=chunk_size)
+        want_logps, want_indices, _ = _reference(hidden, weight, K)
 
         torch.testing.assert_close(got_logps, want_logps)
         assert torch.equal(got_indices, want_indices)
@@ -60,9 +64,9 @@ def test_chunking_does_not_change_the_result():
     hidden = torch.randn(64, HIDDEN, dtype=torch.float64)
     weight = torch.randn(VOCAB, HIDDEN, dtype=torch.float64)
 
-    baseline, _ = chunked_topk_logprobs(hidden, weight, K, chunk_size=64)
+    baseline, _, _ = chunked_topk_logprobs(hidden, weight, K, chunk_size=64)
     for chunk_size in (1, 3, 7, 16, 1024):
-        other, _ = chunked_topk_logprobs(hidden, weight, K, chunk_size=chunk_size)
+        other, _, _ = chunked_topk_logprobs(hidden, weight, K, chunk_size=chunk_size)
         torch.testing.assert_close(other, baseline, rtol=1e-12, atol=1e-12)
 
 
@@ -123,6 +127,53 @@ def test_gather_matches_reference():
     logits = hidden @ weight.t()
     want = torch.gather(logits, -1, indices) - logits.logsumexp(dim=-1, keepdim=True)
     torch.testing.assert_close(got, want)
+
+
+def test_label_logprobs_match_reference():
+    """The realised token is usually outside the top-k, so it is scored in the same pass."""
+    torch.manual_seed(6)
+    hidden = torch.randn(31, HIDDEN, dtype=torch.float64)
+    weight = torch.randn(VOCAB, HIDDEN, dtype=torch.float64)
+    labels = torch.randint(0, VOCAB, (31,))
+
+    _, _, got = chunked_topk_logprobs(hidden, weight, K, labels=labels, chunk_size=7)
+    _, _, want = _reference(hidden, weight, K, labels=labels)
+    torch.testing.assert_close(got, want)
+
+
+def test_label_gradients_match_reference():
+    torch.manual_seed(7)
+    hidden = torch.randn(17, HIDDEN, dtype=torch.float64)
+    weight = torch.randn(VOCAB, HIDDEN, dtype=torch.float64)
+    labels = torch.randint(0, VOCAB, (17,))
+    grad_topk = torch.randn(17, K, dtype=torch.float64)
+    grad_label = torch.randn(17, dtype=torch.float64)
+
+    ch, cw = hidden.clone().requires_grad_(), weight.clone().requires_grad_()
+    topk, _, label = chunked_topk_logprobs(ch, cw, K, labels=labels, chunk_size=4)
+    (topk * grad_topk).sum().add_((label * grad_label).sum()).backward()
+
+    rh, rw = hidden.clone().requires_grad_(), weight.clone().requires_grad_()
+    rtopk, _, rlabel = _reference(rh, rw, K, labels=labels)
+    (rtopk * grad_topk).sum().add_((rlabel * grad_label).sum()).backward()
+
+    torch.testing.assert_close(ch.grad, rh.grad)
+    torch.testing.assert_close(cw.grad, rw.grad)
+
+
+def test_label_inside_topk_is_counted_once_per_source():
+    """A label that coincides with a top-k entry must accumulate, not overwrite."""
+    torch.manual_seed(8)
+    hidden = torch.randn(6, HIDDEN, dtype=torch.float64, requires_grad=True)
+    weight = torch.randn(VOCAB, HIDDEN, dtype=torch.float64, requires_grad=True)
+    _, indices, _ = chunked_topk_logprobs(hidden, weight, K, chunk_size=3)
+    labels = indices[:, 0].contiguous()  # every label is that row's argmax
+
+    def fn(h, w):
+        topk, _, label = chunked_topk_logprobs(h, w, K, labels=labels, chunk_size=3)
+        return topk.sum() + label.sum()
+
+    assert torch.autograd.gradcheck(fn, (hidden, weight), eps=1e-6, atol=1e-8)
 
 
 def test_peak_memory_is_bounded_by_chunk_size():
