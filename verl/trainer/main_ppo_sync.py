@@ -1523,7 +1523,7 @@ class PPOTrainer:
                     # hints-only: degenerate 1-token teacher row (padding-template pattern), zero mask.
                     # The teacher must still score every row so dp-group collectives stay in lockstep.
                     seq = torch.cat([prompt_list[i][-1:], response_ids[:1]])
-                    meta = [1, 0, 0, 1]
+                    meta = [1, 2, 1, 0, 0, 1]  # one sub-row over the 2-token stub
                     mask_row = torch.zeros(response_ids.shape[0], dtype=torch.float32)
                 teacher_seqs.append(seq)
                 seq_meta.append(torch.tensor(meta, dtype=torch.int64))

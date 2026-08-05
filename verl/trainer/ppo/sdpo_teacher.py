@@ -169,47 +169,54 @@ def build_spliced_teacher_row(
     max_prefix_len: int,
     header_ids: torch.Tensor,
 ) -> tuple[torch.Tensor, list[int], int]:
-    """One teacher sequence per sample: each hint (a rendered user turn) inserted immediately
-    before its turn's assistant header, truncated after the last hinted span. Inserting before
-    the header keeps each hinted turn starting from the normal turn-initial state; later turns
-    see earlier hints. When the header is not found before the span, the hint falls back to a
-    bare splice at the span start; fallbacks are counted and returned.
+    """One teacher sub-row per hinted turn, concatenated into a single row.
 
-    The prompt is left-truncated to ``max_prefix_len``; the body (everything after it) is the
-    sequence's verbatim tail, so the worker's length-subtraction contract holds. Returns the
-    sequence, its flat meta [body_len, then (body_start, start, end) per span] mapping each
-    response span [start, end) to its position inside the body, and the fallback count.
+    Each sub-row is the trajectory up to its own turn with only its own hint spliced in,
+    immediately before the turn's assistant header, and truncated after the scored span.
+    Carrying every hint in one sequence would make the teacher score a later turn from a
+    state it could not reach: it would see its own earlier advice followed by the student
+    ignoring it.
+
+    The prompt is left-truncated to ``max_prefix_len``. Returns the concatenation, a flat
+    meta ``[n_sub, (total_len, body_len, body_start, start, end) per sub-row]``, and the
+    number of hints that could not be placed before a header.
     """
-    prefix = prompt_ids if prompt_ids.shape[0] <= max_prefix_len else prompt_ids[-max_prefix_len:]
-    h = header_ids.shape[0]
-    chunks: list[torch.Tensor] = []
+    base_prefix = prompt_ids if prompt_ids.shape[0] <= max_prefix_len else prompt_ids[-max_prefix_len:]
+    header = header_ids.shape[0]
+    pieces: list[torch.Tensor] = []
     meta: list[int] = []
-    cursor = body_len = fallbacks = 0
+    fallbacks = 0
+
     for (_, start, end, _), hint_ids in zip(hinted_turns, hint_ids_list, strict=True):
-        assert cursor <= start, f"hinted turns must be ordered and disjoint: cursor {cursor} > start {start}"
         hint_ids = hint_ids.to(response_ids.dtype)
-        if start - h >= cursor and torch.equal(response_ids[start - h : start], header_ids):
-            insert_at = start - h
-        elif start == cursor == 0 and prefix.shape[0] >= h and torch.equal(prefix[-h:], header_ids):
+        prefix = base_prefix
+        if start >= header and torch.equal(response_ids[start - header : start], header_ids):
+            insert_at = start - header
+        elif start == 0 and prefix.shape[0] >= header and torch.equal(prefix[-header:], header_ids):
             # first turn: its assistant header is the prompt tail, so the hint joins the prefix
-            prefix = torch.cat([prefix[:-h], hint_ids, prefix[-h:]])
+            prefix = torch.cat([prefix[:-header], hint_ids, prefix[-header:]])
             insert_at = None
         else:
             insert_at = start
             fallbacks += 1
-        if insert_at is not None:
-            chunks.append(response_ids[cursor:insert_at])  # untouched context since the previous span
-            body_len += insert_at - cursor
-            chunks.append(hint_ids)  # the hint, a rendered user turn
-            body_len += hint_ids.shape[0]
-            chunks.append(response_ids[insert_at:start])  # the turn's assistant header (empty on fallback)
-            body_len += start - insert_at
-        # body_len here = the span's offset inside the body (recorded before appending it)
-        meta.extend([body_len, start, end])
-        chunks.append(response_ids[start:end])  # the hinted span itself: the tokens the teacher scores
-        body_len += end - start
-        cursor = end
-    return torch.cat([prefix, *chunks]), [body_len, *meta], fallbacks
+
+        if insert_at is None:
+            body = [response_ids[:start], response_ids[start:end]]
+            body_start = start
+        else:
+            body = [
+                response_ids[:insert_at],  # untouched history, no other hints
+                hint_ids,
+                response_ids[insert_at:start],  # the turn's assistant header
+                response_ids[start:end],  # the span the teacher scores
+            ]
+            body_start = start + hint_ids.shape[0]
+
+        body_len = sum(part.shape[0] for part in body)
+        pieces.append(torch.cat([prefix, *body]))
+        meta.extend([prefix.shape[0] + body_len, body_len, body_start, start, end])
+
+    return torch.cat(pieces), [len(hinted_turns), *meta], fallbacks
 
 
 def turn_token_mask(response_len: int, hinted_turns: list[tuple[int, int, int, str]]) -> torch.Tensor:

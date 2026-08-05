@@ -123,7 +123,8 @@ def construct_minimal_padding_template(
     if "teacher_input_ids" in template_sample:
         template_sample["teacher_input_ids"] = input_ids.clone()
     if "teacher_seq_meta" in template_sample:
-        template_sample["teacher_seq_meta"] = torch.tensor([1, 0, 0, 1], dtype=torch.int64)
+        # one sub-row: (total_len, body_len, body_start, start, end) over the 2-token stub
+        template_sample["teacher_seq_meta"] = torch.tensor([1, 2, 1, 0, 0, 1], dtype=torch.int64)
     if "trace_weight" in template_sample:
         template_sample["trace_weight"] = torch.zeros_like(template_sample["trace_weight"])
     if "traj_id" in template_sample:
