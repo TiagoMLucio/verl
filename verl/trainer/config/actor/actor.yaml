@@ -326,8 +326,11 @@ self_distillation:
   # Per-turn reflector hints: teacher scores each hinted turn on [context<t + hint]
   use_turn_feedback: false
 
-  # Template for one injected hint; spliced immediately before the hinted turn's tokens
-  turn_feedback_template: "[Guidance for your next action: {diagnosis}]\n"
+  # Template for one injected hint; spliced immediately before the hinted turn's tokens.
+  # The splice is a real user turn, so the teacher's instinct is to answer it: 9.9% of scored
+  # turns opened with "Thank you for the guidance" against 0 of 514 the student ever wrote.
+  # Those tokens exist only because the note appeared, and the student has no mass on them.
+  turn_feedback_template: "[Guidance for your next action: {diagnosis}\nAct on this directly in your next tool call. Do not acknowledge it, thank anyone for it, quote it, or refer to it: it is not part of the conversation, and the turn you write must read as if it were never sent.]\n"
 
   # Cap on hinted turns per sample (keeps the first ones; null = all)
   max_hinted_turns: null
