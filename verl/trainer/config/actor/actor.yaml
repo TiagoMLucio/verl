@@ -330,7 +330,10 @@ self_distillation:
   # The splice is a real user turn, so the teacher's instinct is to answer it: 9.9% of scored
   # turns opened with "Thank you for the guidance" against 0 of 514 the student ever wrote.
   # Those tokens exist only because the note appeared, and the student has no mass on them.
-  turn_feedback_template: "[Guidance for your next action: {diagnosis}\nAct on this directly in your next tool call. Do not acknowledge it, thank anyone for it, quote it, or refer to it: it is not part of the conversation, and the turn you write must read as if it were never sent.]\n"
+  # "Act on this directly in your next tool call" asked for the reasoning collapse it produced:
+  # bare-call turns went 2.3% -> 91% over five steps, and the teacher's own continuations open
+  # straight with a tool call. Deliberation is restored here; the no-acknowledgement half stays.
+  turn_feedback_template: "[Guidance for your next action: {diagnosis}\nWork out in your own words what this implies for the current state before you act, then take the action it points to. Do not acknowledge it, thank anyone for it, quote it, or refer to it: it is not part of the conversation, and the turn you write must read as if it were never sent.]\n"
 
   # Cap on hinted turns per sample (keeps the first ones; null = all)
   max_hinted_turns: null
