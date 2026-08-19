@@ -189,6 +189,7 @@ actor_rollout_ref:
         never sent.]
 
         '
+      call_mask: span
       max_hinted_turns: null
     router_replay:
       _target_: verl.workers.config.RouterReplayConfig
