@@ -338,6 +338,102 @@ def call_target_rows(
     return out
 
 
+def forced_target_spans(orig_ids: list[int], target_ids: list[int], mode: str) -> list[tuple[int, int]]:
+    """Supervised positions on the CORRECTED call's own grid (``call_target=forced``).
+
+    Mirrors ``divergence_spans`` but keeps the target side of each differing block: those
+    are the positions that exist after the corrected call replaces the student's, so
+    insertions are supervised as real tokens rather than a boundary. A ``delete`` (the
+    student wrote tokens the correction removes) supervises the single target position
+    that follows the removal — the token that must not be the student's deleted one.
+    ``span`` covers the whole corrected call.
+    """
+    import difflib
+
+    n = len(target_ids)
+    if mode == "span":
+        return [(0, n)] if n else []
+    sm = difflib.SequenceMatcher(None, list(orig_ids), list(target_ids), autojunk=False)
+    spans: list[tuple[int, int]] = []
+    for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        span = (j1, j2) if j2 > j1 else (j1, min(j1 + 1, n))
+        if span[0] < span[1]:
+            spans.append(span)
+        if mode == "first":
+            break
+    return spans
+
+
+def forced_call_swap(
+    response_ids: torch.Tensor,
+    hinted_turns: list[tuple],
+    encode_fn,
+    call_open_ids: torch.Tensor,
+    call_close_ids: torch.Tensor,
+    mode: str,
+) -> Optional[dict]:
+    """Replace the first target-bearing call hint's failed call with its corrected call.
+
+    Returns None when no trustworthy swap exists: no call hint with a target, the call's
+    opening or closing tokens are not found inside the hinted turn (truncated call), or
+    the correction tokenizes identically to the student's call. Otherwise a dict:
+
+    - ``response_ids``: the modified row
+    - ``at`` / ``removed`` / ``inserted``: splice coordinates for sibling per-position rows
+      (``row[:at] + fill*inserted + row[at+removed:]``)
+    - ``hinted_turns``: the input hints with spans shifted onto the modified grid
+    - ``mask_spans``: supervised (start, end) spans on the modified response grid
+    - ``hint_idx``: which hint was swapped (its build span must not be re-narrowed:
+      student and target are now identical there, so a diff would keep the full span)
+    """
+    hint_idx = next(
+        (k for k, (*_, at, target) in enumerate(hinted_turns) if at == "call" and target), None
+    )
+    if hint_idx is None:
+        return None
+    _, start, end, *_ , target = hinted_turns[hint_idx]
+    call_open_ids = call_open_ids.to(response_ids.dtype)
+    call_close_ids = call_close_ids.to(response_ids.dtype)
+    call_at = _find_subseq(response_ids, call_open_ids, start, end)
+    if call_at is None:
+        return None
+    close_at = _find_subseq(response_ids, call_close_ids, call_at, end)
+    if close_at is None:
+        return None
+    close_end = close_at + call_close_ids.shape[0]
+    orig = response_ids[call_at:close_end]
+    t_ids = torch.tensor(encode_fn(target), dtype=response_ids.dtype)
+    if t_ids.shape[0] == 0 or torch.equal(orig, t_ids):
+        return None
+
+    delta = t_ids.shape[0] - orig.shape[0]
+    new_response = torch.cat([response_ids[:call_at], t_ids, response_ids[close_end:]])
+    adjusted = [
+        (step, s + delta if s >= close_end else s, e + delta if e >= close_end else e, *rest)
+        for step, s, e, *rest in hinted_turns
+    ]
+    mask_spans = [
+        (call_at + a, call_at + b)
+        for a, b in forced_target_spans(orig.tolist(), t_ids.tolist(), mode)
+    ]
+    return {
+        "response_ids": new_response,
+        "at": call_at,
+        "removed": int(orig.shape[0]),
+        "inserted": int(t_ids.shape[0]),
+        "hinted_turns": adjusted,
+        "mask_spans": mask_spans,
+        "hint_idx": hint_idx,
+    }
+
+
+def splice_row(row: torch.Tensor, at: int, removed: int, fill: torch.Tensor) -> torch.Tensor:
+    """Per-position sibling of a forced swap: cut ``removed`` positions at ``at``, insert ``fill``."""
+    return torch.cat([row[:at], fill.to(row.dtype), row[at + removed:]])
+
+
 def turn_token_mask(response_len: int, spans: list[tuple[int, int]]) -> torch.Tensor:
     """Per-token distillation mask: 1 on the scored spans, 0 elsewhere."""
     mask = torch.zeros(response_len, dtype=torch.float32)

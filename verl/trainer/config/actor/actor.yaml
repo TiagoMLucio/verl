@@ -348,7 +348,9 @@ self_distillation:
   call_mask: span
 
   # teacher = distill toward the (hinted) teacher distribution at forcing positions;
-  # onehot = exact CE toward the corrected token there (pair with call_mask=first)
+  # onehot = exact CE toward the corrected token there (pair with call_mask=first);
+  # forced = splice the corrected call into the training row and distill the student's
+  # recomputed log-probs of it (call_mask picks which corrected tokens are supervised)
   call_target: teacher
 
   # Cap on hinted turns per sample (keeps the first ones; null = all)

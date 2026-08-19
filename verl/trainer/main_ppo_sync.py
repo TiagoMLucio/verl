@@ -1438,7 +1438,8 @@ class PPOTrainer:
 
         # Turn mode is hints-only: hinted samples get a spliced per-sample teacher sequence, the
         # rest a degenerate 1-token row (untrained). Non-turn mode keeps the legacy reprompt context.
-        response_list = responses.unbind()
+        response_list = list(responses.unbind())
+        response_mask_list = list(data["response_mask"].unbind())
         hinted_per_row = [
             sdpo_teacher.select_hinted_turns(
                 ctx.extra_fields, response_list[i].shape[0], self_distillation_cfg.get("max_hinted_turns")
@@ -1508,6 +1509,52 @@ class PPOTrainer:
             call_open_ids = torch.tensor(
                 self.tokenizer.encode("<tool_call>", add_special_tokens=False), dtype=torch.int64
             )
+            encode = lambda t: self.tokenizer.encode(t, add_special_tokens=False)
+
+            # call_target=forced: splice the corrected call into the student's own row, so the
+            # update recomputes its log-probs under the corrected prefix and distills the
+            # teacher there. Runs before old_log_prob (step 5), so every downstream consumer
+            # sees the modified rows consistently. Sibling per-position rows are spliced in
+            # lockstep; the modified fields ship back to TQ with the teacher fields below.
+            forced_rows: dict[int, dict] = {}
+            rollout_lp_list = None
+            if self_distillation_cfg.call_target == "forced" and any(hinted_per_row):
+                call_close_ids = torch.tensor(
+                    self.tokenizer.encode("</tool_call>", add_special_tokens=False), dtype=torch.int64
+                )
+                extra_sel = ["position_ids"]
+                if self.config.actor_rollout_ref.rollout.calculate_log_probs:
+                    extra_sel.append("rollout_log_probs")
+                row_data = tq.kv_batch_get(
+                    keys=batch.keys, partition_id=batch.partition_id, select_fields=extra_sel
+                )
+                if "rollout_log_probs" in row_data:
+                    rollout_lp_list = list(row_data["rollout_log_probs"].unbind())
+                # rebuilt position ids are a plain arange: only valid for 1-D (text) rope
+                text_rope = row_data["position_ids"].unbind()[0].dim() == 1
+                for i in range(batch_size):
+                    if not (hinted_per_row[i] and text_rope):
+                        continue
+                    swap = sdpo_teacher.forced_call_swap(
+                        response_list[i], hinted_per_row[i], encode, call_open_ids,
+                        call_close_ids, self_distillation_cfg.call_mask)
+                    # the swapped region must be model-generated: never put supervised loss
+                    # where the response mask protects observation tokens
+                    if swap is None or int(
+                        response_mask_list[i][swap["at"]: swap["at"] + swap["removed"]].min()
+                    ) != 1:
+                        continue
+                    response_list[i] = swap["response_ids"]
+                    hinted_per_row[i] = swap["hinted_turns"]
+                    response_mask_list[i] = sdpo_teacher.splice_row(
+                        response_mask_list[i], swap["at"], swap["removed"],
+                        torch.ones(swap["inserted"]))
+                    if rollout_lp_list is not None:
+                        rollout_lp_list[i] = sdpo_teacher.splice_row(
+                            rollout_lp_list[i], swap["at"], swap["removed"],
+                            torch.zeros(swap["inserted"]))
+                    forced_rows[i] = swap
+
             teacher_seqs, seq_meta, mask_rows = [], [], []
             target_rows = [] if self_distillation_cfg.call_target == "onehot" else None
             hint_fallbacks = 0
@@ -1542,14 +1589,22 @@ class PPOTrainer:
                     # narrow target-bearing at-call spans to the tokens the corrected call
                     # changes; the loss denominator follows the mask, so this is where the
                     # copy-token dilution is actually removed
-                    encode = lambda t: self.tokenizer.encode(t, add_special_tokens=False)
                     if target_rows is not None:
                         target_rows.append(sdpo_teacher.call_target_rows(
                             spans, call_placed, hinted_per_row[i], response_ids, encode,
                             response_ids.shape[0]))
-                    spans = sdpo_teacher.narrowed_call_spans(
-                        spans, call_placed, hinted_per_row[i], response_ids, encode,
-                        self_distillation_cfg.call_mask)
+                    if i in forced_rows:
+                        # the swapped call already IS the target: re-narrowing would diff
+                        # identical sequences and keep the full span. Its supervised spans
+                        # (diffed against the original call, on the corrected grid)
+                        # substitute; the row's other hints have no targets to narrow.
+                        fr = forced_rows[i]
+                        spans = [s for j, s in enumerate(spans) if j != fr["hint_idx"]]
+                        spans += fr["mask_spans"]
+                    else:
+                        spans = sdpo_teacher.narrowed_call_spans(
+                            spans, call_placed, hinted_per_row[i], response_ids, encode,
+                            self_distillation_cfg.call_mask)
                     mask_row = sdpo_teacher.turn_token_mask(response_ids.shape[0], spans)
                 else:
                     # hints-only: degenerate 1-token teacher row (padding-template pattern), zero mask.
@@ -1580,7 +1635,6 @@ class PPOTrainer:
             }
 
         # loss_mask = supervised mask: batch_num_tokens all-reduces to the global supervised-token count
-        response_mask_list = data["response_mask"].unbind()
         if turn_mode:
             loss_mask_rows = [
                 response_mask_list[i] * mask_rows[i].to(response_mask_list[i].dtype) for i in range(batch_size)
@@ -1588,6 +1642,34 @@ class PPOTrainer:
         else:
             loss_mask_rows = [response_mask_list[i] * int(legacy_mask[i]) for i in range(batch_size)]
         teacher_fields["loss_mask"] = torch.nested.nested_tensor(loss_mask_rows, layout=torch.jagged)
+
+        # Forced swaps change row contents and lengths: ship the modified rows and every
+        # per-position sibling back to TQ so old_log_prob, advantages, and the update all
+        # see one consistent grid. Unchanged rows are rewritten identically.
+        if turn_mode and forced_rows:
+            seqs = [torch.cat([prompt_list[i], response_list[i]]) for i in range(batch_size)]
+            teacher_fields["responses"] = torch.nested.nested_tensor(response_list, layout=torch.jagged)
+            teacher_fields["response_mask"] = torch.nested.nested_tensor(
+                response_mask_list, layout=torch.jagged)
+            teacher_fields["input_ids"] = torch.nested.nested_tensor(seqs, layout=torch.jagged)
+            teacher_fields["attention_mask"] = torch.nested.nested_tensor(
+                [torch.ones_like(s) for s in seqs], layout=torch.jagged)
+            teacher_fields["position_ids"] = torch.nested.nested_tensor(
+                [torch.arange(s.shape[0], dtype=torch.int64) for s in seqs], layout=torch.jagged)
+            if rollout_lp_list is not None:
+                teacher_fields["rollout_log_probs"] = torch.nested.nested_tensor(
+                    rollout_lp_list, layout=torch.jagged)
+            metrics.update(
+                {
+                    "self_distillation/forced_swapped_rows": float(len(forced_rows)),
+                    "self_distillation/forced_skipped_rows": float(
+                        sum(1 for h in hinted_per_row if h) - len(forced_rows)
+                    ),
+                    "self_distillation/forced_delta_tokens": float(
+                        sum(fr["inserted"] - fr["removed"] for fr in forced_rows.values())
+                    ),
+                }
+            )
 
         # A condensed trajectory ships one row per segment; segment_index==0 marks it once so
         # fractions count trajectories rather than segments (long, failing traces split most).

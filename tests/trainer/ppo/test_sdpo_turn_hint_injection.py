@@ -288,3 +288,108 @@ def test_onehot_override_noop_without_targets():
     tlp = torch.zeros(1, 2) - 1.0
     out_lp, out_topk = apply_onehot_call_targets(tlp, torch.tensor([[1, 2]]), torch.tensor([[-1, -1]]), None, None)
     assert torch.equal(out_lp, tlp) and out_topk is None
+
+
+# --- forced swap (call_target == "forced") -------------------------------------------------
+
+from verl.trainer.ppo.sdpo_teacher import forced_call_swap, forced_target_spans, splice_row
+
+FCLOSE = torch.tensor([96], dtype=torch.int64)
+# one turn [0:12): reasoning [0:4), call [4:11) framed by 95/96, turn tail 99
+FRESP = torch.tensor([1, 2, 3, 4, 95, 30, 31, 32, 33, 34, 96, 99], dtype=torch.int64)
+
+
+def _enc(table):
+    return lambda t: table[t]
+
+
+def test_forced_target_spans_modes():
+    orig = [95, 30, 31, 32, 96]
+    tgt = [95, 30, 41, 42, 32, 96]  # one replace (31->41) that also inserts 42
+    assert forced_target_spans(orig, tgt, "first") == [(2, 4)]
+    assert forced_target_spans(orig, tgt, "all") == [(2, 4)]
+    assert forced_target_spans(orig, tgt, "span") == [(0, 6)]
+    two = [95, 40, 31, 33, 96]  # two independent replaces
+    assert forced_target_spans(orig, two, "first") == [(1, 2)]
+    assert forced_target_spans(orig, two, "all") == [(1, 2), (3, 4)]
+
+
+def test_forced_target_spans_delete_supervises_boundary():
+    # correction removes 31: the target position after the removal is supervised
+    assert forced_target_spans([95, 30, 31, 32, 96], [95, 30, 32, 96], "all") == [(2, 3)]
+    # removal at the very end has no following target position: nothing to supervise
+    assert forced_target_spans([95, 30, 31], [95, 30], "all") == []
+
+
+def test_forced_swap_same_length_replace():
+    table = {"T": [95, 30, 41, 32, 33, 34, 96]}  # rel pos 2 changes
+    hinted = [(0, 0, 12, "h", "call", "T")]
+    swap = forced_call_swap(FRESP, hinted, _enc(table), CALL_OPEN, FCLOSE, "first")
+    assert swap is not None and swap["hint_idx"] == 0
+    assert swap["at"] == 4 and swap["removed"] == 7 and swap["inserted"] == 7
+    assert swap["response_ids"].tolist() == [1, 2, 3, 4, 95, 30, 41, 32, 33, 34, 96, 99]
+    assert swap["mask_spans"] == [(6, 7)]
+    assert swap["hinted_turns"] == [(0, 0, 12, "h", "call", "T")], "delta 0 leaves spans alone"
+
+
+def test_forced_swap_shifts_later_spans():
+    resp = torch.cat([FRESP, torch.tensor([50, 90, 91, 92, 60, 61], dtype=torch.int64)])
+    table = {"T": [95, 30, 41, 42, 32, 33, 34, 96]}  # delta +1
+    hinted = [(0, 0, 12, "h", "call", "T"), (1, 14, 18, "g", "turn", None)]
+    swap = forced_call_swap(resp, hinted, _enc(table), CALL_OPEN, FCLOSE, "all")
+    assert swap is not None
+    assert swap["response_ids"].shape[0] == resp.shape[0] + 1
+    assert swap["hinted_turns"][0] == (0, 0, 13, "h", "call", "T"), "own turn end follows the swap"
+    assert swap["hinted_turns"][1] == (1, 15, 19, "g", "turn", None), "later turn shifts by delta"
+    assert swap["mask_spans"] == [(6, 8)], "insert block supervised as real target tokens"
+
+
+def test_forced_swap_skips_unswappable_rows():
+    enc = _enc({"T": [95, 30, 96]})
+    no_target = [(0, 0, 12, "h", "call", None)]
+    assert forced_call_swap(FRESP, no_target, enc, CALL_OPEN, FCLOSE, "first") is None
+    turn_hint_only = [(0, 0, 12, "h", "turn", "T")]
+    assert forced_call_swap(FRESP, turn_hint_only, enc, CALL_OPEN, FCLOSE, "first") is None
+    no_open = torch.tensor([1, 2, 3, 4, 30, 31, 96, 99], dtype=torch.int64)
+    assert forced_call_swap(no_open, [(0, 0, 8, "h", "call", "T")], enc, CALL_OPEN, FCLOSE, "first") is None
+    truncated = FRESP[:9]  # call opening present, closing cut off
+    assert forced_call_swap(truncated, [(0, 0, 9, "h", "call", "T")], enc, CALL_OPEN, FCLOSE, "first") is None
+    identical = _enc({"T": FRESP[4:11].tolist()})
+    assert forced_call_swap(FRESP, [(0, 0, 12, "h", "call", "T")], identical, CALL_OPEN, FCLOSE, "first") is None
+
+
+def test_forced_swap_picks_the_call_hint_among_turn_hints():
+    resp = torch.cat([FRESP, torch.tensor([50, 90, 91, 92, 60, 61], dtype=torch.int64)])
+    table = {"T": [95, 30, 41, 32, 33, 34, 96]}
+    hinted = [(1, 14, 18, "g", "turn", None), (0, 0, 12, "h", "call", "T")]
+    swap = forced_call_swap(resp, hinted, _enc(table), CALL_OPEN, FCLOSE, "first")
+    assert swap is not None and swap["hint_idx"] == 1
+
+
+def test_splice_row_keeps_dtype_and_positions():
+    row = torch.tensor([0.5, 1.5, 2.5, 3.5])
+    out = splice_row(row, 1, 2, torch.zeros(3))
+    assert out.tolist() == [0.5, 0.0, 0.0, 0.0, 3.5] and out.dtype == row.dtype
+    mask = torch.tensor([1, 1, 0, 1], dtype=torch.int64)
+    out = splice_row(mask, 2, 1, torch.ones(2))
+    assert out.tolist() == [1, 1, 1, 1, 1] and out.dtype == torch.int64
+
+
+def test_forced_swap_then_teacher_build_stays_aligned():
+    table = {"T": [95, 30, 41, 42, 32, 33, 34, 96]}  # delta +1
+    hinted = [(0, 0, 12, "h", "call", "T")]
+    swap = forced_call_swap(FRESP, hinted, _enc(table), CALL_OPEN, FCLOSE, "all")
+    new_resp, new_hinted = swap["response_ids"], swap["hinted_turns"]
+    prompt = torch.arange(10, dtype=torch.int64)
+    hint = torch.tensor([70, 71], dtype=torch.int64)
+    seq, meta, fallbacks, spans, placed = build_spliced_teacher_row(
+        prompt, new_resp, new_hinted, [hint], 100, HEADER, close_ids=CLOSE, call_open_ids=CALL_OPEN)
+    assert fallbacks == 0 and placed == [True]
+    assert spans == [(4, 13)], "teacher scores the corrected call span on the new grid"
+    expected = torch.cat([prompt, new_resp[:4], CLOSE, hint, HEADER, new_resp[4:13]])
+    assert torch.equal(seq, expected)
+    for a, b in swap["mask_spans"]:
+        assert spans[0][0] <= a < b <= spans[0][1], "supervised spans sit inside the scored span"
+    from verl.trainer.ppo.sdpo_teacher import turn_token_mask
+    mask = turn_token_mask(new_resp.shape[0], swap["mask_spans"])
+    assert mask.tolist() == [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0], "only the changed corrected tokens train"
