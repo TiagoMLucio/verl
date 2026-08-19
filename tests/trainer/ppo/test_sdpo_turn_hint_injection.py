@@ -44,7 +44,7 @@ def test_hint_inserted_before_assistant_header():
     hinted = [(1, 12, 16, "hint", "turn")]
     hint = torch.tensor([70, 71], dtype=torch.int64)
 
-    seq, meta, fallbacks, _ = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER)
+    seq, meta, fallbacks, _, _ = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER)
 
     assert fallbacks == 0
     expected = torch.cat([prompt, response[:9], hint, response[9:16]])
@@ -58,7 +58,7 @@ def test_first_turn_hint_joins_prompt_tail():
     hinted = [(0, 0, 4, "hint", "turn")]
     hint = torch.tensor([70, 71], dtype=torch.int64)
 
-    seq, meta, fallbacks, _ = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER)
+    seq, meta, fallbacks, _, _ = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER)
 
     assert fallbacks == 0
     expected = torch.cat([prompt[:-3], hint, HEADER, response])
@@ -73,7 +73,7 @@ def test_missing_header_falls_back_to_bare_splice():
     hinted = [(1, 7, 10, "hint", "turn")]
     hint = torch.tensor([70, 71], dtype=torch.int64)
 
-    seq, meta, fallbacks, _ = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER)
+    seq, meta, fallbacks, _, _ = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER)
 
     assert fallbacks == 1
     expected = torch.cat([prompt, response[:7], hint, response[7:10]])
@@ -97,7 +97,7 @@ def test_cumulative_hints_and_truncation_after_last_span():
     hinted = [(0, 5, 8, "a", "turn"), (1, 13, 15, "b", "turn")]
     hints = [torch.tensor([70], dtype=torch.int64), torch.tensor([71], dtype=torch.int64)]
 
-    seq, meta, fallbacks, _ = build_spliced_teacher_row(prompt, response, hinted, hints, 100, HEADER)
+    seq, meta, fallbacks, _, _ = build_spliced_teacher_row(prompt, response, hinted, hints, 100, HEADER)
 
     assert fallbacks == 0
     expected = torch.cat(
@@ -120,7 +120,7 @@ def test_call_hint_splices_between_reasoning_and_call():
     hinted = [(0, 0, 10, "h", "call")]
     hint = torch.tensor([70, 71], dtype=torch.int64)
 
-    seq, meta, fallbacks, spans = build_spliced_teacher_row(
+    seq, meta, fallbacks, spans, placed = build_spliced_teacher_row(
         prompt, response, hinted, [hint], 100, HEADER, close_ids=CLOSE, call_open_ids=CALL_OPEN)
 
     assert fallbacks == 0
@@ -140,7 +140,7 @@ def test_call_hint_without_call_opening_falls_back_to_turn_splice():
     hinted = [(1, 5, 9, "h", "call")]
     hint = torch.tensor([70, 71], dtype=torch.int64)
 
-    seq, meta, fallbacks, spans = build_spliced_teacher_row(
+    seq, meta, fallbacks, spans, placed = build_spliced_teacher_row(
         prompt, response, hinted, [hint], 100, HEADER, close_ids=CLOSE, call_open_ids=CALL_OPEN)
 
     assert fallbacks == 1, "a call hint with no call opening is a fallback"
@@ -155,7 +155,7 @@ def test_call_hint_without_splice_ids_falls_back():
     hinted = [(1, 5, 9, "h", "call")]
     hint = torch.tensor([70, 71], dtype=torch.int64)
 
-    seq, meta, fallbacks, spans = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER)
+    seq, meta, fallbacks, spans, placed = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER)
 
     assert fallbacks == 1
     assert spans == [(5, 9)]
@@ -166,5 +166,72 @@ def test_select_hinted_turns_reads_call_placement():
     from verl.trainer.ppo.sdpo_teacher import select_hinted_turns
 
     extra = {"turn_spans": [[0, 0, 4], [1, 4, 9]],
-             "turn_feedback": [[0, "a"], [1, "b", "call"]]}
-    assert select_hinted_turns(extra, 9) == [(0, 0, 4, "a", "turn"), (1, 4, 9, "b", "call")]
+             "turn_feedback": [[0, "a"], [1, "b", "call"], ]}
+    assert select_hinted_turns(extra, 9) == [(0, 0, 4, "a", "turn", None), (1, 4, 9, "b", "call", None)]
+    extra["turn_feedback"] = [[1, "b", "call", "TARGET"]]
+    assert select_hinted_turns(extra, 9) == [(1, 4, 9, "b", "call", "TARGET")]
+
+
+# --- divergence-window narrowing ----------------------------------------------------------
+
+from verl.trainer.ppo.sdpo_teacher import divergence_spans, narrowed_call_spans, turn_token_mask
+
+
+def test_divergence_single_replace_first_equals_all():
+    student, target = [1, 9, 3, 4], [1, 2, 3, 4]
+    assert divergence_spans(student, target, "first") == [(1, 2)]
+    assert divergence_spans(student, target, "all") == [(1, 2)]
+
+
+def test_divergence_two_independent_blocks():
+    student, target = [9, 2, 3, 8], [1, 2, 3, 4]
+    assert divergence_spans(student, target, "first") == [(0, 1)]
+    assert divergence_spans(student, target, "all") == [(0, 1), (3, 4)]
+
+
+def test_divergence_insert_masks_the_boundary_token():
+    # student is MISSING a token: the position that should have produced it is masked
+    assert divergence_spans([1, 2, 4], [1, 2, 3, 4], "all") == [(2, 3)]
+
+
+def test_divergence_delete_masks_the_extra_tokens():
+    assert divergence_spans([1, 2, 7, 7, 3], [1, 2, 3], "all") == [(2, 4)]
+
+
+def test_divergence_realigns_after_a_shifted_block():
+    # a wrong prefix, then identical content: only the prefix is masked
+    assert divergence_spans([5, 5, 1, 2, 3], [1, 2, 3], "all") == [(0, 2)]
+
+
+def test_divergence_identical_yields_nothing():
+    assert divergence_spans([1, 2, 3], [1, 2, 3], "all") == []
+
+
+def test_narrowing_applies_only_to_placed_call_hints_with_targets():
+    response = torch.tensor([1, 2, 3, 4, 5, 9, 7, 8], dtype=torch.int64)
+    hinted = [(0, 0, 4, "h", "turn", None), (1, 4, 8, "h", "call", "T")]
+    spans = [(0, 4), (4, 8)]
+    encode = lambda t: [5, 6, 7, 8]  # student [5,9,7,8] vs target: token 9 wrong
+    out = narrowed_call_spans(spans, [False, True], hinted, response, encode, "first")
+    assert out == [(0, 4), (5, 6)], "turn span untouched; call span narrowed to the wrong token"
+    mask = turn_token_mask(8, out)
+    assert mask.tolist() == [1, 1, 1, 1, 0, 1, 0, 0]
+
+
+def test_narrowing_skips_fallback_call_hints():
+    response = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+    hinted = [(0, 0, 4, "h", "call", "T")]
+    out = narrowed_call_spans([(0, 4)], [False], hinted, response, lambda t: [9], "all")
+    assert out == [(0, 4)], "a call hint that fell back to turn splice keeps the whole span"
+
+
+def test_narrowing_keeps_span_when_diff_is_empty():
+    response = torch.tensor([1, 2, 3], dtype=torch.int64)
+    hinted = [(0, 0, 3, "h", "call", "T")]
+    out = narrowed_call_spans([(0, 3)], [True], hinted, response, lambda t: [1, 2, 3], "all")
+    assert out == [(0, 3)]
+
+
+def test_span_mode_is_passthrough():
+    hinted = [(0, 0, 3, "h", "call", "T")]
+    assert narrowed_call_spans([(0, 3)], [True], hinted, torch.tensor([9, 9, 9]), lambda t: [1], "span") == [(0, 3)]

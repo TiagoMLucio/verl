@@ -117,6 +117,11 @@ class SelfDistillationConfig(BaseConfig):
         "Continue exactly where you left off: your next output is the tool call itself - "
         "no reply, no acknowledgement, no further reasoning, as if this note were never sent.]\n"
     )
+    # how much of an at-call hinted span the distillation mask covers: the whole call
+    # (span), only the first token block the corrected call changes (first), or every
+    # changed block (all). Narrow masks remove the copy-token dilution: the loss denominator
+    # follows the mask, so decisive tokens train at full strength.
+    call_mask: str = "span"
     max_hinted_turns: Optional[int] = None
 
     def __post_init__(self):
@@ -147,6 +152,10 @@ class SelfDistillationConfig(BaseConfig):
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
         if self.use_turn_feedback:
+            if self.call_mask not in ("span", "first", "all"):
+                raise ValueError(
+                    f"self_distillation.call_mask must be span|first|all, got {self.call_mask!r}"
+                )
             for name in ("turn_feedback_template", "call_feedback_template"):
                 template = getattr(self, name)
                 try:

@@ -1523,9 +1523,9 @@ class PPOTrainer:
                             ),
                             dtype=response_ids.dtype,
                         )
-                        for *_, text, at in hinted_per_row[i]
+                        for *_, text, at, _target in hinted_per_row[i]
                     ]
-                    seq, meta, fallbacks, spans = sdpo_teacher.build_spliced_teacher_row(
+                    seq, meta, fallbacks, spans, call_placed = sdpo_teacher.build_spliced_teacher_row(
                         prompt_list[i],
                         response_ids,
                         hinted_per_row[i],
@@ -1538,6 +1538,13 @@ class PPOTrainer:
                         call_open_ids=call_open_ids,
                     )
                     hint_fallbacks += fallbacks
+                    # narrow target-bearing at-call spans to the tokens the corrected call
+                    # changes; the loss denominator follows the mask, so this is where the
+                    # copy-token dilution is actually removed
+                    spans = sdpo_teacher.narrowed_call_spans(
+                        spans, call_placed, hinted_per_row[i], response_ids,
+                        lambda t: self.tokenizer.encode(t, add_special_tokens=False),
+                        self_distillation_cfg.call_mask)
                     mask_row = sdpo_teacher.turn_token_mask(response_ids.shape[0], spans)
                 else:
                     # hints-only: degenerate 1-token teacher row (padding-template pattern), zero mask.

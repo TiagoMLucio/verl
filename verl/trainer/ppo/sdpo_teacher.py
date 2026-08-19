@@ -120,23 +120,24 @@ def extract_prompt_text(raw_prompt: list[dict]) -> str:
 
 def select_hinted_turns(
     extra_fields: dict, response_len: int, max_hinted_turns: Optional[int] = None
-) -> list[tuple[int, int, int, str, str]]:
+) -> list[tuple[int, int, int, str, str, "Optional[str]"]]:
     """Pair a sample's turn spans with its reflection diagnoses as
-    (step, start, end, text, at), where ``at`` is ``turn`` (hint before the whole turn,
+    (step, start, end, text, at, target), where ``at`` is ``turn`` (hint before the whole turn,
     the default) or ``call`` (hint between the turn's reasoning and its tool call; the
     rollout ships it as a third element of the ``turn_feedback`` entry).
 
     Spans are clamped to the (possibly truncated) response; with a cap, the first
     ``max_hinted_turns`` turns are kept (earliest, before the trajectory loses coherence).
     """
-    diagnoses = {int(entry[0]): (entry[1], entry[2] if len(entry) > 2 else "turn")
+    diagnoses = {int(entry[0]): (entry[1], entry[2] if len(entry) > 2 else "turn",
+                                 entry[3] if len(entry) > 3 else None)
                  for entry in (extra_fields.get("turn_feedback") or [])}
     hinted = []
     for step, start, end in extra_fields.get("turn_spans") or []:
         step, start, end = int(step), int(start), min(int(end), response_len)
         if step in diagnoses and start < end:
-            text, at = diagnoses[step]
-            hinted.append((step, start, end, text, at))
+            text, at, target = diagnoses[step]
+            hinted.append((step, start, end, text, at, target))
     if max_hinted_turns is not None and len(hinted) > max_hinted_turns:
         hinted = hinted[:max_hinted_turns]
     return hinted
@@ -185,7 +186,7 @@ def build_spliced_teacher_row(
     header_ids: torch.Tensor,
     close_ids: Optional[torch.Tensor] = None,
     call_open_ids: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, list[int], int, list[tuple[int, int]]]:
+) -> tuple[torch.Tensor, list[int], int, list[tuple[int, int]], list[bool]]:
     """One teacher sub-row per hinted turn, concatenated into a single row.
 
     Each sub-row is the trajectory up to its own turn with only its own hint spliced in,
@@ -202,17 +203,19 @@ def build_spliced_teacher_row(
 
     The prompt is left-truncated to ``max_prefix_len``. Returns the concatenation, a flat
     meta ``[n_sub, (total_len, body_len, body_start, start, end) per sub-row]``, the
-    number of fallback placements, and the effective (start, end) spans for the
-    distillation mask (== the meta spans).
+    number of fallback placements, the effective (start, end) spans for the
+    distillation mask (== the meta spans), and per-hint whether the call splice was
+    actually placed (False for turn hints and for call hints that fell back).
     """
     base_prefix = prompt_ids if prompt_ids.shape[0] <= max_prefix_len else prompt_ids[-max_prefix_len:]
     header = header_ids.shape[0]
     pieces: list[torch.Tensor] = []
     meta: list[int] = []
     spans: list[tuple[int, int]] = []
+    call_placed: list[bool] = []
     fallbacks = 0
 
-    for (_, start, end, _, at), hint_ids in zip(hinted_turns, hint_ids_list, strict=True):
+    for (_, start, end, _, at, *_), hint_ids in zip(hinted_turns, hint_ids_list, strict=True):
         hint_ids = hint_ids.to(response_ids.dtype)
         prefix = base_prefix
         call_at = None
@@ -255,12 +258,55 @@ def build_spliced_teacher_row(
                 body_start = start + hint_ids.shape[0]
             span = (start, end)
 
+        call_placed.append(call_at is not None)
         body_len = sum(part.shape[0] for part in body)
         pieces.append(torch.cat([prefix, *body]))
         meta.extend([prefix.shape[0] + body_len, body_len, body_start, *span])
         spans.append(span)
 
-    return torch.cat(pieces), [len(hinted_turns), *meta], fallbacks, spans
+    return torch.cat(pieces), [len(hinted_turns), *meta], fallbacks, spans, call_placed
+
+
+def divergence_spans(student_ids, target_ids, mode: str) -> list[tuple[int, int]]:
+    """Positions (relative to the student call) where the corrected call changes tokens.
+
+    Token-level diff via matching blocks, so independent errors at different offsets are
+    found even when lengths shift. ``replace``/``delete`` blocks mask the student's wrong
+    tokens; an ``insert`` (student missing tokens) masks the single boundary position that
+    should have produced them. ``first`` keeps the first differing block, ``all`` keeps
+    every one. Identical sequences yield no spans.
+    """
+    import difflib
+
+    sm = difflib.SequenceMatcher(None, list(student_ids), list(target_ids), autojunk=False)
+    spans: list[tuple[int, int]] = []
+    n = len(student_ids)
+    for tag, i1, i2, _j1, _j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        span = (i1, i2) if i2 > i1 else (i1, min(i1 + 1, n))
+        if span[0] < span[1]:
+            spans.append(span)
+        if mode == "first":
+            break
+    return spans
+
+
+def narrowed_call_spans(spans, call_placed, hinted_turns, student_ids, encode_fn, mode: str):
+    """Mask spans with target-bearing, actually-placed call hints narrowed to the tokens
+    the corrected call changes; everything else passes through. A diff that comes back
+    empty keeps the full span rather than dropping the hint."""
+    if mode == "span":
+        return spans
+    out = []
+    for span, placed, (*_, at, target) in zip(spans, call_placed, hinted_turns, strict=True):
+        s, e = span
+        if placed and at == "call" and target and e > s:
+            subs = divergence_spans(student_ids[s:e].tolist(), encode_fn(target), mode)
+            out += [(s + a, s + b) for a, b in subs] or [span]
+        else:
+            out.append(span)
+    return out
 
 
 def turn_token_mask(response_len: int, spans: list[tuple[int, int]]) -> torch.Tensor:
