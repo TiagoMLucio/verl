@@ -36,10 +36,10 @@ def njt(rows):
 def make_hinted_sample(resp_len=9000, prompt_len=50):
     response_ids = torch.arange(resp_len, dtype=torch.long)
     prompt_ids = torch.full((prompt_len,), 7, dtype=torch.long)
-    hinted = [(3, 100, 2600, "h1"), (7, 2600, resp_len, "h2")]
+    hinted = [(3, 100, 2600, "h1", "turn"), (7, 2600, resp_len, "h2", "turn")]
     hint_ids = [torch.full((20,), 5, dtype=torch.long), torch.full((30,), 6, dtype=torch.long)]
     header_ids = torch.tensor([90, 91, 92], dtype=torch.long)
-    seq, meta, _ = sdpo_teacher.build_spliced_teacher_row(
+    seq, meta, _, _ = sdpo_teacher.build_spliced_teacher_row(
         prompt_ids, response_ids, hinted, hint_ids, 32768, header_ids
     )
     return {

@@ -124,7 +124,7 @@ def make_batch(include_hinted=True, include_unhinted=True):
         # hinted sample: prompt 4, response 12, one hinted turn covering response [2, 7)
         prompt = torch.arange(4, dtype=torch.long) + 1
         resp = torch.arange(12, dtype=torch.long) + 5
-        hinted = [(1, 2, 7, "h1")]
+        hinted = [(1, 2, 7, "h1", "turn")]
         hint_ids = [torch.tensor([50, 51, 52], dtype=torch.long)]
         header = torch.tensor([60, 61], dtype=torch.long)
         seq, meta, _ = sdpo_teacher.build_spliced_teacher_row(prompt, resp, hinted, hint_ids, 4096, header)

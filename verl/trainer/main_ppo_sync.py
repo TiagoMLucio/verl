@@ -1216,6 +1216,12 @@ class PPOTrainer:
                     reward_extra_infos_dict[key] = [
                         json.dumps((ef[i] or {}).get(key)) for i in sorted_indices
                     ]
+                # how a trajectory ended is otherwise only an aggregate fraction in the
+                # metrics: without it a dumped rollout cannot say whether it submitted,
+                # ran out of turns or got stuck
+                reward_extra_infos_dict["traj_exit_reason"] = [
+                    (ef[i] or {}).get("traj_exit_reason") for i in sorted_indices
+                ]
 
             self._dump_generations(
                 inputs=inputs,
@@ -1492,7 +1498,16 @@ class PPOTrainer:
             # meta [body_len, (body_start, start, end)...] maps spliced positions back to the response grid
             prompt_list = data["prompts"].unbind()
             hint_template = self_distillation_cfg.turn_feedback_template
+            call_template = self_distillation_cfg.call_feedback_template
             header_ids = torch.tensor(sdpo_teacher.assistant_header_ids(self.tokenizer), dtype=torch.int64)
+            # mid-turn (at == "call") splices close the assistant turn and reopen it after the
+            # hint; the call span starts at the template's tool-call opening token
+            close_ids = torch.tensor(
+                self.tokenizer.encode(self.tokenizer.eos_token + "\n", add_special_tokens=False), dtype=torch.int64
+            )
+            call_open_ids = torch.tensor(
+                self.tokenizer.encode("<tool_call>", add_special_tokens=False), dtype=torch.int64
+            )
             teacher_seqs, seq_meta, mask_rows = [], [], []
             hint_fallbacks = 0
             from verl.utils.debug_breakpoints import should_break
@@ -1502,12 +1517,15 @@ class PPOTrainer:
                     if should_break("teacher_build"): breakpoint()
                     hint_ids = [
                         torch.tensor(
-                            sdpo_teacher.hint_user_turn_ids(self.tokenizer, hint_template.format(diagnosis=text)),
+                            sdpo_teacher.hint_user_turn_ids(
+                                self.tokenizer,
+                                (call_template if at == "call" else hint_template).format(diagnosis=text),
+                            ),
                             dtype=response_ids.dtype,
                         )
-                        for *_, text in hinted_per_row[i]
+                        for *_, text, at in hinted_per_row[i]
                     ]
-                    seq, meta, fallbacks = sdpo_teacher.build_spliced_teacher_row(
+                    seq, meta, fallbacks, spans = sdpo_teacher.build_spliced_teacher_row(
                         prompt_list[i],
                         response_ids,
                         hinted_per_row[i],
@@ -1516,9 +1534,11 @@ class PPOTrainer:
                         # cap with the student's own prompt budget, not the legacy reprompt one
                         self.config.data.max_prompt_length,
                         header_ids,
+                        close_ids=close_ids,
+                        call_open_ids=call_open_ids,
                     )
                     hint_fallbacks += fallbacks
-                    mask_row = sdpo_teacher.turn_token_mask(response_ids.shape[0], hinted_per_row[i])
+                    mask_row = sdpo_teacher.turn_token_mask(response_ids.shape[0], spans)
                 else:
                     # hints-only: degenerate 1-token teacher row (padding-template pattern), zero mask.
                     # The teacher must still score every row so dp-group collectives stay in lockstep.

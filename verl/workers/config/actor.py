@@ -109,6 +109,14 @@ class SelfDistillationConfig(BaseConfig):
     environment_feedback_only_without_solution: bool = False
     use_turn_feedback: bool = False
     turn_feedback_template: str = "[Hindsight from a previous failed attempt that reached this exact state: {diagnosis}]\n"
+    # wraps hints the rollout marks `at: call` (spliced between a turn's reasoning and its
+    # tool call): the next token after it must be the call itself, so unlike the turn
+    # template it must never invite further deliberation
+    call_feedback_template: str = (
+        "[A note on the tool call you are about to write: {diagnosis}\n"
+        "Continue exactly where you left off: your next output is the tool call itself - "
+        "no reply, no acknowledgement, no further reasoning, as if this note were never sent.]\n"
+    )
     max_hinted_turns: Optional[int] = None
 
     def __post_init__(self):
@@ -139,18 +147,19 @@ class SelfDistillationConfig(BaseConfig):
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
         if self.use_turn_feedback:
-            try:
-                self.turn_feedback_template.format(diagnosis="")
-            except (KeyError, IndexError) as exc:
-                raise ValueError(
-                    f"self_distillation.turn_feedback_template must format on {{diagnosis}} alone, "
-                    f"got {self.turn_feedback_template!r}"
-                ) from exc
-            if "{diagnosis}" not in self.turn_feedback_template:
-                raise ValueError(
-                    "self_distillation.turn_feedback_template must contain the {diagnosis} "
-                    f"placeholder or the hint is silently dropped, got {self.turn_feedback_template!r}"
-                )
+            for name in ("turn_feedback_template", "call_feedback_template"):
+                template = getattr(self, name)
+                try:
+                    template.format(diagnosis="")
+                except (KeyError, IndexError) as exc:
+                    raise ValueError(
+                        f"self_distillation.{name} must format on {{diagnosis}} alone, got {template!r}"
+                    ) from exc
+                if "{diagnosis}" not in template:
+                    raise ValueError(
+                        f"self_distillation.{name} must contain the {{diagnosis}} "
+                        f"placeholder or the hint is silently dropped, got {template!r}"
+                    )
 
 
 @dataclass

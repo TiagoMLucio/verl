@@ -120,18 +120,23 @@ def extract_prompt_text(raw_prompt: list[dict]) -> str:
 
 def select_hinted_turns(
     extra_fields: dict, response_len: int, max_hinted_turns: Optional[int] = None
-) -> list[tuple[int, int, int, str]]:
-    """Pair a sample's turn spans with its reflection diagnoses as (step, start, end, text).
+) -> list[tuple[int, int, int, str, str]]:
+    """Pair a sample's turn spans with its reflection diagnoses as
+    (step, start, end, text, at), where ``at`` is ``turn`` (hint before the whole turn,
+    the default) or ``call`` (hint between the turn's reasoning and its tool call; the
+    rollout ships it as a third element of the ``turn_feedback`` entry).
 
     Spans are clamped to the (possibly truncated) response; with a cap, the first
     ``max_hinted_turns`` turns are kept (earliest, before the trajectory loses coherence).
     """
-    diagnoses = {int(step): text for step, text in (extra_fields.get("turn_feedback") or [])}
+    diagnoses = {int(entry[0]): (entry[1], entry[2] if len(entry) > 2 else "turn")
+                 for entry in (extra_fields.get("turn_feedback") or [])}
     hinted = []
     for step, start, end in extra_fields.get("turn_spans") or []:
         step, start, end = int(step), int(start), min(int(end), response_len)
         if step in diagnoses and start < end:
-            hinted.append((step, start, end, diagnoses[step]))
+            text, at = diagnoses[step]
+            hinted.append((step, start, end, text, at))
     if max_hinted_turns is not None and len(hinted) > max_hinted_turns:
         hinted = hinted[:max_hinted_turns]
     return hinted
@@ -161,68 +166,107 @@ def hint_user_turn_ids(tokenizer, hint_text: str) -> list[int]:
     return tokenizer.encode(suffix, add_special_tokens=False)
 
 
+def _find_subseq(haystack: torch.Tensor, needle: torch.Tensor, lo: int, hi: int) -> Optional[int]:
+    """Index of the first occurrence of ``needle`` inside ``haystack[lo:hi]``, or None."""
+    n = needle.shape[0]
+    if n == 0 or hi - lo < n:
+        return None
+    window = haystack[lo:hi]
+    hits = (window.unfold(0, n, 1) == needle).all(dim=1).nonzero()
+    return lo + hits[0].item() if len(hits) else None
+
+
 def build_spliced_teacher_row(
     prompt_ids: torch.Tensor,
     response_ids: torch.Tensor,
-    hinted_turns: list[tuple[int, int, int, str]],
+    hinted_turns: list[tuple[int, int, int, str, str]],
     hint_ids_list: list[torch.Tensor],
     max_prefix_len: int,
     header_ids: torch.Tensor,
-) -> tuple[torch.Tensor, list[int], int]:
+    close_ids: Optional[torch.Tensor] = None,
+    call_open_ids: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, list[int], int, list[tuple[int, int]]]:
     """One teacher sub-row per hinted turn, concatenated into a single row.
 
     Each sub-row is the trajectory up to its own turn with only its own hint spliced in,
-    immediately before the turn's assistant header, and truncated after the scored span.
+    and truncated after the scored span. ``at == "turn"`` hints go immediately before the
+    turn's assistant header and score the whole turn. ``at == "call"`` hints go between
+    the turn's reasoning and its tool call: the assistant turn is closed (``close_ids``),
+    the hint's user turn inserted, the assistant header reopened, and only the call span
+    (from ``call_open_ids``, e.g. the ``<tool_call>`` token, to the turn's end) is scored.
+    A call hint whose turn has no call opening falls back to the turn splice.
+
     Carrying every hint in one sequence would make the teacher score a later turn from a
     state it could not reach: it would see its own earlier advice followed by the student
     ignoring it.
 
     The prompt is left-truncated to ``max_prefix_len``. Returns the concatenation, a flat
-    meta ``[n_sub, (total_len, body_len, body_start, start, end) per sub-row]``, and the
-    number of hints that could not be placed before a header.
+    meta ``[n_sub, (total_len, body_len, body_start, start, end) per sub-row]``, the
+    number of fallback placements, and the effective (start, end) spans for the
+    distillation mask (== the meta spans).
     """
     base_prefix = prompt_ids if prompt_ids.shape[0] <= max_prefix_len else prompt_ids[-max_prefix_len:]
     header = header_ids.shape[0]
     pieces: list[torch.Tensor] = []
     meta: list[int] = []
+    spans: list[tuple[int, int]] = []
     fallbacks = 0
 
-    for (_, start, end, _), hint_ids in zip(hinted_turns, hint_ids_list, strict=True):
+    for (_, start, end, _, at), hint_ids in zip(hinted_turns, hint_ids_list, strict=True):
         hint_ids = hint_ids.to(response_ids.dtype)
         prefix = base_prefix
-        if start >= header and torch.equal(response_ids[start - header : start], header_ids):
-            insert_at = start - header
-        elif start == 0 and prefix.shape[0] >= header and torch.equal(prefix[-header:], header_ids):
-            # first turn: its assistant header is the prompt tail, so the hint joins the prefix
-            prefix = torch.cat([prefix[:-header], hint_ids, prefix[-header:]])
-            insert_at = None
-        else:
-            insert_at = start
-            fallbacks += 1
+        call_at = None
+        if at == "call" and close_ids is not None and call_open_ids is not None:
+            call_at = _find_subseq(response_ids, call_open_ids.to(response_ids.dtype), start, end)
 
-        if insert_at is None:
-            body = [response_ids[:start], response_ids[start:end]]
-            body_start = start
-        else:
+        if call_at is not None:
             body = [
-                response_ids[:insert_at],  # untouched history, no other hints
+                response_ids[:call_at],  # history plus this turn's header and reasoning
+                close_ids.to(response_ids.dtype),
                 hint_ids,
-                response_ids[insert_at:start],  # the turn's assistant header
-                response_ids[start:end],  # the span the teacher scores
+                header_ids.to(response_ids.dtype),
+                response_ids[call_at:end],  # the call, the only span the teacher scores
             ]
-            body_start = start + hint_ids.shape[0]
+            body_start = call_at + close_ids.shape[0] + hint_ids.shape[0] + header
+            span = (call_at, end)
+        else:
+            if at == "call":
+                fallbacks += 1
+            if start >= header and torch.equal(response_ids[start - header : start], header_ids):
+                insert_at = start - header
+            elif start == 0 and prefix.shape[0] >= header and torch.equal(prefix[-header:], header_ids):
+                # first turn: its assistant header is the prompt tail, so the hint joins the prefix
+                prefix = torch.cat([prefix[:-header], hint_ids, prefix[-header:]])
+                insert_at = None
+            else:
+                insert_at = start
+                fallbacks += 1
+
+            if insert_at is None:
+                body = [response_ids[:start], response_ids[start:end]]
+                body_start = start
+            else:
+                body = [
+                    response_ids[:insert_at],  # untouched history, no other hints
+                    hint_ids,
+                    response_ids[insert_at:start],  # the turn's assistant header
+                    response_ids[start:end],  # the span the teacher scores
+                ]
+                body_start = start + hint_ids.shape[0]
+            span = (start, end)
 
         body_len = sum(part.shape[0] for part in body)
         pieces.append(torch.cat([prefix, *body]))
-        meta.extend([prefix.shape[0] + body_len, body_len, body_start, start, end])
+        meta.extend([prefix.shape[0] + body_len, body_len, body_start, *span])
+        spans.append(span)
 
-    return torch.cat(pieces), [len(hinted_turns), *meta], fallbacks
+    return torch.cat(pieces), [len(hinted_turns), *meta], fallbacks, spans
 
 
-def turn_token_mask(response_len: int, hinted_turns: list[tuple[int, int, int, str]]) -> torch.Tensor:
-    """Per-token distillation mask: 1 on hinted turn spans, 0 elsewhere."""
+def turn_token_mask(response_len: int, spans: list[tuple[int, int]]) -> torch.Tensor:
+    """Per-token distillation mask: 1 on the scored spans, 0 elsewhere."""
     mask = torch.zeros(response_len, dtype=torch.float32)
-    for _, start, end, _ in hinted_turns:
+    for start, end in spans:
         mask[start:end] = 1.0
     return mask
 
