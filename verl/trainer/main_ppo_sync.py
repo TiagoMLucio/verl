@@ -1810,7 +1810,7 @@ class PPOTrainer:
             steps = sorted(traj_steps.get(traj) or [0])
             lo, hi = steps[0], steps[-1]
             span_len = max(hi - lo, 1)
-            hinted_steps = sorted(int(step) for step, _, _, _ in hinted)
+            hinted_steps = sorted(int(step) for step, *_ in hinted)
             rel.extend((step - lo) / span_len for step in hinted_steps)
             gaps.extend(b - a for a, b in zip(hinted_steps, hinted_steps[1:]))
             last_two += sum(1 for step in hinted_steps if step >= hi - 1)
