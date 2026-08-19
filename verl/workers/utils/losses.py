@@ -233,6 +233,36 @@ def _sdpo_teacher_extractor(
     return {"topk_logps": (topk_logits - logsumexp).unsqueeze(0)}
 
 
+def apply_onehot_call_targets(
+    teacher_log_probs: torch.Tensor,
+    responses: torch.Tensor,
+    call_target_ids: torch.Tensor,
+    teacher_topk_logps: Optional[torch.Tensor] = None,
+    student_topk_indices: Optional[torch.Tensor] = None,
+    floor: float = -30.0,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Replace the teacher's distribution with a one-hot on the corrected token wherever a
+    forcing target exists (call_target_ids >= 0), making the distillation there exact CE
+    toward the correction. teacher_log_probs (teacher's logp of the student's token) becomes
+    0 where the student already emitted the target and ``floor`` where it did not; in the
+    top-k domain the slot matching the target gets 0 and the rest ``floor``. Positions whose
+    target is absent from the student's top-k keep the real teacher values (rare: the
+    corrected token is top-5 in >=92% of measured failures)."""
+    has_target = call_target_ids >= 0
+    if not bool(has_target.any()):
+        return teacher_log_probs, teacher_topk_logps
+    tgt = call_target_ids.clamp(min=0)
+    onehot_lp = torch.where(responses == tgt, 0.0, float(floor))
+    teacher_log_probs = torch.where(has_target, onehot_lp.to(teacher_log_probs.dtype), teacher_log_probs)
+    if teacher_topk_logps is not None and student_topk_indices is not None:
+        is_tgt_slot = student_topk_indices == tgt.unsqueeze(-1)
+        in_topk = is_tgt_slot.any(dim=-1)
+        use = (has_target & in_topk).unsqueeze(-1)
+        onehot_topk = torch.where(is_tgt_slot, 0.0, float(floor)).to(teacher_topk_logps.dtype)
+        teacher_topk_logps = torch.where(use, onehot_topk, teacher_topk_logps)
+    return teacher_log_probs, teacher_topk_logps
+
+
 def sdpo_ppo_loss(
     config: ActorConfig,
     sdpo_config,
@@ -308,6 +338,22 @@ def sdpo_ppo_loss(
 
     if teacher_log_probs is None:
         raise ValueError("SDPO: teacher_log_probs missing and no teacher_logprob_fn produced it.")
+
+    if getattr(sdpo_config, "call_target", "teacher") == "onehot":
+        call_target_ids = tu.get(data, "call_target_ids", default=None)
+        if call_target_ids is not None:
+            if call_target_ids.is_nested:
+                call_target_ids = call_target_ids.to_padded_tensor(-1)
+            responses_padded = data["responses"]
+            if responses_padded.is_nested:
+                responses_padded = responses_padded.to_padded_tensor(0)
+            teacher_log_probs, teacher_topk_logps = apply_onehot_call_targets(
+                teacher_log_probs=teacher_log_probs,
+                responses=responses_padded,
+                call_target_ids=call_target_ids,
+                teacher_topk_logps=teacher_topk_logps,
+                student_topk_indices=student_topk_indices,
+            )
     if full_logit_distillation and distill_topk is not None and teacher_topk_logps is None:
         raise ValueError("SDPO: teacher_topk_log_probs missing for full-logit top-k distillation.")
     if full_logit_distillation and distill_topk is None and teacher_all_logps is None:

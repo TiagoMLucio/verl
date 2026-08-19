@@ -1509,6 +1509,7 @@ class PPOTrainer:
                 self.tokenizer.encode("<tool_call>", add_special_tokens=False), dtype=torch.int64
             )
             teacher_seqs, seq_meta, mask_rows = [], [], []
+            target_rows = [] if self_distillation_cfg.call_target == "onehot" else None
             hint_fallbacks = 0
             from verl.utils.debug_breakpoints import should_break
             for i in range(batch_size):
@@ -1541,9 +1542,13 @@ class PPOTrainer:
                     # narrow target-bearing at-call spans to the tokens the corrected call
                     # changes; the loss denominator follows the mask, so this is where the
                     # copy-token dilution is actually removed
+                    encode = lambda t: self.tokenizer.encode(t, add_special_tokens=False)
+                    if target_rows is not None:
+                        target_rows.append(sdpo_teacher.call_target_rows(
+                            spans, call_placed, hinted_per_row[i], response_ids, encode,
+                            response_ids.shape[0]))
                     spans = sdpo_teacher.narrowed_call_spans(
-                        spans, call_placed, hinted_per_row[i], response_ids,
-                        lambda t: self.tokenizer.encode(t, add_special_tokens=False),
+                        spans, call_placed, hinted_per_row[i], response_ids, encode,
                         self_distillation_cfg.call_mask)
                     mask_row = sdpo_teacher.turn_token_mask(response_ids.shape[0], spans)
                 else:
@@ -1552,6 +1557,8 @@ class PPOTrainer:
                     seq = torch.cat([prompt_list[i][-1:], response_ids[:1]])
                     meta = [1, 2, 1, 0, 0, 1]  # one sub-row over the 2-token stub
                     mask_row = torch.zeros(response_ids.shape[0], dtype=torch.float32)
+                    if target_rows is not None:
+                        target_rows.append(torch.full((response_ids.shape[0],), -1, dtype=torch.int64))
                 teacher_seqs.append(seq)
                 seq_meta.append(torch.tensor(meta, dtype=torch.int64))
                 mask_rows.append(mask_row)
@@ -1560,6 +1567,8 @@ class PPOTrainer:
                 "teacher_seq_meta": torch.nested.nested_tensor(seq_meta, layout=torch.jagged),
                 "self_distillation_mask": torch.nested.nested_tensor(mask_rows, layout=torch.jagged),
             }
+            if target_rows is not None:
+                teacher_fields["call_target_ids"] = torch.nested.nested_tensor(target_rows, layout=torch.jagged)
         else:
             teacher_input_ids = torch.nested.nested_tensor(
                 [torch.cat([stripped_prompts[i], response_list[i]]) for i in range(batch_size)],

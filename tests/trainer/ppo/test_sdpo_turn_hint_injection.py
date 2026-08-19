@@ -235,3 +235,56 @@ def test_narrowing_keeps_span_when_diff_is_empty():
 def test_span_mode_is_passthrough():
     hinted = [(0, 0, 3, "h", "call", "T")]
     assert narrowed_call_spans([(0, 3)], [True], hinted, torch.tensor([9, 9, 9]), lambda t: [1], "span") == [(0, 3)]
+
+
+# --- one-hot forcing targets --------------------------------------------------------------
+
+from verl.trainer.ppo.sdpo_teacher import call_target_rows
+from verl.workers.utils.losses import apply_onehot_call_targets
+
+
+def test_call_target_rows_map_replace_and_insert_positions():
+    resp = torch.tensor([1, 2, 3, 4, 5, 9, 7, 8], dtype=torch.int64)
+    hinted = [(1, 4, 8, "h", "call", "T")]
+    rows = call_target_rows([(4, 8)], [True], hinted, resp, lambda t: [5, 6, 7, 8], 8)
+    assert rows.tolist() == [-1, -1, -1, -1, -1, 6, -1, -1]
+    rows = call_target_rows([(0, 3)], [True], [(0, 0, 3, "h", "call", "T")],
+                            torch.tensor([1, 2, 4], dtype=torch.int64), lambda t: [1, 2, 3, 4], 3)
+    assert rows.tolist() == [-1, -1, 3], "insert boundary maps to the first missing token"
+
+
+def test_call_target_rows_skip_fallback_and_turn_hints():
+    resp = torch.tensor([1, 2, 3], dtype=torch.int64)
+    rows = call_target_rows([(0, 3)], [False], [(0, 0, 3, "h", "call", "T")], resp, lambda t: [9], 3)
+    assert rows.tolist() == [-1, -1, -1]
+    rows = call_target_rows([(0, 3)], [True], [(0, 0, 3, "h", "turn", None)], resp, lambda t: [9], 3)
+    assert rows.tolist() == [-1, -1, -1]
+
+
+def test_onehot_override_hits_only_target_positions():
+    resp = torch.tensor([[5, 9, 7]])
+    tgt = torch.tensor([[-1, 6, 7]])
+    tlp = torch.zeros(1, 3) - 1.0
+    topk_lp = torch.zeros(1, 3, 2) - 2.0
+    topk_idx = torch.tensor([[[5, 1], [6, 9], [7, 2]]])
+    out_lp, out_topk = apply_onehot_call_targets(tlp, resp, tgt, topk_lp, topk_idx)
+    assert out_lp[0].tolist() == [-1.0, -30.0, 0.0]
+    assert out_topk[0, 1].tolist() == [0.0, -30.0]
+    assert out_topk[0, 0].tolist() == [-2.0, -2.0]
+
+
+def test_onehot_override_keeps_teacher_when_target_not_in_topk():
+    resp = torch.tensor([[9]])
+    tgt = torch.tensor([[6]])
+    tlp = torch.zeros(1, 1) - 1.0
+    topk_lp = torch.zeros(1, 1, 2) - 2.0
+    topk_idx = torch.tensor([[[9, 3]]])  # 6 absent from student's top-k
+    out_lp, out_topk = apply_onehot_call_targets(tlp, resp, tgt, topk_lp, topk_idx)
+    assert out_lp[0].tolist() == [-30.0], "per-token logp still one-hot (student token != target)"
+    assert out_topk[0, 0].tolist() == [-2.0, -2.0], "topk falls back to the real teacher"
+
+
+def test_onehot_override_noop_without_targets():
+    tlp = torch.zeros(1, 2) - 1.0
+    out_lp, out_topk = apply_onehot_call_targets(tlp, torch.tensor([[1, 2]]), torch.tensor([[-1, -1]]), None, None)
+    assert torch.equal(out_lp, tlp) and out_topk is None

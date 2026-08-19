@@ -309,6 +309,35 @@ def narrowed_call_spans(spans, call_placed, hinted_turns, student_ids, encode_fn
     return out
 
 
+def call_target_rows(
+    spans, call_placed, hinted_turns, student_ids, encode_fn, response_len: int
+):
+    """Per-position corrected-token ids for placed, target-bearing call hints, aligned by
+    the same token diff as the mask narrowing: position i of a replace block maps to the
+    corrected block's token at the same offset; an insert's boundary position maps to the
+    first inserted token; everywhere else -1 (no forcing target)."""
+    import difflib
+
+    out = torch.full((response_len,), -1, dtype=torch.int64)
+    for span, placed, (*_, at, target) in zip(spans, call_placed, hinted_turns, strict=True):
+        s, e = span
+        if not (placed and at == "call" and target and e > s):
+            continue
+        t_ids = encode_fn(target)
+        sm = difflib.SequenceMatcher(None, student_ids[s:e].tolist(), list(t_ids), autojunk=False)
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal":
+                continue
+            if i2 == i1:  # insert: the boundary position should have produced t_ids[j1]
+                if i1 < e - s:
+                    out[s + i1] = int(t_ids[j1])
+                continue
+            for k in range(i2 - i1):
+                if j1 + k < j2:
+                    out[s + i1 + k] = int(t_ids[j1 + k])
+    return out
+
+
 def turn_token_mask(response_len: int, spans: list[tuple[int, int]]) -> torch.Tensor:
     """Per-token distillation mask: 1 on the scored spans, 0 elsewhere."""
     mask = torch.zeros(response_len, dtype=torch.float32)

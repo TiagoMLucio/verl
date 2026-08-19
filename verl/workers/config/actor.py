@@ -122,6 +122,11 @@ class SelfDistillationConfig(BaseConfig):
     # changed block (all). Narrow masks remove the copy-token dilution: the loss denominator
     # follows the mask, so decisive tokens train at full strength.
     call_mask: str = "span"
+    # what the teacher distribution IS at forcing positions: the real (hinted) teacher, or a
+    # one-hot on the corrected token (exact CE toward the correction; with call_mask=first the
+    # masked window sits where student and corrected contexts are identical, so this is true
+    # forcing there)
+    call_target: str = "teacher"
     max_hinted_turns: Optional[int] = None
 
     def __post_init__(self):
@@ -152,6 +157,10 @@ class SelfDistillationConfig(BaseConfig):
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
         if self.use_turn_feedback:
+            if self.call_target not in ("teacher", "onehot"):
+                raise ValueError(
+                    f"self_distillation.call_target must be teacher|onehot, got {self.call_target!r}"
+                )
             if self.call_mask not in ("span", "first", "all"):
                 raise ValueError(
                     f"self_distillation.call_mask must be span|first|all, got {self.call_mask!r}"
