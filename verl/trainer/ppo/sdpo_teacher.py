@@ -274,21 +274,31 @@ def divergence_spans(student_ids, target_ids, mode: str) -> list[tuple[int, int]
     Token-level diff via matching blocks, so independent errors at different offsets are
     found even when lengths shift. ``replace``/``delete`` blocks mask the student's wrong
     tokens; an ``insert`` (student missing tokens) masks the single boundary position that
-    should have produced them. ``first`` keeps the first differing block, ``all`` keeps
-    every one. Identical sequences yield no spans.
+    should have produced them. ``first`` keeps the first differing block and ``all`` every
+    one; only a block's first position sees a prefix the corrected call agrees with, so
+    ``first_token``/``all_tokens`` keep just that position per block. Identical sequences
+    yield no spans.
+
+    The student span closes the assistant turn (``<|im_end|>``) while the corrected call
+    does not, so a trailing block past the target's end is the turn closer, not a
+    divergence, and is never supervised.
     """
     import difflib
 
     sm = difflib.SequenceMatcher(None, list(student_ids), list(target_ids), autojunk=False)
     spans: list[tuple[int, int]] = []
-    n = len(student_ids)
-    for tag, i1, i2, _j1, _j2 in sm.get_opcodes():
+    n, m = len(student_ids), len(target_ids)
+    for tag, i1, i2, j1, _j2 in sm.get_opcodes():
         if tag == "equal":
             continue
+        if i2 == n and j1 == m:
+            continue
         span = (i1, i2) if i2 > i1 else (i1, min(i1 + 1, n))
+        if mode in ("first_token", "all_tokens"):
+            span = (span[0], min(span[0] + 1, n))
         if span[0] < span[1]:
             spans.append(span)
-        if mode == "first":
+        if mode in ("first", "first_token"):
             break
     return spans
 
@@ -390,9 +400,11 @@ def forced_target_spans(orig_ids: list[int], target_ids: list[int], mode: str) -
         if tag == "equal":
             continue
         span = (j1, j2) if j2 > j1 else (j1, min(j1 + 1, n))
+        if mode in ("first_token", "all_tokens"):
+            span = (span[0], min(span[0] + 1, n))
         if span[0] < span[1]:
             spans.append(span)
-        if mode == "first":
+        if mode in ("first", "first_token"):
             break
     return spans
 

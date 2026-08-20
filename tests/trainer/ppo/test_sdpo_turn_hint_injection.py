@@ -460,3 +460,34 @@ def test_forced_rollout_lp_restore_is_inert_without_a_marker():
     rollout = torch.tensor([-0.1, -0.3, -0.2])
     out = restore_forced_rollout_lp(rollout, torch.tensor([-1.0, -2.0, -3.0]))
     assert out is rollout
+
+
+from verl.trainer.ppo.sdpo_teacher import divergence_spans as _dspans
+
+
+def test_divergence_never_supervises_the_turn_closer():
+    """The student span ends on <|im_end|> tokens the corrected call cannot contain: the
+    trailing delete past the target's end is the closer, not a divergence."""
+    stu = [10, 20, 30, 96, 99]  # ... </tool_call> <|im_end|>
+    tgt = [10, 21, 30, 96]
+    assert _dspans(stu, tgt, "all") == [(1, 2)]
+    assert _dspans(stu, tgt, "first") == [(1, 2)]
+    # a genuine trailing replace is NOT the closer and stays supervised
+    assert _dspans([10, 20, 31], [10, 20, 32], "all") == [(2, 3)]
+
+
+def test_divergence_token_modes_keep_one_position_per_block():
+    stu = [1, 2, 3, 4, 5, 6, 7, 99]
+    tgt = [1, 8, 9, 4, 5, 60, 7]  # two changed blocks + trailing closer delete
+    assert _dspans(stu, tgt, "all") == [(1, 3), (5, 6)]
+    assert _dspans(stu, tgt, "all_tokens") == [(1, 2), (5, 6)]
+    assert _dspans(stu, tgt, "first_token") == [(1, 2)]
+    assert _dspans(stu, tgt, "first") == [(1, 3)]
+
+
+def test_forced_target_spans_token_modes():
+    orig = [95, 30, 31, 32, 96]
+    tgt = [95, 40, 41, 32, 96]
+    assert forced_target_spans(orig, tgt, "all") == [(1, 3)]
+    assert forced_target_spans(orig, tgt, "all_tokens") == [(1, 2)]
+    assert forced_target_spans(orig, tgt, "first_token") == [(1, 2)]

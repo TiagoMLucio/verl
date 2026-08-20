@@ -118,9 +118,11 @@ class SelfDistillationConfig(BaseConfig):
         "no reply, no acknowledgement, no further reasoning, as if this note were never sent.]\n"
     )
     # how much of an at-call hinted span the distillation mask covers: the whole call
-    # (span), only the first token block the corrected call changes (first), or every
-    # changed block (all). Narrow masks remove the copy-token dilution: the loss denominator
-    # follows the mask, so decisive tokens train at full strength.
+    # (span), the first token block the corrected call changes (first), every changed block
+    # (all), or only each block's first position (first_token, all_tokens) - the one place
+    # whose prefix the corrected call still agrees with. Narrow masks remove the copy-token
+    # dilution: the loss denominator follows the mask, so decisive tokens train at full
+    # strength.
     call_mask: str = "span"
     # what the teacher distribution IS at forcing positions: the real (hinted) teacher, a
     # one-hot on the corrected token (exact CE toward the correction; with call_mask=first the
@@ -170,9 +172,10 @@ class SelfDistillationConfig(BaseConfig):
                 raise ValueError(
                     f"self_distillation.call_target must be teacher|onehot|forced, got {self.call_target!r}"
                 )
-            if self.call_mask not in ("span", "first", "all"):
+            if self.call_mask not in ("span", "first", "first_token", "all", "all_tokens"):
                 raise ValueError(
-                    f"self_distillation.call_mask must be span|first|all, got {self.call_mask!r}"
+                    "self_distillation.call_mask must be span|first|first_token|all|all_tokens, "
+                    f"got {self.call_mask!r}"
                 )
             if self.call_loss_weight < 0:
                 raise ValueError(
