@@ -1606,7 +1606,8 @@ class PPOTrainer:
                     else:
                         spans = sdpo_teacher.narrowed_call_spans(
                             spans, call_placed, hinted_per_row[i], response_ids, encode,
-                            self_distillation_cfg.call_mask)
+                            self_distillation_cfg.call_mask,
+                            decode_fn=self.tokenizer.decode)
                     mask_row = sdpo_teacher.turn_token_mask(response_ids.shape[0], spans)
                 else:
                     # hints-only: degenerate 1-token teacher row (padding-template pattern), zero mask.

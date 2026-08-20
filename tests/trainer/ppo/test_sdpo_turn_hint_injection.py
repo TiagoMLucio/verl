@@ -491,3 +491,25 @@ def test_forced_target_spans_token_modes():
     assert forced_target_spans(orig, tgt, "all") == [(1, 3)]
     assert forced_target_spans(orig, tgt, "all_tokens") == [(1, 2)]
     assert forced_target_spans(orig, tgt, "first_token") == [(1, 2)]
+
+
+from verl.trainer.ppo.sdpo_teacher import char_divergence_spans
+
+
+def test_char_divergence_is_immune_to_bpe_boundary_drag():
+    """The escape case from the lab: the divergent characters sit inside a merged
+    punctuation token; the mask must cover that token, never its equal neighbours."""
+    tab = {1: "x = ", 7: "()`.\\", 4: "\\n", 9: "bar", 6: "<|im_end|>"}
+    dec = lambda ids: "".join(tab[i] for i in ids)  # noqa: E731
+    stu = [1, 7, 4, 9, 6]
+    tgt = "x = ()`.\nbar"
+    assert char_divergence_spans(stu, tgt, dec, "first_token") == [(1, 2)]
+    assert char_divergence_spans(stu, tgt, dec, "first") == [(1, 3)]
+    assert char_divergence_spans(stu, tgt, dec, "all_tokens") == [(1, 2)]
+
+
+def test_char_divergence_skips_the_turn_closer_and_identical_text():
+    tab = {5: "foo", 9: "bar", 6: "<|im_end|>"}
+    dec = lambda ids: "".join(tab[i] for i in ids)  # noqa: E731
+    assert char_divergence_spans([5, 6], "foo", dec, "all") == []
+    assert char_divergence_spans([5, 9], "foobar", dec, "all") == []

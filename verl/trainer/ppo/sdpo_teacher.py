@@ -303,17 +303,80 @@ def divergence_spans(student_ids, target_ids, mode: str) -> list[tuple[int, int]
     return spans
 
 
-def narrowed_call_spans(spans, call_placed, hinted_turns, student_ids, encode_fn, mode: str):
+def token_char_offsets(ids, decode_fn):
+    """Per-token [start, end) character offsets, or None when per-token decoding does not
+    concatenate to the full decode (byte-fallback tokens); callers then keep the id diff."""
+    pieces = [decode_fn([int(i)]) for i in ids]
+    if "".join(pieces) != decode_fn([int(i) for i in ids]):
+        return None
+    offsets, pos = [], 0
+    for piece in pieces:
+        offsets.append((pos, pos + len(piece)))
+        pos += len(piece)
+    return offsets
+
+
+def char_divergence_spans(student_ids, target_text, decode_fn, mode: str):
+    """Divergence-mask spans placed by a CHARACTER diff projected onto the token grid.
+
+    A token-id diff drags equal characters into a block whenever the divergence sits
+    inside a BPE-merged token: the id block then opens at the merged token's first
+    character and first_token can land on a token whose own characters match the
+    correction. The character diff cannot be fooled: a token is masked iff its characters
+    overlap a real divergence. ``first``/``all`` take every overlapping token of the
+    first/each char span; ``first_token``/``all_tokens`` only the first. The trailing
+    turn-closer (student text past the target's end) is never a divergence. Returns None
+    when offsets are unavailable; callers fall back to the id diff.
+    """
+    import difflib
+
+    ids = [int(i) for i in student_ids]
+    offsets = token_char_offsets(ids, decode_fn)
+    if offsets is None:
+        return None
+    text = "".join(decode_fn([i]) for i in ids)
+    sm = difflib.SequenceMatcher(None, text, target_text, autojunk=False)
+    n, m = len(text), len(target_text)
+    spans: list[tuple[int, int]] = []
+    for tag, i1, i2, j1, _j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        if i2 == n and j1 == m:
+            continue
+        a, b = (i1, i2) if i2 > i1 else (i1, min(i1 + 1, n))
+        if a >= b:
+            continue
+        toks = [k for k, (cs, ce) in enumerate(offsets) if cs < b and ce > a]
+        if not toks:
+            continue
+        span = (toks[0], toks[0] + 1) if mode in ("first_token", "all_tokens") else (toks[0], toks[-1] + 1)
+        if not spans or span[0] >= spans[-1][1]:
+            spans.append(span)
+        elif span[1] > spans[-1][1]:
+            spans[-1] = (spans[-1][0], span[1])
+        if mode in ("first", "first_token"):
+            break
+    return spans
+
+
+def narrowed_call_spans(spans, call_placed, hinted_turns, student_ids, encode_fn, mode: str,
+                        decode_fn=None):
     """Mask spans with target-bearing, actually-placed call hints narrowed to the tokens
-    the corrected call changes; everything else passes through. A diff that comes back
-    empty keeps the full span rather than dropping the hint."""
+    the corrected call changes; everything else passes through. With ``decode_fn`` the
+    narrowing is a character diff projected onto tokens (immune to BPE-boundary drag);
+    without it, or when offsets are unavailable, the token-id diff. A diff that comes
+    back empty keeps the full span rather than dropping the hint."""
     if mode == "span":
         return spans
     out = []
     for span, placed, (*_, at, target) in zip(spans, call_placed, hinted_turns, strict=True):
         s, e = span
         if placed and at == "call" and target and e > s:
-            subs = divergence_spans(student_ids[s:e].tolist(), encode_fn(target), mode)
+            subs = None
+            if decode_fn is not None:
+                subs = char_divergence_spans(student_ids[s:e], target, decode_fn, mode)
+            if subs is None:
+                subs = divergence_spans(student_ids[s:e].tolist(), encode_fn(target), mode)
             out += [(s + a, s + b) for a, b in subs] or [span]
         else:
             out.append(span)
