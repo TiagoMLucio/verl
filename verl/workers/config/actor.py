@@ -131,6 +131,12 @@ class SelfDistillationConfig(BaseConfig):
     # corrected tokens are supervised)
     call_target: str = "teacher"
     max_hinted_turns: Optional[int] = None
+    #: lambda in `L = L_turn + lambda * L_call`: weight of rows supervised by a mid-turn call
+    #: hint relative to rows supervised by turn-level hints. Call rows carry ~10x the
+    #: per-token divergence, so at lambda=1 they contribute ~85-90% of the update while being
+    #: a small minority of rows; a trajectory carries one kind of hint or the other, so this
+    #: is a row weight (a within-row scale would cancel in the token-mean).
+    call_loss_weight: float = 1.0
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
@@ -167,6 +173,10 @@ class SelfDistillationConfig(BaseConfig):
             if self.call_mask not in ("span", "first", "all"):
                 raise ValueError(
                     f"self_distillation.call_mask must be span|first|all, got {self.call_mask!r}"
+                )
+            if self.call_loss_weight < 0:
+                raise ValueError(
+                    f"self_distillation.call_loss_weight must be >= 0, got {self.call_loss_weight}"
                 )
             for name in ("turn_feedback_template", "call_feedback_template"):
                 template = getattr(self, name)

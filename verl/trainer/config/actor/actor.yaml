@@ -356,6 +356,10 @@ self_distillation:
   # Cap on hinted turns per sample (keeps the first ones; null = all)
   max_hinted_turns: null
 
+  # lambda in `L = L_turn + lambda * L_call`: weight of call-hinted rows relative to
+  # turn-hinted (pipeline) ones. 1.0 = today, where call rows carry ~85-90% of the update
+  call_loss_weight: 1.0
+
 # Router replay configuration for MoE models
 router_replay:
 

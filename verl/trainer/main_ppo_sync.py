@@ -1689,22 +1689,17 @@ class PPOTrainer:
         supervised_per_row = [float(mask.sum()) for mask in loss_mask_rows]
         traj_of_row = [tuple(key.rsplit("_", 2)[:2]) for key in batch.keys]
         n_traces = len(set(traj_of_row))
-        traj_supervised: dict[tuple, float] = defaultdict(float)
-        for traj, n_supervised in zip(traj_of_row, supervised_per_row, strict=True):
-            traj_supervised[traj] += n_supervised
-        shares = [
-            n_supervised / traj_supervised[traj] if traj_supervised[traj] > 0 else 0.0
-            for traj, n_supervised in zip(traj_of_row, supervised_per_row, strict=True)
-        ]
-        # Renormalize to the supervised-row count: the shares sum to the number of supervised
+        # call-hinted rows carry ~10x the per-token divergence of turn-hinted ones, so they
+        # dominate the update at equal row weight; call_loss_weight rebalances the two channels
+        call_row = [any(hint[4] == "call" for hint in hinted_per_row[i]) for i in range(batch_size)]
+        # Renormalized to the supervised-row count: raw shares sum to the number of supervised
         # trajectories, which would otherwise shrink the update by the average segments-per-
         # trajectory (~0.6x at our condensation rate) and confound comparisons across runs.
-        n_supervised_rows = sum(1 for n in supervised_per_row if n > 0)
-        total_share = sum(shares)
-        scale = (n_supervised_rows / total_share) if total_share > 0 else 1.0
-        teacher_fields["trace_weight"] = torch.tensor(
-            [share * scale for share in shares], dtype=torch.float32
-        ).unsqueeze(-1)
+        weights = sdpo_teacher.trace_weights(
+            supervised_per_row, traj_of_row, call_row,
+            self_distillation_cfg.call_loss_weight if turn_mode else 1.0,
+        )
+        teacher_fields["trace_weight"] = torch.tensor(weights, dtype=torch.float32).unsqueeze(-1)
         # Row -> trajectory, as a plain int the update path can carry: mini-batches are cut
         # from shuffled rows, so a condensed trajectory's supervised segments land in
         # different optimizer steps even though their weights are a single trajectory's share.
@@ -1783,6 +1778,18 @@ class PPOTrainer:
                         sum(len(hinted) for hinted in hinted_per_row) / len(hinted_traces) if hinted_traces else 0.0
                     ),
                     "self_distillation/hint_injection_fallbacks": hint_fallbacks,
+                    # the two supervision channels, as the loss actually weighs them
+                    "self_distillation/call_row_fraction": (
+                        sum(1 for i, c in enumerate(call_row) if c and supervised_per_row[i] > 0)
+                        / max(sum(1 for n in supervised_per_row if n > 0), 1)
+                    ),
+                    "self_distillation/call_row_weight_share": (
+                        sum(w for w, c in zip(weights, call_row, strict=True) if c)
+                        / max(sum(weights), 1e-8)
+                    ),
+                    "self_distillation/call_loss_weight": float(
+                        self_distillation_cfg.call_loss_weight
+                    ),
                 }
             )
             metrics.update(self._hint_position_metrics(hinted_per_row, extra_fields_list, traj_of_row))
