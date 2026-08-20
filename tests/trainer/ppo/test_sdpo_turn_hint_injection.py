@@ -437,3 +437,26 @@ def test_call_loss_weight_is_inert_when_every_row_is_one_channel():
     for lam in (0.1, 1.0, 5.0):
         assert trace_weights(sup, rows, [True, True], lam) == pytest.approx([1.0, 1.0])
         assert trace_weights(sup, rows, [False, False], lam) == pytest.approx([1.0, 1.0])
+
+
+from verl.trainer.ppo.sdpo_teacher import FORCED_LP_MARKER, restore_forced_rollout_lp
+
+
+def test_forced_rollout_lp_marker_restores_ratio_one():
+    """The forced tokens were never sampled: their IS weight must be exp(0), not the policy's
+    own probability of the call the correction is trying to teach."""
+    old = torch.tensor([-0.1, -8.0, -7.0, -0.2])
+    rollout = splice_row(torch.tensor([-0.1, -0.3, -0.2]), 1, 1,
+                         torch.full((2,), FORCED_LP_MARKER))
+    fixed = restore_forced_rollout_lp(rollout, old)
+    assert fixed.tolist() == pytest.approx([-0.1, -8.0, -7.0, -0.2])
+    assert torch.exp(old - fixed).tolist() == pytest.approx([1.0] * 4)
+    # what the zero fill did instead: the weight IS the policy's probability of the token
+    zeroed = splice_row(torch.tensor([-0.1, -0.3, -0.2]), 1, 1, torch.zeros(2))
+    assert torch.exp(old - zeroed)[1].item() < 1e-3
+
+
+def test_forced_rollout_lp_restore_is_inert_without_a_marker():
+    rollout = torch.tensor([-0.1, -0.3, -0.2])
+    out = restore_forced_rollout_lp(rollout, torch.tensor([-1.0, -2.0, -3.0]))
+    assert out is rollout

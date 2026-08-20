@@ -1550,9 +1550,11 @@ class PPOTrainer:
                         response_mask_list[i], swap["at"], swap["removed"],
                         torch.ones(swap["inserted"]))
                     if rollout_lp_list is not None:
+                        # marked, not zeroed: a zero reads as log p = 0, and the rollout-correction
+                        # weight exp(old_lp - rollout_lp) would then mute the forced tokens
                         rollout_lp_list[i] = sdpo_teacher.splice_row(
                             rollout_lp_list[i], swap["at"], swap["removed"],
-                            torch.zeros(swap["inserted"]))
+                            torch.full((swap["inserted"],), sdpo_teacher.FORCED_LP_MARKER))
                     forced_rows[i] = swap
 
             teacher_seqs, seq_meta, mask_rows = [], [], []
@@ -2018,6 +2020,10 @@ class PPOTrainer:
         )
 
         data = DataProto(batch=data.to_padded_tensor())
+        if "rollout_log_probs" in data.batch:
+            data.batch["rollout_log_probs"] = sdpo_teacher.restore_forced_rollout_lp(
+                data.batch["rollout_log_probs"], data.batch["old_log_probs"]
+            )
 
         # 3. calculate actor entroy metrics
         actor_config = self.config.actor_rollout_ref.actor
@@ -2092,6 +2098,10 @@ class PPOTrainer:
         data = DataProto(batch=data.to_padded_tensor())
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
+        if "rollout_log_probs" in data.batch:
+            data.batch["rollout_log_probs"] = sdpo_teacher.restore_forced_rollout_lp(
+                data.batch["rollout_log_probs"], data.batch["old_log_probs"]
+            )
 
         # 1. apply kl penalty to rewards
         if self.config.algorithm.use_kl_in_reward:

@@ -36,6 +36,7 @@ __all__ = [
     "extract_prompt_text",
     "feedback_used",
     "remove_thinking_trace",
+    "restore_forced_rollout_lp",
     "select_hinted_turns",
     "select_solution",
     "turn_token_mask",
@@ -462,6 +463,25 @@ def forced_call_swap(
 def splice_row(row: torch.Tensor, at: int, removed: int, fill: torch.Tensor) -> torch.Tensor:
     """Per-position sibling of a forced swap: cut ``removed`` positions at ``at``, insert ``fill``."""
     return torch.cat([row[:at], fill.to(row.dtype), row[at + removed:]])
+
+
+#: rollout log-prob written at positions the forced swap inserted; a sampled log-prob is never
+#: positive, so the marker cannot be mistaken for one
+FORCED_LP_MARKER = 1.0
+
+
+def restore_forced_rollout_lp(rollout_log_probs: torch.Tensor, old_log_probs: torch.Tensor) -> torch.Tensor:
+    """Rollout-correction ratio 1 at the positions the forced swap inserted.
+
+    Those tokens were never sampled, so no rollout policy scored them. Any stand-in makes
+    ``exp(old_lp - rollout_lp)`` scale the loss by the policy's own probability of the corrected
+    call, which is the term the correction exists to raise: the arm would suppress exactly the
+    tokens it is teaching. Matching the two log-probs leaves the weight at 1.
+    """
+    marked = rollout_log_probs > 0
+    if not bool(marked.any()):
+        return rollout_log_probs
+    return torch.where(marked, old_log_probs.to(rollout_log_probs.dtype), rollout_log_probs)
 
 
 def turn_token_mask(response_len: int, spans: list[tuple[int, int]]) -> torch.Tensor:
