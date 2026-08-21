@@ -448,9 +448,12 @@ def char_divergence_spans(student_ids, target_text, decode_fn, mode: str, encode
         # insertion ending in `)` otherwise lands on the `')` before it).
         decided = None
         if t_offsets is not None:
-            lo = equal_run_start if was_equal else i1
-            decided = _decision_token(offsets, text, t_offsets, target_text, i1, j1,
-                                      max(lo, prev_end))
+            # the walk-back may cross opcode borders (a value boundary abuts the equal run
+            # inside the field) but not the whole equal stretch: a BPE merge induced by
+            # the divergence spans a few characters, while far-back boundary mismatches
+            # are sampling-noise segmentation of identical text
+            lo = max(equal_run_start if was_equal else i1, prev_end, i1 - 16)
+            decided = _decision_token(offsets, text, t_offsets, target_text, i1, j1, lo)
         if decided is None and tag in ("delete", "insert"):
             indel = text[i1:i2] if tag == "delete" else target_text[j1:j2]
             if indel and indel == indel[0] * len(indel):
