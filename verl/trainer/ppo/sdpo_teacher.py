@@ -425,11 +425,18 @@ def char_divergence_spans(student_ids, target_text, decode_fn, mode: str, encode
         t_offsets = token_char_offsets(encode_fn(target_text), decode_fn)
     spans: list[tuple[int, int]] = []
     prev_end = 0
-    last_equal_start = 0
+    equal_run_start = 0
+    prev_was_equal = True
     for tag, i1, i2, j1, j2 in segmented_char_opcodes(text, target_text):
         if tag in ("equal", "closer"):
-            last_equal_start = i1
+            # consecutive equal opcodes (a field boundary abuts an equal run inside the
+            # value) are ONE equal stretch: the decision walk may cross all of it, or a
+            # merged token straddling the boundary (quote+content) is unreachable
+            if not prev_was_equal:
+                equal_run_start = i1
+            prev_was_equal = True
             continue
+        was_equal, prev_was_equal = prev_was_equal, False
         # An indel's position is ambiguous up to rotation, and difflib parks it at
         # whichever end its anchor blocks happened to prefer. Canonicalize to the
         # DECISION POINT - the first position where the model's next character truly
@@ -441,8 +448,9 @@ def char_divergence_spans(student_ids, target_text, decode_fn, mode: str, encode
         # insertion ending in `)` otherwise lands on the `')` before it).
         decided = None
         if t_offsets is not None:
+            lo = equal_run_start if was_equal else i1
             decided = _decision_token(offsets, text, t_offsets, target_text, i1, j1,
-                                      max(last_equal_start, prev_end))
+                                      max(lo, prev_end))
         if decided is None and tag in ("delete", "insert"):
             indel = text[i1:i2] if tag == "delete" else target_text[j1:j2]
             if indel and indel == indel[0] * len(indel):

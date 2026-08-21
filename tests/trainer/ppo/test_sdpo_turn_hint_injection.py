@@ -588,3 +588,14 @@ def test_decision_token_follows_the_corrected_tokenization():
     enc2, dec2 = _toy_tokenizer(vocab2)
     got = char_divergence_spans([0, 1, 3, 4], 'd(\\"\\"\\"\nx', dec2, "first_token", encode_fn=enc2)
     assert got == [(1, 2)], got
+
+
+def test_decision_walk_crosses_the_field_boundary_for_quote_merges():
+    """When the corrected wire merges the opening quote with the first content char, the
+    walk-back must cross the value boundary (two adjacent equal opcodes are one stretch)
+    or the merged token is unreachable and the mask lands one token late."""
+    vocab = ['"old_str":', ' "', "def", ' x"', "}", "<|im_end|>", ' "@', "@"]
+    enc, dec = _toy_tokenizer(vocab)
+    got = char_divergence_spans([0, 1, 2, 3, 4, 5], '"old_str": "@def x"}', dec,
+                                "first_token", encode_fn=enc)
+    assert got == [(1, 2)], got
