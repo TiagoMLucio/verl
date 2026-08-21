@@ -535,3 +535,56 @@ def test_segmented_diff_cannot_jump_the_field_boundary():
 def test_segmented_diff_falls_back_without_call_structure():
     ops = segmented_char_opcodes("plain a text", "plain b text")
     assert [o[0] for o in ops] == ["equal", "replace", "equal"]
+
+
+def test_char_divergence_slides_indels_to_the_run_start():
+    """Inserting spaces into an indent run is position-ambiguous; difflib parks the indel
+    at the run's end (right before the `if`). The wrong generation decision is the run's
+    first token - the whitespace token - so the mask must slide left onto it."""
+    tab = {1: "x:\n", 2: "        ", 3: "if", 4: " y:\n", 5: "            ", 6: "<|im_end|>"}
+    dec = lambda ids: "".join(tab[i] for i in ids)  # noqa: E731
+    insert_case = char_divergence_spans([1, 2, 3, 4, 6], "x:\n            if y:\n", dec, "first_token")
+    assert insert_case == [(1, 2)], insert_case
+    delete_case = char_divergence_spans([1, 5, 3, 4, 6], "x:\n        if y:\n", dec, "first_token")
+    assert delete_case == [(1, 2)], delete_case
+
+
+def test_mixed_indels_rotate_to_the_true_decision_point():
+    """A comment insertion ending in `)` next to a `)` must not land on the closing
+    quote token; the shared characters rotate right and the boundary is the token the
+    model wrote instead of starting the comment."""
+    tab = {1: "msg.append(x'", 2: "')", 3: "\n\n", 4: "        if s:", 6: "<|im_end|>"}
+    dec = lambda ids: "".join(tab[i] for i in ids)  # noqa: E731
+    got = char_divergence_spans(
+        [1, 2, 3, 4, 6], "msg.append(x'') # Swapped a and b(message)\n\n        if s:", dec, "first_token")
+    assert got == [(2, 3)], got
+    tab2 = {1: "f(a", 2: ")extra", 3: ")x", 6: "<|im_end|>"}
+    dec2 = lambda ids: "".join(tab2[i] for i in ids)  # noqa: E731
+    assert char_divergence_spans([1, 2, 3, 6], "f(a)x", dec2, "first_token") == [(1, 2)]
+
+
+def _toy_tokenizer(vocab):
+    def enc(text):
+        out, i = [], 0
+        while i < len(text):
+            best = max((v for v in range(len(vocab)) if text.startswith(vocab[v], i)),
+                       key=lambda v: len(vocab[v]), default=None)
+            assert best is not None, repr(text[i: i + 10])
+            out.append(best)
+            i += len(vocab[best])
+        return out
+    return enc, (lambda ids: "".join(vocab[i] for i in ids))
+
+
+def test_decision_token_follows_the_corrected_tokenization():
+    """Tokenizer-aware placement: a docstring quote that MERGES with the previous
+    quote-pair token puts the mask on that token; when the previous token survives in
+    the corrected tokenization, the mask falls on the following token."""
+    vocab = ["file", '.\\"', '\\"\n', '\\"\\"', "\n", "x"]
+    enc, dec = _toy_tokenizer(vocab)
+    got = char_divergence_spans([0, 1, 2, 5], 'file.\\"\\"\\"\nx', dec, "first_token", encode_fn=enc)
+    assert got == [(2, 3)], got
+    vocab2 = ["d(", '\\"\\"', '\\"\\"\\"', "\n", "x"]
+    enc2, dec2 = _toy_tokenizer(vocab2)
+    got = char_divergence_spans([0, 1, 3, 4], 'd(\\"\\"\\"\nx', dec2, "first_token", encode_fn=enc2)
+    assert got == [(1, 2)], got

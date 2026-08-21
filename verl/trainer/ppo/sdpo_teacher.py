@@ -371,7 +371,38 @@ def segmented_char_opcodes(a: str, b: str):
     return ops
 
 
-def char_divergence_spans(student_ids, target_text, decode_fn, mode: str):
+def _decision_token(offsets, text, t_offsets, target_text, a, ja, lo):
+    """The student token index where generation truly diverged, or None.
+
+    Walk left from the divergent char to the nearest position that is a token boundary in
+    BOTH the student's sampled tokenization and the canonical tokenization of the corrected
+    text, then compare token texts forward: the first mismatch is the decision token. This
+    is tokenizer-aware placement: when the corrected tokenization merges the divergent
+    characters into the previous token (a docstring quote joining a quote-pair token),
+    the mismatch - and the mask - lands where the model should have emitted the bigger
+    merged token; when the previous token survives in the corrected tokenization, the
+    mask falls on the following token instead.
+    """
+    s_bound = {cs: k for k, (cs, _ce) in enumerate(offsets)}
+    t_bound = {cs: k for k, (cs, _ce) in enumerate(t_offsets)}
+    c = a
+    while c >= lo:
+        tc = ja - (a - c)
+        if c in s_bound and tc >= 0 and tc in t_bound:
+            si, ti = s_bound[c], t_bound[tc]
+            while si < len(offsets) and ti < len(t_offsets):
+                ss, se = offsets[si]
+                ts, te = t_offsets[ti]
+                if text[ss:se] != target_text[ts:te]:
+                    return si
+                si, ti = si + 1, ti + 1
+            return si if si < len(offsets) else len(offsets) - 1
+        c -= 1
+    return None
+
+
+def char_divergence_spans(student_ids, target_text, decode_fn, mode: str, encode_fn=None,
+                          target_offsets=None):
     """Divergence-mask spans placed by a CHARACTER diff projected onto the token grid.
 
     A token-id diff drags equal characters into a block whenever the divergence sits
@@ -389,16 +420,54 @@ def char_divergence_spans(student_ids, target_text, decode_fn, mode: str):
         return None
     text = "".join(decode_fn([i]) for i in ids)
     n, m = len(text), len(target_text)
+    t_offsets = target_offsets
+    if t_offsets is None and encode_fn is not None:
+        t_offsets = token_char_offsets(encode_fn(target_text), decode_fn)
     spans: list[tuple[int, int]] = []
-    for tag, i1, i2, j1, _j2 in segmented_char_opcodes(text, target_text):
+    prev_end = 0
+    last_equal_start = 0
+    for tag, i1, i2, j1, j2 in segmented_char_opcodes(text, target_text):
         if tag in ("equal", "closer"):
+            last_equal_start = i1
             continue
+        # An indel's position is ambiguous up to rotation, and difflib parks it at
+        # whichever end its anchor blocks happened to prefer. Canonicalize to the
+        # DECISION POINT - the first position where the model's next character truly
+        # differs from the corrected continuation. A homogeneous indel (an indentation
+        # or backslash run) slides LEFT to its run start: the too-short whitespace
+        # token after the newline is the wrong decision, not the `if` after it. A
+        # mixed indel slides RIGHT while its first character equals the corrected
+        # continuation: those shared characters were emitted correctly (a comment
+        # insertion ending in `)` otherwise lands on the `')` before it).
+        decided = None
+        if t_offsets is not None:
+            decided = _decision_token(offsets, text, t_offsets, target_text, i1, j1,
+                                      max(last_equal_start, prev_end))
+        if decided is None and tag in ("delete", "insert"):
+            indel = text[i1:i2] if tag == "delete" else target_text[j1:j2]
+            if indel and indel == indel[0] * len(indel):
+                width = i2 - i1
+                while i1 > prev_end and text[i1 - 1] == indel[0]:
+                    i1 -= 1
+                i2 = i1 + width
+            elif tag == "insert":
+                while i1 < n and j1 < j2 and target_text[j1] == text[i1]:
+                    i1 += 1
+                    j1 += 1
+                i2 = i1
+            else:
+                while i2 < n and text[i1] == text[i2]:
+                    i1 += 1
+                    i2 += 1
+        prev_end = max(prev_end, i2 if i2 > i1 else i1 + 1)
         if i2 == n and j1 == m:
             continue
         a, b = (i1, i2) if i2 > i1 else (i1, min(i1 + 1, n))
         if a >= b:
             continue
         toks = [k for k, (cs, ce) in enumerate(offsets) if cs < b and ce > a]
+        if decided is not None:
+            toks = sorted({decided, *[k for k in toks if k >= decided]})
         if not toks:
             continue
         span = (toks[0], toks[0] + 1) if mode in ("first_token", "all_tokens") else (toks[0], toks[-1] + 1)
@@ -426,7 +495,8 @@ def narrowed_call_spans(spans, call_placed, hinted_turns, student_ids, encode_fn
         if placed and at == "call" and target and e > s:
             subs = None
             if decode_fn is not None:
-                subs = char_divergence_spans(student_ids[s:e], target, decode_fn, mode)
+                subs = char_divergence_spans(student_ids[s:e], target, decode_fn, mode,
+                                             encode_fn=encode_fn)
             if subs is None:
                 subs = divergence_spans(student_ids[s:e].tolist(), encode_fn(target), mode)
             out += [(s + a, s + b) for a, b in subs] or [span]
