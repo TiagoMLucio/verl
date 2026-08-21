@@ -513,3 +513,25 @@ def test_char_divergence_skips_the_turn_closer_and_identical_text():
     dec = lambda ids: "".join(tab[i] for i in ids)  # noqa: E731
     assert char_divergence_spans([5, 6], "foo", dec, "all") == []
     assert char_divergence_spans([5, 9], "foobar", dec, "all") == []
+
+
+from verl.trainer.ppo.sdpo_teacher import segmented_char_opcodes
+
+
+def test_segmented_diff_cannot_jump_the_field_boundary():
+    """When new_str repeats old_str, an unanchored diff matches the student's old_str
+    against the target's new_str and produces giant cross-field blocks; the per-field
+    diff must yield only the real per-field edits."""
+    body = "import (\\\\n    A,\\\\n    B\\\\n)"
+    fixed = "import (\\n    A,\\n    B\\n)"
+    stu = '<tool_call>{"a": 1, "old_str": "' + body + '", "new_str": "' + body + ' # x"}</tool_call><|im_end|>'
+    tgt = '<tool_call>{"a": 1, "old_str": "' + fixed + '", "new_str": "' + fixed + ' # x"}</tool_call>'
+    ops = [o for o in segmented_char_opcodes(stu, tgt) if o[0] not in ("equal", "closer")]
+    assert len(ops) == 6 and all(o[0] == "delete" and o[2] - o[1] == 1 for o in ops), ops
+    closer = [o for o in segmented_char_opcodes(stu, tgt) if o[0] == "closer"]
+    assert len(closer) == 1 and stu[closer[0][1]:closer[0][2]] == "<|im_end|>"
+
+
+def test_segmented_diff_falls_back_without_call_structure():
+    ops = segmented_char_opcodes("plain a text", "plain b text")
+    assert [o[0] for o in ops] == ["equal", "replace", "equal"]

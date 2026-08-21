@@ -316,6 +316,61 @@ def token_char_offsets(ids, decode_fn):
     return offsets
 
 
+_WIRE_VALUES = re.compile(r'"(old_str|new_str)":\s*("(?:[^"\\]|\\.)*")')
+
+
+def _aligned_call_segments(a: str, b: str):
+    """Segment two renderings of the SAME call into alternating fixed/value chunks, or
+    None when they do not share structure. tool_fix builds the corrected call by swapping
+    field values inside the student's own text, so everything outside old_str/new_str is
+    char-equal (the student text may end with the turn closer the target lacks)."""
+    ma, mb = list(_WIRE_VALUES.finditer(a)), list(_WIRE_VALUES.finditer(b))
+    if not ma or len(ma) != len(mb) or [m.group(1) for m in ma] != [m.group(1) for m in mb]:
+        return None
+    segments, pa, pb = [], 0, 0
+    for x, y in zip(ma, mb, strict=True):
+        if a[pa: x.start(2)] != b[pb: y.start(2)]:
+            return None
+        segments.append((pa, x.start(2), pb, y.start(2), "fixed"))
+        segments.append((x.start(2), x.end(2), y.start(2), y.end(2), "value"))
+        pa, pb = x.end(2), y.end(2)
+    tail_a, tail_b = a[pa:], b[pb:]
+    if not tail_a.startswith(tail_b):
+        return None
+    segments.append((pa, pa + len(tail_b), pb, len(b), "fixed"))
+    if len(tail_a) > len(tail_b):
+        segments.append((pa + len(tail_b), len(a), len(b), len(b), "closer"))
+    return segments
+
+
+def segmented_char_opcodes(a: str, b: str):
+    """difflib opcodes in whole-text coordinates, diffed per call field when possible.
+
+    An unanchored minimal edit script goes wrong exactly when new_str repeats old_str:
+    matching the student's old_str against the target's new_str is "cheaper" than the real
+    correction, and the diff jumps the field boundary. Per-field diffing makes that jump
+    impossible; texts without the call structure fall back to the plain diff. The turn
+    closer the target cannot contain is emitted as its own ``closer`` opcode so span
+    builders can ignore it."""
+    import difflib
+
+    segments = _aligned_call_segments(a, b)
+    if segments is None:
+        return difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes()
+    ops = []
+    for a1, a2, b1, b2, kind in segments:
+        if kind == "closer":
+            ops.append(("closer", a1, a2, b1, b2))
+        elif kind == "fixed":
+            if a2 > a1:
+                ops.append(("equal", a1, a2, b1, b2))
+        else:
+            for t, i1, i2, j1, j2 in difflib.SequenceMatcher(
+                    None, a[a1:a2], b[b1:b2], autojunk=False).get_opcodes():
+                ops.append((t, a1 + i1, a1 + i2, b1 + j1, b1 + j2))
+    return ops
+
+
 def char_divergence_spans(student_ids, target_text, decode_fn, mode: str):
     """Divergence-mask spans placed by a CHARACTER diff projected onto the token grid.
 
@@ -328,18 +383,15 @@ def char_divergence_spans(student_ids, target_text, decode_fn, mode: str):
     turn-closer (student text past the target's end) is never a divergence. Returns None
     when offsets are unavailable; callers fall back to the id diff.
     """
-    import difflib
-
     ids = [int(i) for i in student_ids]
     offsets = token_char_offsets(ids, decode_fn)
     if offsets is None:
         return None
     text = "".join(decode_fn([i]) for i in ids)
-    sm = difflib.SequenceMatcher(None, text, target_text, autojunk=False)
     n, m = len(text), len(target_text)
     spans: list[tuple[int, int]] = []
-    for tag, i1, i2, j1, _j2 in sm.get_opcodes():
-        if tag == "equal":
+    for tag, i1, i2, j1, _j2 in segmented_char_opcodes(text, target_text):
+        if tag in ("equal", "closer"):
             continue
         if i2 == n and j1 == m:
             continue
