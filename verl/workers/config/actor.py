@@ -108,6 +108,9 @@ class SelfDistillationConfig(BaseConfig):
     include_environment_feedback: bool = False
     environment_feedback_only_without_solution: bool = False
     use_turn_feedback: bool = False
+    # must mirror the rollout's apply_chat_template kwargs (e.g. {"enable_thinking": False}):
+    # header/hint fragments are derived under these kwargs to match rollout tokens
+    chat_template_kwargs: dict = field(default_factory=dict)
     turn_feedback_template: str = "[Hindsight from a previous failed attempt that reached this exact state: {diagnosis}]\n"
     # wraps hints the rollout marks `at: call` (spliced between a turn's reasoning and its
     # tool call): the next token after it must be the call itself, so unlike the turn

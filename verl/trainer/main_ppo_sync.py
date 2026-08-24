@@ -1500,7 +1500,10 @@ class PPOTrainer:
             prompt_list = data["prompts"].unbind()
             hint_template = self_distillation_cfg.turn_feedback_template
             call_template = self_distillation_cfg.call_feedback_template
-            header_ids = torch.tensor(sdpo_teacher.assistant_header_ids(self.tokenizer), dtype=torch.int64)
+            template_kwargs = dict(getattr(self_distillation_cfg, "chat_template_kwargs", None) or {})
+            header_ids = torch.tensor(
+                sdpo_teacher.assistant_header_ids(self.tokenizer, template_kwargs=template_kwargs), dtype=torch.int64
+            )
             # mid-turn (at == "call") splices close the assistant turn and reopen it after the
             # hint; the call span starts at the template's tool-call opening token
             close_ids = torch.tensor(
@@ -1570,6 +1573,7 @@ class PPOTrainer:
                             sdpo_teacher.hint_user_turn_ids(
                                 self.tokenizer,
                                 (call_template if at == "call" else hint_template).format(diagnosis=text),
+                                template_kwargs=template_kwargs,
                             ),
                             dtype=response_ids.dtype,
                         )

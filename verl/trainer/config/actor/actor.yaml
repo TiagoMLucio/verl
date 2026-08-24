@@ -326,6 +326,10 @@ self_distillation:
   # Per-turn reflector hints: teacher scores each hinted turn on [context<t + hint]
   use_turn_feedback: false
 
+  # Rollout-side apply_chat_template kwargs, mirrored when deriving header/hint fragments
+  # (e.g. {enable_thinking: false} for Qwen3.5); must match the agent config's value
+  chat_template_kwargs: {}
+
   # Template for one injected hint; spliced immediately before the hinted turn's tokens.
   # The splice is a real user turn, so the teacher's instinct is to answer it: 9.9% of scored
   # turns opened with "Thank you for the guidance" against 0 of 514 the student ever wrote.
