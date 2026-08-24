@@ -1373,10 +1373,12 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 logits.div_(temperature.clamp(min=1e-8).to(logits.dtype))
 
                 if calculate_entropy:
+                    # same flag-aware entropy as the rmpad path: the raw call materializes
+                    # fp32 full-vocab logits (37k tokens x 248k vocab = 37 GiB on Qwen3.5)
                     if not self.engine_config.entropy_checkpointing:
-                        entropy = verl_F.entropy_from_logits(logits)
+                        entropy = self.compute_entropy_from_logits(logits)
                     else:
-                        entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
+                        entropy = torch.utils.checkpoint.checkpoint(self.compute_entropy_from_logits, logits)
 
                 if calculate_sum_pi_squared:
                     sum_pi_squared = verl_F.calculate_sum_pi_squared_from_logits(logits)
