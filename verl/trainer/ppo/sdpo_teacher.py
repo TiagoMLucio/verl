@@ -427,6 +427,10 @@ def char_divergence_spans(student_ids, target_text, decode_fn, mode: str, encode
     prev_end = 0
     equal_run_start = 0
     prev_was_equal = True
+    # a right-slide must not leave the field segment its opcode came from: sliding into
+    # the scaffolding after a value would mask tokens outside the corrected field
+    segs = _aligned_call_segments(text, target_text)
+    seg_ends = [(a1, a2, b1, b2) for a1, a2, b1, b2, _k in segs] if segs is not None else None
     for tag, i1, i2, j1, j2 in segmented_char_opcodes(text, target_text):
         if tag in ("equal", "closer"):
             # consecutive equal opcodes (a field boundary abuts an equal run inside the
@@ -462,12 +466,16 @@ def char_divergence_spans(student_ids, target_text, decode_fn, mode: str, encode
                     i1 -= 1
                 i2 = i1 + width
             elif tag == "insert":
-                while i1 < n and j1 < j2 and target_text[j1] == text[i1]:
+                stop = next((a2 for a1, a2, b1, b2 in seg_ends if b1 <= j1 < b2), n) \
+                    if seg_ends is not None else n
+                while i1 < stop and j1 < j2 and target_text[j1] == text[i1]:
                     i1 += 1
                     j1 += 1
                 i2 = i1
             else:
-                while i2 < n and text[i1] == text[i2]:
+                stop = next((a2 for a1, a2, b1, b2 in seg_ends if a1 <= i1 < a2), n) \
+                    if seg_ends is not None else n
+                while i2 < stop and text[i1] == text[i2]:
                     i1 += 1
                     i2 += 1
         prev_end = max(prev_end, i2 if i2 > i1 else i1 + 1)
