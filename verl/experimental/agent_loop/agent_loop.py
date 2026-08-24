@@ -830,6 +830,11 @@ class AgentLoopWorker:
             "image_grid_thw": multi_modal_inputs.get("image_grid_thw"),
             "video_grid_thw": multi_modal_inputs.get("video_grid_thw"),
         }
+        # Text-only episodes: mrope degenerates to the text arange, so emit 1-D rows and
+        # keep every downstream consumer (TQ packing, SDPO splice, teacher rows) on the
+        # text-rope layout instead of (components, seq_len) rows.
+        if multi_modal_kwargs["image_grid_thw"] is None and multi_modal_kwargs["video_grid_thw"] is None:
+            return compute_position_id_with_mask(attention_mask)  # (1, seq_len)
         # For transformers>=5.3.0, mm_token_type_ids is only used to calculate position ids.
         if multi_modal_inputs.pop("mm_token_type_ids", None) is not None:
             mm_token_type_ids = torch.zeros_like(input_ids)
