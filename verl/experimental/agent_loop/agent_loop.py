@@ -791,6 +791,11 @@ class AgentLoopWorker:
         images = multi_modal_data.get("images")
         videos = multi_modal_data.get("videos")
         audios = multi_modal_data.get("audios")
+        # Text-only episodes: skip the mm processor entirely -- its output carries
+        # non-empty bookkeeping tensors (mm_token_type_ids, attention_mask) that read
+        # as real multi-modal inputs downstream (the SDPO loss refuses such batches).
+        if not images and not videos and not audios:
+            return multi_modal_inputs
         current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
 
         multi_modal_inputs = build_multimodal_processor_inputs(
