@@ -68,6 +68,8 @@ from verl.workers.utils.sdpo import (
 )
 
 logger = logging.getLogger(__file__)
+
+_ATTACH_DIAG = 0
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
@@ -762,6 +764,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self.sdpo_enabled:
             attach_response_keep_positions(data)
+            global _ATTACH_DIAG
+            if _ATTACH_DIAG < 2:
+                _ATTACH_DIAG += 1
+                _m = data.get("teacher_seq_meta", None)
+                _k = data.get("logits_keep_positions", None)
+                logger.warning(
+                    "[span-only] update_actor: teacher_seq_meta=%s nested=%s -> keep_positions=%s",
+                    type(_m).__name__ if _m is not None else None,
+                    getattr(_m, "is_nested", None),
+                    None if _k is None else int(_k.values().shape[0]))
         # SDPO reads top-k and a logsumexp off the real logits, which the fused kernel
         # never materializes; span-only keeps this pass cheap anyway.
         tu.assign_non_tensor(data, use_fused_kernels=False)

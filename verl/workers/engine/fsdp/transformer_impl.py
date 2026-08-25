@@ -80,6 +80,8 @@ from ..utils import enable_full_determinism, postprocess_batch_func, prepare_mic
 from .utils import create_device_mesh, get_sharding_strategy
 
 logger = logging.getLogger(__file__)
+
+_SPAN_DIAG = 0
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
@@ -1180,6 +1182,20 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # instead of the full sequence, which is what makes a 248k-vocab lm_head
                 # affordable here.
                 keep_positions = micro_batch.get("logits_keep_positions", None)
+                # one-off diagnostic: span-only is what keeps a 248k-vocab lm_head affordable,
+                # and its absence is silent -- it just materialises the whole sequence.
+                global _SPAN_DIAG
+                if _SPAN_DIAG < 4:
+                    _SPAN_DIAG += 1
+                    _tot = int(micro_batch["input_ids"].offsets()[-1])
+                    if keep_positions is None:
+                        logger.warning(
+                            "[span-only] INACTIVE: no logits_keep_positions in micro_batch "
+                            "(keys=%s); lm_head will run over all %d tokens",
+                            sorted(micro_batch.keys()), _tot)
+                    else:
+                        logger.warning("[span-only] active: %d kept of %d tokens",
+                                       int(keep_positions.values().shape[0]), _tot)
                 if keep_positions is not None:
                     assert not use_fused_kernels, "logits_keep_positions does not support fused kernels"
                     nested_ids = micro_batch["input_ids"]
