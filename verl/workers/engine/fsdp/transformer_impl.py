@@ -1154,6 +1154,17 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     input_ids=micro_batch["input_ids"], max_seq_len=max_seq_len
                 )
 
+                # An all-ones mask carries no information a causal LM does not already
+                # apply, but passing it as an explicit mask disqualifies SDPA's flash
+                # backend, which falls back to the math kernel and materialises the full
+                # (heads x L x L) score matrix: 16 heads at L=31.7k cost 29.93 GiB and
+                # OOM'd job 3183777, while the same code at L=8k needs only ~2 GiB
+                # (quadratic, hence every short smoke passing). Micro-batches of one
+                # sequence -- what ppo_micro_batch_size_per_gpu=1 always produces -- are
+                # never padded, so drop the mask and let the causal fast path run.
+                if attention_mask is not None and bool(attention_mask.all()):
+                    attention_mask = None
+
                 model_inputs = {
                     "input_ids": input_ids,
                     "attention_mask": attention_mask,
