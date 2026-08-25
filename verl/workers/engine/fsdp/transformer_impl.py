@@ -1160,6 +1160,31 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     "position_ids": position_ids,
                 }
 
+                # Span-only lm_head, padded counterpart of the use_remove_padding=True
+                # branch above. HF applies a tensor `logits_to_keep` as
+                # hidden_states[:, idx, :] -- the SAME sequence positions for every row --
+                # so rows with different spans (the SDPO teacher's spliced sub-rows) go in
+                # as the union of their positions, and each row's own slice is gathered
+                # back out in prepare_model_outputs. Still bounded by the kept spans
+                # instead of the full sequence, which is what makes a 248k-vocab lm_head
+                # affordable here.
+                keep_positions = micro_batch.get("logits_keep_positions", None)
+                if keep_positions is not None:
+                    assert not use_fused_kernels, "logits_keep_positions does not support fused kernels"
+                    nested_ids = micro_batch["input_ids"]
+                    nested_offsets = nested_ids.offsets()
+                    keep_rows = list(keep_positions.unbind())
+                    # sorted+deduped, so searchsorted maps each row's positions into it
+                    keep_union = torch.unique(torch.cat(keep_rows))
+                    model_inputs["logits_to_keep"] = keep_union
+                    # packed indices, row-major -- same layout and meaning as the rmpad branch
+                    output_args["logits_keep_idx"] = keep_positions.values() + nested_offsets[
+                        :-1
+                    ].repeat_interleave(keep_positions.offsets().diff())
+                    output_args["keep_union"] = keep_union
+                    output_args["keep_rows"] = keep_rows
+                    output_args["total_nnz"] = int(nested_offsets[-1])
+
             else:
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
@@ -1359,6 +1384,67 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     sum_pi_squared = torch.nested.nested_tensor_from_jagged(sum_pi_squared_rmpad, cu_seqlens)
             else:
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
+
+        elif output_args.get("logits_keep_idx") is not None:
+            # Span-only, padded path: the lm_head ran on the union of kept positions, so
+            # `output.logits` is (bsz, |union|, vocab) rather than the full sequence.
+            # Below mirrors the use_remove_padding=True keep_idx branch verbatim -- gather
+            # each row's own positions, work in the packed layout, scatter the reductions
+            # back over total_nnz -- so both paths produce identical fields.
+            assert pad_mode == DatasetPadMode.NO_PADDING, f"pad_mode {pad_mode} not implemented"
+            assert not calculate_sum_pi_squared, "logits_keep_positions does not support sum_pi_squared"
+            keep_idx = output_args["logits_keep_idx"]
+            keep_union = output_args["keep_union"]
+            keep_rows = output_args["keep_rows"]
+            total_nnz = output_args["total_nnz"]
+            cu_seqlens = input_ids.offsets()
+
+            logits_union = output.logits  # (bsz, |union|, vocab)
+            # row-major concat, matching how keep_idx was built from keep_positions.values()
+            logits_rmpad = torch.cat(
+                [
+                    logits_union[i].index_select(0, torch.searchsorted(keep_union, row))
+                    for i, row in enumerate(keep_rows)
+                ],
+                dim=0,
+            )  # (n_keep_total, vocab)
+
+            # per-position temperature, restricted to the kept positions
+            temperature_keep = (
+                output_args["temperature"].repeat_interleave(cu_seqlens.diff())[keep_idx]
+            )
+            logits_rmpad = logits_rmpad / temperature_keep.clamp(min=1e-8).unsqueeze(-1).to(logits_rmpad.dtype)
+
+            labels_keep = output_args["input_ids_rmpad_rolled"][keep_idx]
+            log_probs = logprobs_from_logits(
+                logits=logits_rmpad,
+                labels=labels_keep,
+                inplace_backward=not calculate_entropy,
+            )
+            log_probs = log_probs.new_zeros(total_nnz).index_copy_(0, keep_idx, log_probs)
+
+            if calculate_entropy:
+                if not self.engine_config.entropy_checkpointing:
+                    entropy_keep = self.compute_entropy_from_logits(logits_rmpad)
+                else:
+                    entropy_keep = torch.utils.checkpoint.checkpoint(self.compute_entropy_from_logits, logits_rmpad)
+                entropy = entropy_keep.new_zeros(total_nnz).index_copy_(0, keep_idx, entropy_keep)
+
+            if distillation_use_topk:
+                outputs = logits_processor_func(
+                    student_logits=logits_rmpad.unsqueeze(0), data=micro_batch, logits_keep_idx=keep_idx
+                )
+                for k, v in outputs.items():
+                    v = v.squeeze(0)
+                    v = v.new_zeros((total_nnz, *v.shape[1:])).index_copy_(0, keep_idx, v)
+                    assert v.shape[0] == log_probs.shape[0], (
+                        f"log_probs shape: {log_probs.shape}, {k} shape: {v.shape}"
+                    )
+                    model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
+
+            log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
+            if calculate_entropy:
+                entropy = torch.nested.nested_tensor_from_jagged(entropy, cu_seqlens)
 
         else:  # not using rmpad and no ulysses sp
             response_length = tu.get_non_tensor_data(data=micro_batch, key="max_response_length", default=1024)
