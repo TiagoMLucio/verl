@@ -182,6 +182,8 @@ def qwen3_5_base_forward(
 class Qwen3_5CausalLMOutputForPPO(Qwen3_5CausalLMOutputWithPast):
     log_probs: Optional[torch.FloatTensor] = None
     entropy: Optional[torch.FloatTensor] = None
+    topk_logps: Optional[torch.FloatTensor] = None
+    topk_indices: Optional[torch.LongTensor] = None
 
 
 def forward_with_normal_backend(
@@ -189,11 +191,18 @@ def forward_with_normal_backend(
     input_ids: torch.LongTensor = None,
     labels: Optional[torch.LongTensor] = None,
     temperature: float = 1.0,
+    logits_to_keep: int | torch.Tensor = 0,
     **kwargs,
 ) -> "Qwen3_5CausalLMOutputForPPO":
     outputs = self.model(input_ids, **kwargs)
     hidden_states = outputs[0]
-    logits = self.lm_head(hidden_states)
+    # Same slice HF's own Qwen3_5 forward applies. This patch replaces that forward
+    # wholesale, so without it `logits_to_keep` reaches the base model as dead **kwargs
+    # and the head widens all 248k vocab over the full sequence: at 31k tokens that is
+    # the ~28 GiB fp32 transient whose backward OOM'd 3184998/3185005/3186431.
+    # int 0 reproduces the unsliced default, since slice(-0, None) is the whole sequence.
+    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+    logits = self.lm_head(hidden_states[:, slice_indices, :])
     return Qwen3_5CausalLMOutputForPPO(
         logits=logits,
         hidden_states=outputs.hidden_states,
@@ -206,12 +215,27 @@ def forward_with_torch_backend(
     labels: Optional[torch.LongTensor] = None,
     temperature: float = 1.0,
     shift_labels: Optional[torch.LongTensor] = None,
+    logits_to_keep: int | torch.Tensor = 0,
+    use_fused_kernels: bool = True,
+    distill_topk: Optional[int] = None,
+    distill_chunk_size: int = 512,
     **kwargs,
 ) -> "Qwen3_5CausalLMOutputForPPO":
     from verl.utils.experimental.torch_functional import FusedLinearForPPO
 
     outputs = self.model(input_ids, **kwargs)
     hidden_states = outputs[0]
+
+    # See `dense_common.forward_with_torch_backend`: the patch is class-level, so a caller
+    # that needs real logits (SDPO reads top-k and a logsumexp off them) opts out per call,
+    # and `logits_to_keep` must be honoured here or the head widens the whole sequence.
+    if not use_fused_kernels and distill_topk is None:
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        return Qwen3_5CausalLMOutputForPPO(
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+        )
 
     # See `dense_common.forward_with_torch_backend` for the `shift_labels`
     # rationale (issue #6068).
@@ -223,6 +247,33 @@ def forward_with_torch_backend(
         rolled_labels = torch.roll(input_ids, shifts=-1, dims=-1)
     else:
         raise RuntimeError("To use forward_with_torch_backend, either labels or input_ids must be provided.")
+
+    # Chunked distillation head: see `dense_common.forward_with_torch_backend`. It has to
+    # run here because FSDP reshards lm_head.weight as soon as this forward returns.
+    if distill_topk is not None:
+        from verl.utils.experimental.chunked_topk import chunked_topk_logprobs
+
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        kept_hidden = hidden_states[:, slice_indices, :].squeeze(0)
+        chunk_labels = rolled_labels.squeeze(0) if rolled_labels.dim() > 1 else rolled_labels
+        chunk_labels = chunk_labels[slice_indices]
+        vocab_weights = self.lm_head.weight
+        if isinstance(vocab_weights, DTensor):
+            vocab_weights = vocab_weights.full_tensor()
+        topk_logps, topk_indices, label_logps = chunked_topk_logprobs(
+            kept_hidden,
+            vocab_weights,
+            distill_topk,
+            labels=chunk_labels,
+            temperature=temperature,
+            chunk_size=distill_chunk_size,
+        )
+        return Qwen3_5CausalLMOutputForPPO(
+            log_probs=label_logps.unsqueeze(0),
+            topk_logps=topk_logps.unsqueeze(0),
+            topk_indices=topk_indices.unsqueeze(0),
+            hidden_states=outputs.hidden_states,
+        )
 
     fused_linear_for_ppo = FusedLinearForPPO()
     vocab_weights = self.lm_head.weight
@@ -254,12 +305,24 @@ def forward_with_triton_backend(
     labels: Optional[torch.LongTensor] = None,
     temperature: float = 1.0,
     shift_labels: Optional[torch.LongTensor] = None,
+    logits_to_keep: int | torch.Tensor = 0,
+    use_fused_kernels: bool = True,
+    distill_topk: Optional[int] = None,
+    distill_chunk_size: int = 512,
     **kwargs,
 ) -> "Qwen3_5CausalLMOutputForPPO":
     from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 
     outputs = self.model(input_ids, **kwargs)
     hidden_states = outputs[0]
+
+    if not use_fused_kernels and distill_topk is None:
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        return Qwen3_5CausalLMOutputForPPO(
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+        )
 
     # See `dense_common.forward_with_torch_backend` for the `shift_labels`
     # rationale (issue #6068).
@@ -275,6 +338,31 @@ def forward_with_triton_backend(
     if ulysses_sequence_parallel_size > 1:
         rolled_labels, _, _ = ulysses_pad_and_slice_inputs(
             rolled_labels, position_ids_rmpad=None, sp_size=ulysses_sequence_parallel_size
+        )
+
+    if distill_topk is not None:
+        from verl.utils.experimental.chunked_topk import chunked_topk_logprobs
+
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        kept_hidden = hidden_states[:, slice_indices, :].squeeze(0)
+        chunk_labels = rolled_labels.squeeze(0) if rolled_labels.dim() > 1 else rolled_labels
+        chunk_labels = chunk_labels[slice_indices]
+        weights = self.lm_head.weight
+        if isinstance(weights, DTensor):
+            weights = weights.full_tensor()
+        topk_logps, topk_indices, label_logps = chunked_topk_logprobs(
+            kept_hidden,
+            weights,
+            distill_topk,
+            labels=chunk_labels,
+            temperature=temperature,
+            chunk_size=distill_chunk_size,
+        )
+        return Qwen3_5CausalLMOutputForPPO(
+            log_probs=label_logps.unsqueeze(0),
+            topk_logps=topk_logps.unsqueeze(0),
+            topk_indices=topk_indices.unsqueeze(0),
+            hidden_states=outputs.hidden_states,
         )
 
     vocab_weights = self.lm_head.weight
