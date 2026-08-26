@@ -1483,7 +1483,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 logits = output.logits  # (bsz, response_length, vocab_size)
                 temperature = output_args["temperature"]  # (bsz,)
                 temperature = temperature.unsqueeze(-1).unsqueeze(-1)
-                logits.div_(temperature.clamp(min=1e-8).to(logits.dtype))
+                scale = temperature.clamp(min=1e-8).to(logits.dtype)
+                # SFT runs at temperature 1: dividing would rewrite the whole
+                # (tokens x 248k vocab) tensor to no effect
+                if not bool((scale == 1).all()):
+                    logits.div_(scale)
 
                 if calculate_entropy:
                     # same flag-aware entropy as the rmpad path: the raw call materializes
@@ -1499,9 +1503,14 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 if pad_mode == DatasetPadMode.NO_PADDING:
                     cu_seqlens = input_ids.offsets()
                     seq_lengths = cu_seqlens.diff()
-                    starts = torch.zeros_like(seq_lengths, dtype=torch.int64)
-                    logits = torch.nested.narrow(logits, 1, starts, seq_lengths, layout=torch.jagged)
-                    logits_rmpad = torch.cat([t for t in logits.unbind()])
+                    if int(seq_lengths.sum()) == logits.shape[0] * logits.shape[1]:
+                        # nothing was padded (always so at micro_batch_size_per_gpu=1):
+                        # narrow+cat would copy the whole full-vocab tensor for nothing
+                        logits_rmpad = logits.reshape(-1, logits.shape[-1])
+                    else:
+                        starts = torch.zeros_like(seq_lengths, dtype=torch.int64)
+                        logits = torch.nested.narrow(logits, 1, starts, seq_lengths, layout=torch.jagged)
+                        logits_rmpad = torch.cat([t for t in logits.unbind()])
                     input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
                     log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
 

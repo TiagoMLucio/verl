@@ -163,6 +163,11 @@ def logprobs_from_logits_naive(logits: torch.Tensor, labels: torch.Tensor) -> to
     return logpy
 
 
+# elements per log_softmax call in logprobs_from_logits_v2; caps the transient
+# without reverting to one kernel launch per row
+_LOGPROB_BLOCK_NUMEL = 1 << 28
+
+
 def logprobs_from_logits_v2(logits: torch.FloatTensor, labels: torch.Tensor) -> torch.Tensor:
     """Memory-efficient log-probability computation using row-wise processing.
 
@@ -190,13 +195,23 @@ def logprobs_from_logits_v2(logits: torch.FloatTensor, labels: torch.Tensor) -> 
         logsumexp_values = torch.stack([torch.logsumexp(logit, dim=-1) for logit in logits])
         logprobs_labels = logits_labels - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
     else:
-        # logsumexp approach is unstable with bfloat16, fall back to slightly less efficent approach
-        logprobs_labels = []
-        for row_logits, row_labels in zip(logits, labels, strict=True):  # loop to reduce peak mem consumption
-            row_logprobs = F.log_softmax(row_logits, dim=-1)
-            row_logprobs_labels = row_logprobs.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(-1)
-            logprobs_labels.append(row_logprobs_labels)
-        logprobs_labels = torch.stack(logprobs_labels)
+        # logsumexp approach is unstable with bfloat16, fall back to slightly less efficent approach.
+        # Blocked rather than row-at-a-time: this function is also called with 2-D
+        # (tokens, vocab) logits, where one row is one token, so a per-row loop launches
+        # a single-block kernel per token (32k of them per micro-batch at 32k context).
+        # Blocking keeps the same peak -- every block's output is saved for backward
+        # either way -- while cutting launches by ~1000x. Same function, row-wise.
+        rows = logits.shape[0]
+        row_numel = logits[0].numel() if rows else 1
+        block = max(1, min(rows, _LOGPROB_BLOCK_NUMEL // max(row_numel, 1)))
+        chunks = []
+        for start in range(0, rows, block):
+            stop = start + block
+            block_logprobs = F.log_softmax(logits[start:stop], dim=-1)
+            chunks.append(
+                block_logprobs.gather(dim=-1, index=labels[start:stop].unsqueeze(-1)).squeeze(-1)
+            )
+        logprobs_labels = torch.cat(chunks, dim=0)
     return logprobs_labels
 
 
