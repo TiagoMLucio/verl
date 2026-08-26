@@ -86,6 +86,45 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
 
+_VISION_TOWER_ATTRS = ("visual", "vision_tower", "vision_model")
+
+
+def _find_vision_tower(module: torch.nn.Module) -> Optional[torch.nn.Module]:
+    """First submodule registered under a vision-tower attribute name, or None."""
+    for name, submodule in module.named_modules():
+        if name.rsplit(".", 1)[-1] in _VISION_TOWER_ATTRS:
+            return submodule
+    return None
+
+
+def _freeze_vision_tower(module: torch.nn.Module) -> None:
+    tower = _find_vision_tower(module)
+    assert tower is not None, "freeze_vision_tower is set but the model has no vision tower"
+    tower.requires_grad_(False)
+
+
+def _compile_transformer_layers(module: torch.nn.Module) -> int:
+    """torch.compile every transformer block, in place, leaving any vision tower eager.
+
+    Regional on purpose. Compiling the whole model is not an option here: the wrapped module
+    would break at every FSDP hook, and a VLM's tower carries data-dependent shapes that
+    graph-break unconditionally. Blocks are the unit FSDP wraps, so compiling them before
+    `fully_shard` leaves the unshard/reshard hooks outside the compiled region, and HF's
+    gradient checkpointing (which wraps `__call__`) outside it as well.
+    """
+    layer_cls_names = set(getattr(module, "_no_split_modules", None) or [])
+    if not layer_cls_names:
+        return 0
+    tower = _find_vision_tower(module)
+    skip = {id(m) for m in tower.modules()} if tower is not None else set()
+
+    compiled = 0
+    for submodule in module.modules():
+        if type(submodule).__name__ in layer_cls_names and id(submodule) not in skip:
+            submodule.forward = torch.compile(submodule.forward, dynamic=True)
+            compiled += 1
+    return compiled
+
 
 class FSDPEngine(BaseEngine):
     """
@@ -313,6 +352,23 @@ class FSDPEngine(BaseEngine):
 
             if self.model_config.enable_gradient_checkpointing:
                 module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
+            # Both must land before FSDP wraps: the wrap policy reads requires_grad, and a
+            # block has to be compiled while it is still a plain nn.Module.
+            if self.model_config.freeze_vision_tower:
+                assert not self._is_lora, "freeze_vision_tower and LoRA both freeze; pick one"
+                # the tower's non-block parameters share the root unit with the trained ones,
+                # which FSDP1 can only flatten under use_orig_params
+                assert self.engine_config.strategy == "fsdp2" or self.engine_config.use_orig_params, (
+                    "freeze_vision_tower on FSDP1 requires engine.use_orig_params=True"
+                )
+                _freeze_vision_tower(module)
+
+            if self.engine_config.compile_transformer_layers:
+                n_compiled = _compile_transformer_layers(module)
+                assert n_compiled > 0, "compile_transformer_layers matched no block: _no_split_modules is empty"
+                if self.rank == 0:
+                    print(f"torch.compile applied to {n_compiled} transformer blocks")
         return module
 
     def _build_lora_module(self, module):
@@ -462,7 +518,13 @@ class FSDPEngine(BaseEngine):
     def _build_optimizer(self, module):
         from verl.workers.config.optimizer import build_optimizer
 
-        optimizer = build_optimizer(module.parameters(), self.optimizer_config)
+        parameters = module.parameters()
+        if self.model_config.freeze_vision_tower:
+            # Adam allocates its state lazily, per parameter that shows up with a gradient,
+            # so a frozen parameter left in a param group costs nothing -- but it would still
+            # be carried through state_dict and clip. Keep the groups to what is trained.
+            parameters = [p for p in parameters if p.requires_grad]
+        optimizer = build_optimizer(parameters, self.optimizer_config)
 
         return optimizer
 
@@ -1503,12 +1565,13 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 if pad_mode == DatasetPadMode.NO_PADDING:
                     cu_seqlens = input_ids.offsets()
                     seq_lengths = cu_seqlens.diff()
+                    # also consumed by the entropy narrow further down
+                    starts = torch.zeros_like(seq_lengths, dtype=torch.int64)
                     if int(seq_lengths.sum()) == logits.shape[0] * logits.shape[1]:
                         # nothing was padded (always so at micro_batch_size_per_gpu=1):
                         # narrow+cat would copy the whole full-vocab tensor for nothing
                         logits_rmpad = logits.reshape(-1, logits.shape[-1])
                     else:
-                        starts = torch.zeros_like(seq_lengths, dtype=torch.int64)
                         logits = torch.nested.narrow(logits, 1, starts, seq_lengths, layout=torch.jagged)
                         logits_rmpad = torch.cat([t for t in logits.unbind()])
                     input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
