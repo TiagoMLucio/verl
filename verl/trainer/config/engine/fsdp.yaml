@@ -50,6 +50,10 @@ entropy_from_logits_with_chunking: false
 # Whether to use torch compile in fsdp.
 use_torch_compile: true
 
+# Whether to torch.compile each transformer block before FSDP wraps it. Regional by
+# construction: the wrapped module is not compilable as a whole, and a vision tower is skipped.
+compile_transformer_layers: false
+
 # Whether to use entropy checkpointing in fsdp.
 entropy_checkpointing: false
 

@@ -167,6 +167,7 @@ actor_rollout_ref:
       include_environment_feedback: true
       environment_feedback_only_without_solution: true
       use_turn_feedback: false
+      chat_template_kwargs: {}
       turn_feedback_template: '[Guidance for your next action: {diagnosis}
 
         Work out in your own words what this implies for the current state before
@@ -431,6 +432,7 @@ actor_rollout_ref:
     override_config: {}
     enable_gradient_checkpointing: true
     enable_activation_offload: false
+    freeze_vision_tower: false
     use_remove_padding: true
     lora_rank: 0
     lora_alpha: 16
@@ -629,6 +631,7 @@ critic:
     override_config: {}
     enable_gradient_checkpointing: true
     enable_activation_offload: false
+    freeze_vision_tower: false
     use_remove_padding: true
     lora_rank: 0
     lora_alpha: 16

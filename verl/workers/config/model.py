@@ -117,6 +117,11 @@ class HFModelConfig(BaseConfig):
     enable_gradient_checkpointing: bool = True
     enable_activation_offload: bool = False
 
+    # Drop the vision tower out of the autograd graph on a text-only workload. The dummy
+    # image forward stays -- it is what keeps the module reachable -- but a frozen tower
+    # costs no backward, no grad reduce and no optimizer state.
+    freeze_vision_tower: bool = False
+
     use_remove_padding: bool = True
 
     # TODO: unify fsdp and megatron lora config
