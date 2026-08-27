@@ -1212,6 +1212,25 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     position_ids = torch.nested.to_padded_tensor(
                         position_ids, padding=0, output_size=(batch_size, max_seq_len)
                     )
+                    # Pads continue each row's positions rather than resetting to 0. A
+                    # reset reads to transformers as a packed-sequence boundary
+                    # (masking_utils.find_packed_sequence_indices), which it only ever
+                    # looks for when the 2D mask is None and no cache is live -- exactly
+                    # this call, since forward_step passes use_cache=False. It then builds
+                    # a document mask and forbids the is_causal skip, so SDPA takes the
+                    # math kernel and materialises (bsz x heads x L x L) anyway: 21.20 GiB
+                    # on two teacher sub-rows of 18.9k, job 3203003. Dropping the mask and
+                    # keeping the positions monotonic are one fix, not two -- either alone
+                    # leaves the mask materialised. Only pad slots change value; every real
+                    # position keeps its own, so nothing the loss reads moves.
+                    ramp = torch.arange(max_seq_len, device=position_ids.device)
+                    pad_slots = ramp.unsqueeze(0) >= seq_len_effective.unsqueeze(1)
+                    last_real = position_ids.gather(1, (seq_len_effective - 1).unsqueeze(1))
+                    position_ids = torch.where(
+                        pad_slots,
+                        last_real + 1 + (ramp.unsqueeze(0) - seq_len_effective.unsqueeze(1)),
+                        position_ids,
+                    )
 
                 # No mask at all. `to_padded_tensor` pads every row on the RIGHT, and a
                 # causal LM cannot let a trailing pad reach an earlier position, so each
