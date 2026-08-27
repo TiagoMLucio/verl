@@ -73,7 +73,6 @@ from verl.utils.ulysses import (
     ulysses_pad_and_slice_inputs,
 )
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
-from verl.workers.utils.padding import build_attention_mask_from_nested
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
 from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
@@ -1214,20 +1213,17 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         position_ids, padding=0, output_size=(batch_size, max_seq_len)
                     )
 
-                attention_mask = build_attention_mask_from_nested(
-                    input_ids=micro_batch["input_ids"], max_seq_len=max_seq_len
-                )
-
-                # An all-ones mask carries no information a causal LM does not already
-                # apply, but passing it as an explicit mask disqualifies SDPA's flash
-                # backend, which falls back to the math kernel and materialises the full
-                # (heads x L x L) score matrix: 16 heads at L=31.7k cost 29.93 GiB and
-                # OOM'd job 3183777, while the same code at L=8k needs only ~2 GiB
-                # (quadratic, hence every short smoke passing). Micro-batches of one
-                # sequence -- what ppo_micro_batch_size_per_gpu=1 always produces -- are
-                # never padded, so drop the mask and let the causal fast path run.
-                if attention_mask is not None and bool(attention_mask.all()):
-                    attention_mask = None
+                # No mask at all. `to_padded_tensor` pads every row on the RIGHT, and a
+                # causal LM cannot let a trailing pad reach an earlier position, so each
+                # real position attends to exactly the keys it would attend to unpadded;
+                # only real positions are ever read back out (the keep_idx gather, or the
+                # narrow over cu_seqlens below), so what the pad positions compute is
+                # discarded. Passing the mask instead disqualifies SDPA's flash backend and
+                # the math kernel materialises the whole (bsz x heads x L x L) score matrix:
+                # one row of 31.7k over 16 heads cost 29.93 GiB (job 3183777), and two
+                # teacher sub-rows padded to 17.1k cost 17.44 GiB (job 3196068) -- the
+                # padding, not the sequence, is what makes bsz > 1 quadratic here.
+                attention_mask = None
 
                 model_inputs = {
                     "input_ids": input_ids,
@@ -1298,6 +1294,13 @@ class FSDPEngineWithLMHead(FSDPEngine):
             model_inputs["use_fused_kernels"] = use_fused_kernels
         distill_topk = tu.get_non_tensor_data(data=micro_batch, key="chunked_distill_topk", default=None)
         if distill_topk is not None:
+            if "keep_union" in output_args:
+                raise NotImplementedError(
+                    "the chunked head returns reductions instead of logits, and the padded "
+                    "span-only branch has no logits to gather each row's span out of; "
+                    "span-only already bounds the head on this path, so leave "
+                    "use_chunked_lm_head off when logits_keep_positions is set"
+                )
             model_inputs["distill_topk"] = distill_topk
             model_inputs["distill_chunk_size"] = self.model_config.get("chunked_lm_head_size", 512)
             output_args["chunked_distill"] = True
