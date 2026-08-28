@@ -801,8 +801,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             tu.assign_non_tensor(data, gate_batch_num_tokens=int(kept.item()))
 
         # SDPO reads top-k and a logsumexp off the real logits, which the fused kernel
-        # never materializes; span-only keeps this pass cheap anyway.
-        tu.assign_non_tensor(data, use_fused_kernels=False)
+        # never materializes; span-only keeps this pass cheap anyway. Other loss modes
+        # never read logits, so they keep the engine's configured fused setting
+        # (train_batch injects it when the key is absent): forcing it off on vanilla
+        # PPO materializes full-vocab logits over the whole sequence with nothing to
+        # bound them -- 43.8k tokens x 248320 x bf16 = the 20.26 GiB OOM of job 3206010.
+        if self.sdpo_enabled:
+            tu.assign_non_tensor(data, use_fused_kernels=False)
         if self._chunked_distill_topk() is not None:
             tu.assign_non_tensor(data, chunked_distill_topk=self._chunked_distill_topk())
 

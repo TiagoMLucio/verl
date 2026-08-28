@@ -1560,8 +1560,33 @@ class FSDPEngineWithLMHead(FSDPEngine):
         else:  # not using rmpad and no ulysses sp
             response_length = tu.get_non_tensor_data(data=micro_batch, key="max_response_length", default=1024)
             if use_fused_kernels:
-                log_probs = output.log_probs[:, -response_length - 1 : -1]
-                entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
+                if pad_mode == DatasetPadMode.NO_PADDING:
+                    # The fused kernel scored every position of the right-padded rows, so
+                    # hand back each row's real prefix as nested over cu_seqlens -- the
+                    # same contract the logits branch below produces. The legacy slice
+                    # under this fixed-width layout returns a (bsz, response_length)
+                    # padded tensor whose rows response_from_nested/no_padding_2_padding
+                    # then mis-slice into empty ones: job 3206010's vanilla update saw
+                    # old_log_probs of width 0 against a 44758-token log_prob. The label
+                    # at each row's last real position is the pad token (per-row roll),
+                    # matching the packed roll's row-crossing label there: both are
+                    # garbage, and every consumer drops that position via its -1 shift.
+                    cu_seqlens = input_ids.offsets()
+                    seq_lengths = cu_seqlens.diff()
+                    starts = torch.zeros_like(seq_lengths)
+
+                    def _rows_to_nested(padded: torch.Tensor) -> torch.Tensor:
+                        rows = torch.nested.narrow(padded, 1, starts, seq_lengths, layout=torch.jagged)
+                        return torch.nested.nested_tensor_from_jagged(
+                            torch.cat([t for t in rows.unbind()]), cu_seqlens
+                        )
+
+                    log_probs = _rows_to_nested(output.log_probs)
+                    if calculate_entropy:
+                        entropy = _rows_to_nested(output.entropy)
+                else:
+                    log_probs = output.log_probs[:, -response_length - 1 : -1]
+                    entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
 
             else:
                 logits = output.logits  # (bsz, response_length, vocab_size)
