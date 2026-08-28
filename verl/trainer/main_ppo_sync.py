@@ -909,6 +909,7 @@ class PPOTrainer:
         sample_gts = []
         sample_scores = []
         sample_turns = []
+        sample_exit_reasons = []
         data_sources = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
         dump_all_inputs: list[str] = []
@@ -980,9 +981,19 @@ class PPOTrainer:
             reward_extra_infos_dict["reward"].extend(scores)
 
             extra_fields_list = data.pop("extra_fields", None)
+            if extra_fields_list is None:
+                sample_exit_reasons.extend([None] * len(scores))
             if extra_fields_list is not None:
                 n_prior = len(reward_extra_infos_dict["reward"]) - len(extra_fields_list.tolist())
                 for extra_field in extra_fields_list.tolist():
+                    # how a val rollout ended lives at the top level of extra_fields, next to
+                    # reward_extra_info rather than inside it; without it a dumped val
+                    # trajectory cannot say whether it submitted, ran out of turns or got
+                    # stuck, which is the whole comparison between arms. Dump-only: the
+                    # value is a string and process_validation_metrics aggregates numerics.
+                    sample_exit_reasons.append(
+                        extra_field.get("traj_exit_reason") if isinstance(extra_field, dict) else None
+                    )
                     reward_extra_info = (
                         extra_field.get("reward_extra_info", {}) if isinstance(extra_field, dict) else {}
                     )
@@ -1054,7 +1065,12 @@ class PPOTrainer:
                     k: [v[i] for i in session_final_indices] for k, v in reward_extra_infos_dict.items()
                 }
                 | {"uid": dump_all_keys}
-                | ({"sample_index": dump_all_indices} if any(i is not None for i in dump_all_indices) else {}),
+                | ({"sample_index": dump_all_indices} if any(i is not None for i in dump_all_indices) else {})
+                | (
+                    {"traj_exit_reason": [sample_exit_reasons[i] for i in session_final_indices]}
+                    if any(r is not None for r in sample_exit_reasons)
+                    else {}
+                ),
                 dump_path=val_data_dir,
             )
 
