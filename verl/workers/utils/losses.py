@@ -24,6 +24,7 @@ from verl.trainer.ppo.core_algos import (
     compute_value_loss,
     get_policy_loss_fn,
     kl_penalty,
+    sdpo_gate_row_seed,
 )
 from verl.utils import tensordict_utils as tu
 from verl.utils.attention_utils import index_first_axis, rearrange
@@ -33,6 +34,9 @@ from verl.utils.metric import AggregationType, Metric
 from verl.utils.torch_functional import masked_mean, masked_sum
 from verl.workers.config import ActorConfig, CriticConfig
 from verl.workers.utils.padding import no_padding_2_padding
+
+# one-time kept-fraction line per process: a broken gate is visible in the job log
+_GATE_DIAG_LOGGED = False
 
 
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
@@ -359,9 +363,42 @@ def sdpo_ppo_loss(
     if full_logit_distillation and distill_topk is None and teacher_all_logps is None:
         raise ValueError("SDPO: teacher_all_log_probs missing for full-logit distillation.")
 
+    # entropy is padded once here; the token gate reads it and the entropy bonus below reuses it
+    entropy = model_output.get("entropy", None)
+    if entropy is not None:
+        entropy = no_padding_2_padding(entropy, data)
+
+    token_gate = getattr(sdpo_config, "token_gate", "none") or "none"
+    gate_seed = None
+    batch_num_tokens = data["batch_num_tokens"]
+    if token_gate != "none":
+        if token_gate in ("q3", "entropy_topk") and entropy is None:
+            raise ValueError(
+                f"SDPO: token_gate={token_gate!r} needs the student entropy; "
+                "set actor_rollout_ref.actor.calculate_entropy=true"
+            )
+        if token_gate == "random":
+            responses = data["responses"]
+            if responses.is_nested:
+                responses = responses.to_padded_tensor(0)
+            gate_seed = sdpo_gate_row_seed(responses, response_mask)
+        # token-mean divides by batch_num_tokens: keep the denominator honest by swapping in
+        # the post-gate kept count, all-reduced by update_actor the same way the engine
+        # all-reduces batch_num_tokens (every mode keeps exactly ceil(rho * n) per row, so
+        # the count is known pre-forward). seq-mean-token-mean never reads it: each row is
+        # re-normalized by its own post-gate loss_mask token count inside agg_loss.
+        if batch_num_tokens:
+            gate_num_tokens = tu.get_non_tensor_data(data, key="gate_batch_num_tokens", default=None)
+            if gate_num_tokens is None:
+                raise ValueError(
+                    "SDPO: token_gate is enabled but gate_batch_num_tokens was not shipped; "
+                    "the update path must all-reduce the kept-token count (see update_actor)."
+                )
+            batch_num_tokens = gate_num_tokens
+
     # batch_num_tokens is the global supervised-token count: the SDPO update ships loss_mask = supervised mask
     config.global_batch_info["dp_size"] = data["dp_size"]
-    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
+    config.global_batch_info["batch_num_tokens"] = batch_num_tokens
     config.global_batch_info["global_batch_size"] = data["global_batch_size"]
     config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
 
@@ -380,7 +417,20 @@ def sdpo_ppo_loss(
         rollout_is_weights=rollout_is_weights,
         global_batch_info=config.global_batch_info,
         seq_weights=trace_weight,
+        student_entropy=entropy.detach() if entropy is not None else None,
+        gate_seed=gate_seed,
     )
+
+    global _GATE_DIAG_LOGGED
+    if token_gate != "none" and not _GATE_DIAG_LOGGED and metrics.get("self_distillation/gate_candidates__sum"):
+        _GATE_DIAG_LOGGED = True
+        kept = metrics["self_distillation/gate_kept__sum"]
+        cand = metrics["self_distillation/gate_candidates__sum"]
+        print(
+            f"[token-gate] mode={token_gate} rho={sdpo_config.token_gate_rho} first supervised "
+            f"micro-batch: kept {int(kept)}/{int(cand)} tokens ({kept / cand:.3f})",
+            flush=True,
+        )
     metrics["self_distillation/empty_target_batch"] = (
         self_distillation_mask.sum().item() == 0 if self_distillation_mask is not None else False
     )
@@ -404,15 +454,15 @@ def sdpo_ppo_loss(
     metrics["actor/pg_loss"] = Metric(value=loss, aggregation=metric_aggregation)
     policy_loss = loss
 
-    entropy = model_output.get("entropy", None)
     if entropy is not None:
-        entropy = no_padding_2_padding(entropy, data)
         # span-only update: entropy exists only at hinted-span positions, so average there
         entropy_mask = response_mask
         if "logits_keep_positions" in data.keys() and self_distillation_mask is not None and self_distillation_mask.dim() > 1:
             entropy_mask = response_mask * self_distillation_mask
         # a 0 batch_num_tokens would make entropy_loss inf with NaN grads (entropy connects to the graph unmasked)
         entropy_gbi = dict(config.global_batch_info or {})
+        # the bonus averages over the pre-gate mask, so it keeps the pre-gate denominator
+        entropy_gbi["batch_num_tokens"] = data["batch_num_tokens"]
         if not entropy_gbi.get("batch_num_tokens"):
             entropy_gbi["batch_num_tokens"] = entropy_mask.sum().clamp(min=1.0)
         entropy_loss = agg_loss(

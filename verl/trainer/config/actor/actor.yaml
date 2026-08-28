@@ -366,6 +366,14 @@ self_distillation:
   # turn-hinted (pipeline) ones. 1.0 = today, where call rows carry ~85-90% of the update
   call_loss_weight: 1.0
 
+  # Which supervised tokens actually train: none | gap_topk | q3 | entropy_topk | random.
+  # Every mode keeps exactly ceil(token_gate_rho * n) supervised tokens per row, ranked
+  # within the row; q3 and entropy_topk require actor.calculate_entropy=true
+  token_gate: none
+
+  # Fraction of each row's supervised tokens a token gate keeps
+  token_gate_rho: 0.2
+
 # Router replay configuration for MoE models
 router_replay:
 

@@ -142,10 +142,25 @@ class SelfDistillationConfig(BaseConfig):
     #: a small minority of rows; a trajectory carries one kind of hint or the other, so this
     #: is a row weight (a within-row scale would cancel in the token-mean).
     call_loss_weight: float = 1.0
+    #: which supervised tokens actually train: none (all of them), gap_topk (largest
+    #: |logp_teacher - logp_student|), q3 (low-entropy AND high-gap "confidently wrong",
+    #: topped up / trimmed by gap rank), entropy_topk (highest student entropy), random
+    #: (content-seeded hash). Every mode keeps exactly ceil(token_gate_rho * n) supervised
+    #: tokens per row, ranked within the row; q3 and entropy_topk require calculate_entropy.
+    token_gate: str = "none"
+    #: fraction of each row's supervised tokens a token gate keeps
+    token_gate_rho: float = 0.2
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
             raise ValueError(f"self_distillation.alpha must be in [0,1], got {self.alpha}")
+        if self.token_gate not in ("none", "gap_topk", "q3", "entropy_topk", "random"):
+            raise ValueError(
+                "self_distillation.token_gate must be none|gap_topk|q3|entropy_topk|random, "
+                f"got {self.token_gate!r}"
+            )
+        if not 0.0 < self.token_gate_rho <= 1.0:
+            raise ValueError(f"self_distillation.token_gate_rho must be in (0,1], got {self.token_gate_rho}")
         canonical_regularization_modes = {
             "ema": "ema",
             "trust_region": "trust_region",

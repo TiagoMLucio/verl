@@ -187,6 +187,8 @@ actor_rollout_ref:
       call_target: teacher
       max_hinted_turns: null
       call_loss_weight: 1.0
+      token_gate: none
+      token_gate_rho: 0.2
     router_replay:
       _target_: verl.workers.config.RouterReplayConfig
       mode: disabled
