@@ -71,7 +71,7 @@ class SelfDistillationConfig(BaseConfig):
         teacher (str): Which teacher builds the distillation targets. "reprompt" is the
             paper's: a fresh prompt carrying a successful sibling's solution and the
             environment feedback. "turn_hints" builds one spliced teacher sequence per sample
-            from reflection hints (``extra_fields["turn_spans"]``/``["turn_feedback"]``), each
+            from reflection hints (``extra_fields["turn_spans"]``/``["turn_hints"]``), each
             hint inserted right before its turn; samples without hints ship a degenerate
             teacher row with a zero mask (scored only to keep dp-group collectives in
             lockstep) and contribute nothing to the loss.

@@ -1214,11 +1214,11 @@ class PPOTrainer:
             sample_indices = self._fetch_sample_indices(batch)
             if sample_indices is not None and len(sample_indices) == len(batch.keys):
                 reward_extra_infos_dict["sample_index"] = [sample_indices[i] for i in sorted_indices]
-            # downstream hint analysis reads turn_feedback/turn_spans from the dump, not trace exports
+            # downstream hint analysis reads turn_hints/turn_spans from the dump, not trace exports
             extra_fields = data.pop("extra_fields", None)
             if extra_fields is not None:
                 ef = extra_fields.tolist()
-                for key in ("turn_feedback", "turn_spans"):
+                for key in ("turn_hints", "turn_spans"):
                     reward_extra_infos_dict[key] = [
                         json.dumps((ef[i] or {}).get(key)) for i in sorted_indices
                     ]

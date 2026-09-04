@@ -46,14 +46,14 @@ def select_hinted_turns(
     extra_fields: dict, response_len: int, max_hinted_turns: Optional[int] = None
 ) -> list[HintedTurn]:
     """Pair a sample's turn spans with its hints. The rollout ships the
-    placement as an optional third element of the ``turn_feedback`` entry; a fourth element
+    placement as an optional third element of the ``turn_hints`` entry; a fourth element
     (the ``target`` field older rollout dumps still carry) is ignored.
 
     Spans are clamped to the (possibly truncated) response; with a cap, the first
     ``max_hinted_turns`` turns are kept (earliest, before the trajectory loses coherence).
     """
     hint_by_step = {int(entry[0]): (entry[1], entry[2] if len(entry) > 2 else "turn")
-                    for entry in (extra_fields.get("turn_feedback") or [])}
+                    for entry in (extra_fields.get("turn_hints") or [])}
     hinted = []
     for step, start, end in extra_fields.get("turn_spans") or []:
         step, start, end = int(step), int(start), min(int(end), response_len)

@@ -115,9 +115,9 @@ def test_turn_hint_teacher_matches_the_splice_and_decodes_nothing():
     teacher = make_teacher(cfg, tok, max_prompt_length=4096)
     assert isinstance(teacher, TurnHintTeacher) and teacher.needs_prompts
     extra = [
-        {"turn_spans": SPANS, "turn_feedback": [[0, "h0"], [1, "h1", "call"]]},
-        {"turn_spans": SPANS, "turn_feedback": []},
-        {"turn_spans": SPANS, "turn_feedback": [[1, "h2"]], "segment_index": 1, "segment_prompt": SEGMENT_PROMPT},
+        {"turn_spans": SPANS, "turn_hints": [[0, "h0"], [1, "h1", "call"]]},
+        {"turn_spans": SPANS, "turn_hints": []},
+        {"turn_spans": SPANS, "turn_hints": [[1, "h2"]], "segment_index": 1, "segment_prompt": SEGMENT_PROMPT},
     ]
     inputs = _inputs(extra, ["a", "a", "b"], [0.0, 0.0, 0.0], [None] * 3)
 
@@ -220,10 +220,10 @@ def test_turn_hint_teacher_counts_one_fallback_per_hint():
     mid_turn = [[0, 1, len(TURN0)], SPANS[1]]
     extra = [
         # a call hint on a turn without <tool_call> whose span also starts mid-turn: one fallback
-        {"turn_spans": mid_turn, "turn_feedback": [[0, "h0", "call"], [1, "h1"]]},
+        {"turn_spans": mid_turn, "turn_hints": [[0, "h0", "call"], [1, "h1"]]},
         # a turn hint whose span start is not preceded by the assistant header
-        {"turn_spans": mid_turn, "turn_feedback": [[0, "h2"]]},
-        {"turn_spans": SPANS, "turn_feedback": [[0, "h3"], [1, "h4", "call"]]},
+        {"turn_spans": mid_turn, "turn_hints": [[0, "h2"]]},
+        {"turn_spans": SPANS, "turn_hints": [[0, "h3"], [1, "h4", "call"]]},
     ]
     out = teacher.build(_inputs(extra, ["a", "b", "c"], [0.0] * 3, [None] * 3))
     assert out.metrics["self_distillation/hint_injection_fallbacks"] == 2
@@ -258,15 +258,15 @@ def test_trainer_turn_hints_batch_fields_and_metrics(monkeypatch):
     and a row with a first-turn hint."""
     # key, uid, reward, feedback, extra_fields
     rows = [
-        ("u1_0_0", "u1", 0.0, "fb0", dict(turn_spans=SPANS, turn_feedback=[[0, "h0"], [1, "h1", "call"]],
+        ("u1_0_0", "u1", 0.0, "fb0", dict(turn_spans=SPANS, turn_hints=[[0, "h0"], [1, "h1", "call"]],
                                           segment_index=0, num_segments=1, traj_exit_reason="finished",
                                           timings=TIMINGS)),
-        ("u1_1_0", "u1", 1.0, None, dict(turn_spans=SPANS, turn_feedback=[], segment_index=0, num_segments=2,
+        ("u1_1_0", "u1", 1.0, None, dict(turn_spans=SPANS, turn_hints=[], segment_index=0, num_segments=2,
                                          traj_exit_reason="submitted")),
-        ("u1_1_1", "u1", 1.0, None, dict(turn_spans=SPANS, turn_feedback=[[1, "h2"]], segment_index=1,
+        ("u1_1_1", "u1", 1.0, None, dict(turn_spans=SPANS, turn_hints=[[1, "h2"]], segment_index=1,
                                          num_segments=2, segment_prompt=SEGMENT_PROMPT)),
         ("u2_0_0", "u2", 0.0, "   ", None),
-        ("u2_1_0", "u2", 0.0, "fb4", dict(turn_spans=SPANS, turn_feedback=[[0, "h3"]], segment_index=0,
+        ("u2_1_0", "u2", 0.0, "fb4", dict(turn_spans=SPANS, turn_hints=[[0, "h3"]], segment_index=0,
                                           num_segments=1, traj_exit_reason="finished")),
     ]
     keys = [r[0] for r in rows]

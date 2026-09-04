@@ -168,10 +168,10 @@ def test_select_hinted_turns_reads_call_placement():
     from verl.trainer.ppo.sdpo.hints import select_hinted_turns
 
     extra = {"turn_spans": [[0, 0, 4], [1, 4, 9]],
-             "turn_feedback": [[0, "a"], [1, "b", "call"], ]}
+             "turn_hints": [[0, "a"], [1, "b", "call"], ]}
     assert select_hinted_turns(extra, 9) == [HintedTurn(0, 0, 4, "a", "turn"), HintedTurn(1, 4, 9, "b", "call")]
     assert [hint.is_call for hint in select_hinted_turns(extra, 9)] == [False, True]
-    extra["turn_feedback"] = [[1, "b", "call", "removed target field"]]
+    extra["turn_hints"] = [[1, "b", "call", "removed target field"]]
     assert select_hinted_turns(extra, 9) == [HintedTurn(1, 4, 9, "b", "call")]
 
 
