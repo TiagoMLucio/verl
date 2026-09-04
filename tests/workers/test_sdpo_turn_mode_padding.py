@@ -76,7 +76,7 @@ def test_micro_splits_stay_row_aligned():
         "responses": torch.tensor([11], dtype=torch.long),
         "response_mask": torch.zeros(1),
         "teacher_input_ids": torch.tensor([8, 11], dtype=torch.long),
-        "teacher_seq_meta": torch.tensor([1, 0, 0, 1], dtype=torch.int64),
+        "teacher_seq_meta": torch.tensor([1, 2, 1, 0, 0, 1], dtype=torch.int64),
     }
     td = to_td([make_hinted_sample(), stub])
     run_teacher_grid_path(td)
@@ -90,7 +90,7 @@ def test_corrupt_spans_are_caught():
     sample = make_hinted_sample()
     sample["responses"] = torch.arange(100, dtype=torch.long)  # truncated vs meta
     sample["response_mask"] = torch.ones(100)
-    with pytest.raises(AssertionError, match="spans exceed the response row"):
+    with pytest.raises(AssertionError, match="span exceeds the response row"):
         run_teacher_grid_path(to_td([sample]))
 
 

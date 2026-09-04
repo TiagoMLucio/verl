@@ -69,7 +69,7 @@ def _sink():
 def _lane(attrs: dict | None) -> int:
     if attrs and attrs.get("sample_index") is not None:
         # stable row per (sample, rollout_n); offset keeps rollouts clear of tid 0
-        return 10 + int(attrs["sample_index"]) * 8 + int(attrs.get("rollout_n") or 0) % 8
+        return 10 + int(attrs["sample_index"]) * 64 + int(attrs.get("rollout_n") or 0) % 64
     inherited = _lane_cv.get()
     if inherited is not None:
         return inherited
@@ -148,5 +148,10 @@ def span(name: str, attrs_getter=None, **args):
                 attrs = None
         if error is not None:
             args = {**args, "error": error}
-        emit(name, t_start, time.time(), attrs=attrs, **args)
-        _lane_cv.reset(token)
+        # a failing sink must neither mask the wrapped exception nor leak the lane
+        try:
+            emit(name, t_start, time.time(), attrs=attrs, **args)
+        except Exception:
+            pass
+        finally:
+            _lane_cv.reset(token)

@@ -91,6 +91,7 @@ class ChunkedTopkLogprobs(torch.autograd.Function):
         if grad_label_logps is not None:
             grad_label_logps = grad_label_logps.to(compute_dtype)
 
+        weight_c = weight.to(compute_dtype)
         for start in range(0, hidden.shape[0], chunk_size):
             end = min(start + chunk_size, hidden.shape[0])
             temp = _slice_temperature(temperature, start, end)
@@ -110,7 +111,7 @@ class ChunkedTopkLogprobs(torch.autograd.Function):
                 grad_chunk = grad_chunk / temp
 
             if grad_hidden is not None:
-                grad_hidden[start:end] = (grad_chunk @ weight.to(compute_dtype)).to(hidden.dtype)
+                grad_hidden[start:end] = (grad_chunk @ weight_c).to(hidden.dtype)
             if grad_weight is not None:
                 grad_weight += grad_chunk.t() @ hidden[start:end].to(compute_dtype)
 
