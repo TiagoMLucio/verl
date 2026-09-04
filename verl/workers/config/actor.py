@@ -51,8 +51,12 @@ __all__ = [
 class SelfDistillationConfig(BaseConfig):
     """Configuration for self-distillation loss.
 
+    Distillation is enabled when policy_loss.loss_mode == "sdpo". ``teacher`` picks which
+    teacher builds the distillation targets; the keys after it apply only to the teacher
+    they are listed under (under "turn_hints", the reprompt keys for the sibling solution
+    and the feedback only feed the supervision-source metrics).
+
     Args:
-        Distillation is enabled when policy_loss.loss_mode == "sdpo".
         full_logit_distillation (bool): Whether to use full-logit KL distillation.
         alpha (float): KL interpolation coefficient.
             0.0=forward KL, 1.0=reverse KL, in-between=JSD.
@@ -63,12 +67,35 @@ class SelfDistillationConfig(BaseConfig):
             toward the student ("ema") or the trust-region mixing coefficient.
         distillation_topk (Optional[int]): If set, use top-k logits for distillation.
         distillation_add_tail (bool): Whether to add a tail bucket for top-k distillation.
+        is_clip (Optional[float]): Clip value for distillation IS ratio; None disables IS weighting.
+        teacher (str): Which teacher builds the distillation targets. "reprompt" is the
+            paper's: a fresh prompt carrying a successful sibling's solution and the
+            environment feedback. "turn_hints" builds one spliced teacher sequence per sample
+            from reflection hints (``extra_fields["turn_spans"]``/``["turn_feedback"]``), each
+            hint inserted right before its turn; samples without hints ship a degenerate
+            teacher row with a zero mask (scored only to keep dp-group collectives in
+            lockstep) and contribute nothing to the loss.
+
+        turn_hints teacher:
+        chat_template_kwargs (dict): The rollout's apply_chat_template kwargs (e.g.
+            {"enable_thinking": False}); header and hint fragments are rendered under them
+            so they match the rollout tokens.
+        turn_hint_template (str): Template for one turn-placed hint, spliced immediately
+            before the hinted turn's tokens. Uses the {hint} placeholder.
+        call_hint_template (str): Template for one call-placed hint, spliced between the
+            turn's reasoning and its tool call. Uses the {hint} placeholder.
+        max_hinted_turns (Optional[int]): Cap on hinted turns per sample (keeps the first
+            ones, earliest before the trajectory loses coherence); None hints every turn the
+            reflector wrote for.
+        call_loss_weight (float): Weight of rows supervised by a call-placed hint relative
+            to rows supervised by turn-placed ones.
+
+        reprompt teacher:
         max_reprompt_len (int): Maximum length of the reprompted prompt.
         reprompt_truncation (str): Truncation side for the reprompted prompt: "right" or "left".
         dont_reprompt_on_self_success (bool): Whether to not reprompt on self-success.
         remove_thinking_from_demonstration (bool): Whether to remove <think>...</think>
             tags from successful demonstrations before reprompting.
-        is_clip (Optional[float]): Clip value for distillation IS ratio; None disables IS weighting.
         reprompt_template (str): Template for reprompting. Uses {prompt}, {solution}, {feedback} placeholders.
         solution_template (str): Template for formatting solution section.
             Uses {successful_previous_attempt} placeholder.
@@ -77,17 +104,6 @@ class SelfDistillationConfig(BaseConfig):
             in reprompting for wrong attempts.
         environment_feedback_only_without_solution (bool): If True, only use feedback
             when no solution is available (ignore feedback when solution exists).
-        use_turn_feedback (bool): Build one spliced teacher sequence per sample from
-            reflection hints (``extra_fields["turn_spans"]``/``["turn_feedback"]``), each hint
-            inserted right before its turn; samples without hints ship a degenerate teacher
-            row with a zero mask (scored only to keep dp-group collectives in lockstep) and
-            contribute nothing to the loss.
-        turn_feedback_template (str): Template for one turn-placed hint, spliced immediately
-            before the hinted turn's tokens. Uses the {diagnosis} placeholder.
-        call_feedback_template (str): Template for one call-placed hint, spliced between the
-            turn's reasoning and its tool call. Uses the {diagnosis} placeholder.
-        max_hinted_turns (Optional[int]): Cap on hinted turns per sample (keeps the first
-            ones, earliest before the trajectory loses coherence); None hints every diagnosed turn.
     """
 
     full_logit_distillation: bool = True
@@ -97,22 +113,15 @@ class SelfDistillationConfig(BaseConfig):
     teacher_update_rate: float = 0.05
     distillation_topk: Optional[int] = None
     distillation_add_tail: bool = True
-    max_reprompt_len: int = 10240
-    reprompt_truncation: str = "right"
-    dont_reprompt_on_self_success: bool = False
-    remove_thinking_from_demonstration: bool = False
     is_clip: Optional[float] = None
-    reprompt_template: str = "{prompt}{solution}{feedback}\n\nCorrectly solve the original question.\n"
-    solution_template: str = "\nCorrect solution:\n\n{successful_previous_attempt}\n\n"
-    feedback_template: str = "\nThe following is feedback from your unsuccessful earlier attempt:\n\n{feedback_raw}\n\n"
-    include_environment_feedback: bool = False
-    environment_feedback_only_without_solution: bool = False
-    use_turn_feedback: bool = False
+    teacher: str = "reprompt"
+
+    # turn_hints teacher
     # must mirror the rollout's apply_chat_template kwargs (e.g. {"enable_thinking": False}):
     # header/hint fragments are derived under these kwargs to match rollout tokens
     chat_template_kwargs: dict = field(default_factory=dict)
-    turn_feedback_template: str = (
-        "[Guidance for your next action: {diagnosis}\n"
+    turn_hint_template: str = (
+        "[Guidance for your next action: {hint}\n"
         "Work out in your own words what this implies for the current state before you act, then take "
         "the action it points to. Do not acknowledge it, thank anyone for it, quote it, or refer to it: "
         "it is not part of the conversation, and the turn you write must read as if it were never sent.]\n"
@@ -120,8 +129,8 @@ class SelfDistillationConfig(BaseConfig):
     # wraps hints the rollout marks `at: call` (spliced between a turn's reasoning and its
     # tool call): the next token after it must be the call itself, so unlike the turn
     # template it must never invite further deliberation
-    call_feedback_template: str = (
-        "[A note on the tool call you are about to write: {diagnosis}\n"
+    call_hint_template: str = (
+        "[A note on the tool call you are about to write: {hint}\n"
         "Continue exactly where you left off: your next output is the tool call itself - "
         "no reply, no acknowledgement, no further reasoning, as if this note were never sent.]\n"
     )
@@ -132,6 +141,17 @@ class SelfDistillationConfig(BaseConfig):
     #: a small minority of rows; a trajectory carries one kind of hint or the other, so this
     #: is a row weight (a within-row scale would cancel in the token-mean).
     call_loss_weight: float = 1.0
+
+    # reprompt teacher
+    max_reprompt_len: int = 10240
+    reprompt_truncation: str = "right"
+    dont_reprompt_on_self_success: bool = False
+    remove_thinking_from_demonstration: bool = False
+    reprompt_template: str = "{prompt}{solution}{feedback}\n\nCorrectly solve the original question.\n"
+    solution_template: str = "\nCorrect solution:\n\n{successful_previous_attempt}\n\n"
+    feedback_template: str = "\nThe following is feedback from your unsuccessful earlier attempt:\n\n{feedback_raw}\n\n"
+    include_environment_feedback: bool = False
+    environment_feedback_only_without_solution: bool = False
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
@@ -162,22 +182,24 @@ class SelfDistillationConfig(BaseConfig):
             )
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
-        if self.use_turn_feedback:
+        if self.teacher not in ("reprompt", "turn_hints"):
+            raise ValueError(f"self_distillation.teacher must be reprompt|turn_hints, got {self.teacher!r}")
+        if self.teacher == "turn_hints":
             if self.call_loss_weight < 0:
                 raise ValueError(
                     f"self_distillation.call_loss_weight must be >= 0, got {self.call_loss_weight}"
                 )
-            for name in ("turn_feedback_template", "call_feedback_template"):
+            for name in ("turn_hint_template", "call_hint_template"):
                 template = getattr(self, name)
                 try:
-                    template.format(diagnosis="")
+                    template.format(hint="")
                 except (KeyError, IndexError) as exc:
                     raise ValueError(
-                        f"self_distillation.{name} must format on {{diagnosis}} alone, got {template!r}"
+                        f"self_distillation.{name} must format on {{hint}} alone, got {template!r}"
                     ) from exc
-                if "{diagnosis}" not in template:
+                if "{hint}" not in template:
                     raise ValueError(
-                        f"self_distillation.{name} must contain the {{diagnosis}} "
+                        f"self_distillation.{name} must contain the {{hint}} "
                         f"placeholder or the hint is silently dropped, got {template!r}"
                     )
 

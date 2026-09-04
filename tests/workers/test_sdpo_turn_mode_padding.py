@@ -23,10 +23,10 @@ import pytest
 import torch
 from tensordict import TensorDict
 
-from verl.trainer.ppo import sdpo_teacher
 from verl.trainer.ppo.padding_utils import construct_minimal_padding_template
+from verl.trainer.ppo.sdpo import splice
+from verl.trainer.ppo.sdpo.hints import HintedTurn
 from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META
-from verl.trainer.ppo.sdpo_teacher import HintedTurn
 from verl.utils import tensordict_utils as tu
 from verl.workers.utils.sdpo import explode_turn_teacher_rows, scatter_turn_teacher_outputs
 
@@ -41,7 +41,7 @@ def make_hinted_sample(resp_len=9000, prompt_len=50):
     hinted = [HintedTurn(3, 100, 2600, "h1", "turn"), HintedTurn(7, 2600, resp_len, "h2", "turn")]
     hint_ids = [torch.full((20,), 5, dtype=torch.long), torch.full((30,), 6, dtype=torch.long)]
     header_ids = torch.tensor([90, 91, 92], dtype=torch.long)
-    seq, meta, _, _ = sdpo_teacher.build_spliced_teacher_row(
+    seq, meta, _, _ = splice.build_spliced_teacher_row(
         prompt_ids, response_ids, hinted, hint_ids, 32768, header_ids
     )
     return {

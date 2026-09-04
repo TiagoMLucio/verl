@@ -29,7 +29,7 @@ import os
 import threading
 import time
 import uuid
-from collections import Counter, defaultdict
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pprint import pprint
@@ -70,19 +70,21 @@ from verl.single_controller.ray import (
 )
 from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler, run_ppo
-from verl.trainer.ppo import core_algos, sdpo_teacher
+from verl.trainer.ppo import core_algos
+from verl.trainer.ppo import sdpo_health_metrics as health
 from verl.trainer.ppo.core_algos import agg_loss, finalize_ratio_metrics
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
-    process_validation_metrics,
 )
 from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
 from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_advantage, compute_spec_decode_metrics
 from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
-from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META
+from verl.trainer.ppo.sdpo import TeacherInputs, make_teacher
+from verl.trainer.ppo.sdpo.reprompt import collect_feedback
+from verl.trainer.ppo.sdpo.splice import trace_weights
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_teacher_policy
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils import tensordict_utils as tu
@@ -155,10 +157,7 @@ def compute_advantage_for_multi_trajectories(
     final_sessions: dict[str, tuple[int, int]] = {}
     row_session_keys = []
     for i, key in enumerate(batch_keys):
-        fields = key.rsplit("_", 2)
-        assert len(fields) == 3, f"Unexpected key format: {key}"
-        uid, session_id, index = fields[0], fields[1], int(fields[2])
-        session_key = f"{uid}_{session_id}"
+        session_key, index = _session_key(key), _parse_key(key)[2]
         row_session_keys.append(session_key)
         if session_key not in final_sessions or final_sessions[session_key][0] < index:
             final_sessions[session_key] = (index, i)
@@ -193,14 +192,24 @@ def compute_advantage_for_multi_trajectories(
     return data
 
 
+def _parse_key(key: str) -> tuple[str, int, int]:
+    """``(uid, session_id, index)`` of a TransferQueue row key ``{uid}_{session_id}_{index}``."""
+    uid, session_id, index = key.rsplit("_", 2)
+    return uid, int(session_id), int(index)
+
+
+def _session_key(key: str) -> str:
+    """``{uid}_{session_id}``: the trajectory (agent loop session) a row key belongs to."""
+    return key.rsplit("_", 1)[0]
+
+
 def _final_segment_local_indices(keys: list[str]) -> list[int]:
-    """Row index of each session's final segment, from {uid}_{session_id}_{index} keys."""
+    """Row index of each session's final segment."""
     best: dict[str, tuple[int, int]] = {}
     for row, key in enumerate(keys):
-        uid, session_id, index = key.rsplit("_", 2)
-        session_key = f"{uid}_{session_id}"
-        if session_key not in best or best[session_key][0] < int(index):
-            best[session_key] = (int(index), row)
+        session_key, index = _session_key(key), _parse_key(key)[2]
+        if session_key not in best or best[session_key][0] < index:
+            best[session_key] = (index, row)
     return [row for _, row in best.values()]
 
 
@@ -573,13 +582,14 @@ class PPOTrainer:
         trust_remote_code = self.config.data.get("trust_remote_code", False)
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-        if loss_mode == "sdpo":
-            self.tokenizer.padding_side = "left"
-            reprompt_truncation = self.config.actor_rollout_ref.actor.get("self_distillation", {}).get(
-                "reprompt_truncation"
+        self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
+        if loss_mode == "sdpo" and self_distillation_cfg is not None:
+            self.sdpo_teacher = make_teacher(
+                self_distillation_cfg,
+                self.tokenizer,
+                apply_chat_template_kwargs=self.config.data.get("apply_chat_template_kwargs", {}),
+                max_prompt_length=self.config.data.max_prompt_length,
             )
-            if reprompt_truncation in {"left", "right"}:
-                self.tokenizer.truncation_side = reprompt_truncation
         # Used for multimodal LLM, could be None
         self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
@@ -741,6 +751,11 @@ class PPOTrainer:
             config=self.config,
             rm_resource_pool=resource_pool,
         )
+        if self.reward_loop_manager.reward_loop_worker_handles is None:
+            raise NotImplementedError(
+                "the sync trainer scores rollouts in the reward loop only: a colocated reward model "
+                "needs reward.reward_model.enable_resource_pool=true"
+            )
         logger.info("reward loop manager initialized")
 
         # 8. initialize teacher loop manager
@@ -935,25 +950,14 @@ class PPOTrainer:
             # 2. sample batch from replay buffer
             batch = self.replay_buffer.sample(partition_id="val", global_steps=self.global_steps)
 
-            # 3. [OPTIONAL] compute reward score with colocated reward model
-            if self.reward_loop_manager.reward_loop_worker_handles is None:
-                self.checkpoint_manager.sleep_replicas()
-                batch = self._compute_reward_colocate(batch)
-                self.checkpoint_manager.update_weights()
-
-            # 4. collect necessary data for logging
+            # 3. collect necessary data for logging
             # For multi-output agent loops, only use the final output per session for metrics.
             # Keys have format {uid}_{session_id}_{index}; keep only the highest index per session.
             session_max: dict[str, tuple[int, int]] = {}  # session_key -> (max_index, position)
             for pos, key in enumerate(batch.keys):
-                parts = key.rsplit("_", 2)
-                if len(parts) == 3:
-                    session_key = f"{parts[0]}_{parts[1]}"
-                    index = int(parts[2])
-                    if session_key not in session_max or index > session_max[session_key][0]:
-                        session_max[session_key] = (index, pos)
-                else:
-                    session_max[key] = (0, pos)
+                session_key, index = _session_key(key), _parse_key(key)[2]
+                if session_key not in session_max or index > session_max[session_key][0]:
+                    session_max[session_key] = (index, pos)
             sorted_sessions = sorted(session_max.items(), key=lambda x: x[1][1])
             final_indices = [pos for _, (_, pos) in sorted_sessions]
             final_keys = [batch.keys[i] for i in final_indices]
@@ -1039,11 +1043,7 @@ class PPOTrainer:
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
             # Sort according to uid (so that generations in the same rollout are together)
-            sort_keys = []
-            for key in dump_all_keys:
-                parts = key.rsplit("_", 2)
-                sort_keys.append((parts[0], int(parts[1]), int(parts[2])) if len(parts) == 3 else (key, 0, 0))
-            sorted_indices = sorted(range(len(dump_all_keys)), key=lambda i: sort_keys[i])
+            sorted_indices = sorted(range(len(dump_all_keys)), key=lambda i: _parse_key(dump_all_keys[i]))
             dump_all_inputs = [dump_all_inputs[i] for i in sorted_indices]
             dump_all_outputs = [dump_all_outputs[i] for i in sorted_indices]
             dump_all_keys = [dump_all_keys[i] for i in sorted_indices]
@@ -1051,11 +1051,7 @@ class PPOTrainer:
 
             # For ground truths, scores and reward extra infos, find the values in the
             # lists for the final samples of each session
-            dump_all_sessions = [
-                f"{parts[0]}_{parts[1]}" if len(parts) == 3 else key
-                for key in dump_all_keys
-                for parts in [key.rsplit("_", 2)]
-            ]
+            dump_all_sessions = [_session_key(key) for key in dump_all_keys]
             session_final_indices = [session_to_sample_idx[session] for session in dump_all_sessions]
             self._dump_generations(
                 inputs=dump_all_inputs,
@@ -1075,7 +1071,7 @@ class PPOTrainer:
                 dump_path=val_data_dir,
             )
 
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        return health.validation_metrics(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1205,14 +1201,7 @@ class PPOTrainer:
                 gts = [None] * len(uids)
 
             # Sort by uid key ({sample}_{rollout}_{output})
-            sort_keys = []
-            for key in batch.keys:
-                parts = key.rsplit("_", 2)
-                if len(parts) == 3:
-                    sort_keys.append((parts[0], int(parts[1]), int(parts[2])))
-                else:
-                    sort_keys.append((key, 0, 0))
-            sorted_indices = sorted(range(len(sort_keys)), key=lambda i: sort_keys[i])
+            sorted_indices = sorted(range(len(batch.keys)), key=lambda i: _parse_key(batch.keys[i]))
 
             inputs = [inputs[i] for i in sorted_indices]
             outputs = [outputs[i] for i in sorted_indices]
@@ -1248,37 +1237,6 @@ class PPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=rollout_data_dir,
             )
-
-    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns) -> dict[str, float]:
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
-        # with multiple sources (e.g. difficulty bands) also log the combined total under "all"
-        if len(set(data_sources)) > 1:
-            merged = process_validation_metrics(["all"] * len(data_sources), sample_uids, reward_extra_infos_dict)
-            data_src2var2metric2val.update(merged)
-        metric_dict = {}
-        for data_source, var2metric2val in data_src2var2metric2val.items():
-            core_var = "acc" if "acc" in var2metric2val else "reward"
-            for var_name, metric2val in var2metric2val.items():
-                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
-                for metric_name, metric_val in metric2val.items():
-                    if (
-                        (var_name == core_var)
-                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
-                        and (f"@{n_max}" in metric_name)
-                    ):
-                        metric_sec = "val-core"
-                    else:
-                        metric_sec = "val-aux"
-                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
-                    metric_dict[pfx] = metric_val
-
-        if len(sample_turns) > 0:
-            sample_turns = np.array(sample_turns)
-            metric_dict["val-aux/num_turns/min"] = sample_turns.min()
-            metric_dict["val-aux/num_turns/max"] = sample_turns.max()
-            metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
-
-        return metric_dict
 
     def _start_profiling(self) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
@@ -1317,11 +1275,6 @@ class PPOTrainer:
             if self.use_critic:
                 self.critic_wg.stop_profile()
 
-    def _compute_reward_colocate(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
-        """Compute the reward with colocate reward model."""
-        # TODO: add reward model
-        raise NotImplementedError
-
     def _add_remax_reward_baselines(self, batch: KVBatchMeta) -> KVBatchMeta:
         """Attach one greedy baseline reward to every sampled ReMax trajectory."""
         baseline_prefix = "remax_baseline_"
@@ -1329,10 +1282,9 @@ class PPOTrainer:
         all_baseline_keys = []
         final_baseline_key_by_uid: dict[str, tuple[int, str]] = {}
         for key, tag in zip(batch.keys, batch.tags, strict=True):
-            uid, _, index = key.rsplit("_", 2)
+            uid, _, output_index = _parse_key(key)
             if uid.startswith(baseline_prefix):
                 all_baseline_keys.append(key)
-                output_index = int(index)
                 if uid not in final_baseline_key_by_uid or final_baseline_key_by_uid[uid][0] < output_index:
                     final_baseline_key_by_uid[uid] = (output_index, key)
             else:
@@ -1368,488 +1320,97 @@ class PPOTrainer:
         )
 
     def _maybe_build_self_distillation_batch(self, batch: KVBatchMeta, metrics: dict) -> None:
-        """Build SDPO teacher inputs and distillation masks when loss_mode is set to ``sdpo``.
+        """Build the SDPO teacher fields when loss_mode is set to ``sdpo``.
 
-        Mirrors ``RayPPOTrainer._maybe_build_self_distillation_batch``, adapted to TransferQueue:
-        the rollout outputs are read from TQ instead of a ``DataProto`` (``reward_tensor`` and
-        ``reward_extra_infos_dict``, which the legacy trainer receives as arguments, are
-        reconstructed here), and the per-sample teacher sequence (``teacher_input_ids`` = teacher
-        prompt + response) and ``self_distillation_mask`` are written back to TQ instead of
-        returned. The teacher attention mask / position ids are derived and recomputed inside the
-        actor worker (see ``reconstruct_padded_teacher_from_nested``).
-
-        With ``use_turn_feedback``, supervision is hints-only: samples carrying reflection hints
-        ship one spliced teacher sequence (hints inserted before their turns, with
-        ``teacher_seq_meta`` mapping hinted spans back to the response grid) and a per-token
-        distillation mask over those spans; un-hinted samples are not trained at all (degenerate
-        1-token teacher row, zero mask — the teacher still scores them so dp collectives stay
-        in lockstep).
+        The rollout outputs are read from TransferQueue and ``self.sdpo_teacher`` turns them
+        into one no-padding teacher sequence per sample (the actor worker re-pads it and
+        recomputes the attention mask and position ids, see
+        ``reconstruct_padded_teacher_from_nested``), its distillation mask and its loss mask.
+        The per-trajectory row weights and the batch health metrics are shared by both
+        teachers and computed here, then everything is written back to TransferQueue.
         """
-        self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
+        cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-        if self_distillation_cfg is None or loss_mode != "sdpo":
+        if cfg is None or loss_mode != "sdpo":
             return
         from verl.utils.debug_breakpoints import should_break
         if should_break("teacher_build"): breakpoint()
 
-        turn_mode = bool(self_distillation_cfg.use_turn_feedback)
         select_fields = ["responses", "rm_scores", "raw_prompt", "uid", "extra_fields", "response_mask"]
-        if turn_mode:
+        if self.sdpo_teacher.needs_prompts:
             select_fields.append("prompts")
-        data = tq.kv_batch_get(
-            keys=batch.keys,
-            partition_id=batch.partition_id,
-            select_fields=select_fields,
-        )
-
+        data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=select_fields)
         if "raw_prompt" not in data:
             raise ValueError("SDPO requires `raw_prompt` in TransferQueue to build teacher prompts.")
         if "uid" not in data:
             raise ValueError("SDPO requires `uid` in TransferQueue.")
 
-        responses = data["responses"]
         batch_size = len(batch.keys)
-        uids = list(data["uid"])
-        reward_tensor = data["rm_scores"].to_padded_tensor(padding=0.0)
-        reward_extra_infos_dict = {
-            "feedback": [
-                extra_field.get("reward_extra_info", {}).get("feedback") if isinstance(extra_field, dict) else None
-                for extra_field in data["extra_fields"]
-            ]
-        }
-
-        response_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in responses.unbind()]
-        raw_prompts = list(data["raw_prompt"])
-
-        prompt_texts = [sdpo_teacher.extract_prompt_text(raw_prompt) for raw_prompt in raw_prompts]
-
-        feedback_list = sdpo_teacher.collect_feedback(
-            include_environment_feedback=self_distillation_cfg.include_environment_feedback,
-            reward_extra_infos_dict=reward_extra_infos_dict,
+        extra_fields = [ef if isinstance(ef, dict) else {} for ef in data["extra_fields"]]
+        seq_scores = data["rm_scores"].to_padded_tensor(padding=0.0).sum(dim=-1).tolist()
+        feedback = collect_feedback(
+            include_environment_feedback=cfg.include_environment_feedback,
+            reward_extra_infos_dict={
+                "feedback": [ef.get("reward_extra_info", {}).get("feedback") for ef in extra_fields]
+            },
             batch_size=batch_size,
         )
-
-        success_by_uid = sdpo_teacher.collect_solutions_by_uid(
-            uids,
-            reward_tensor,
-            success_reward_threshold=self_distillation_cfg.success_reward_threshold,
+        inputs = TeacherInputs(
+            keys=list(batch.keys),
+            prompts=list(data["prompts"].unbind()) if self.sdpo_teacher.needs_prompts else None,
+            responses=list(data["responses"].unbind()),
+            response_mask=list(data["response_mask"].unbind()),
+            raw_prompts=list(data["raw_prompt"]),
+            uids=list(data["uid"]),
+            seq_scores=seq_scores,
+            feedback=feedback,
+            extra_fields=extra_fields,
         )
-        extra_fields_list = list(data["extra_fields"])
-        contexts = [
-            sdpo_teacher.TeacherSampleContext(
-                raw_prompt=raw_prompts[i],
-                prompt_text=prompt_texts[i],
-                solution=sdpo_teacher.select_solution(
-                    i,
-                    success_by_uid,
-                    uids,
-                    response_texts,
-                    self_distillation_cfg.dont_reprompt_on_self_success,
-                    self_distillation_cfg.remove_thinking_from_demonstration,
-                ),
-                feedback=feedback_list[i],
-                extra_fields=extra_fields_list[i] if isinstance(extra_fields_list[i], dict) else {},
-            )
-            for i in range(batch_size)
-        ]
+        teacher = self.sdpo_teacher.build(inputs)
+        fields = dict(teacher.fields)
 
-        # Turn mode is hints-only: hinted samples get a spliced per-sample teacher sequence, the
-        # rest a degenerate 1-token row (untrained). Non-turn mode keeps the legacy reprompt context.
-        response_list = list(responses.unbind())
-        response_mask_list = list(data["response_mask"].unbind())
-        hinted_per_row = [
-            sdpo_teacher.select_hinted_turns(
-                ctx.extra_fields, response_list[i].shape[0], self_distillation_cfg.max_hinted_turns
-            )
-            if turn_mode
-            else []
-            for i, ctx in enumerate(contexts)
-        ]
-        # Hints-only in turn mode: un-hinted rows are not trained, so no reprompt context is built.
-        reprompt_rows = [] if turn_mode else list(range(batch_size))
-
-        messages = [sdpo_teacher.build_teacher_messages(contexts[i], self_distillation_cfg) for i in reprompt_rows]
-        stripped_prompts: dict[int, torch.Tensor] = {}
-        if messages:
-            apply_kwargs = dict(self.config.data.get("apply_chat_template_kwargs", {}))
-            chat_template_kwargs = dict(
-                tokenize=True,
-                return_tensors="pt",
-                return_dict=True,
-                add_generation_prompt=True,
-                max_length=self_distillation_cfg.max_reprompt_len,
-                padding=True,
-                truncation=True,
-                **apply_kwargs,
-            )
-            try:
-                teacher_prompt = self.tokenizer.apply_chat_template(
-                    messages,
-                    continue_final_message=False,
-                    **chat_template_kwargs,
-                )
-            except TypeError:
-                teacher_prompt = self.tokenizer.apply_chat_template(messages, **chat_template_kwargs)
-
-            if isinstance(teacher_prompt, torch.Tensor):
-                teacher_prompt_input_ids = teacher_prompt
-                pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-                teacher_prompt_attention_mask = (teacher_prompt_input_ids != pad_token_id).to(dtype=torch.long)
-            else:
-                teacher_prompt_input_ids = teacher_prompt["input_ids"]
-                teacher_prompt_attention_mask = teacher_prompt.get("attention_mask")
-                if teacher_prompt_attention_mask is None:
-                    teacher_prompt_attention_mask = torch.ones_like(teacher_prompt_input_ids, dtype=torch.long)
-            stripped_prompts = {
-                row: teacher_prompt_input_ids[j][teacher_prompt_attention_mask[j].bool()]
-                for j, row in enumerate(reprompt_rows)
-            }
-
-        feedback_used = [sdpo_teacher.feedback_used(ctx, self_distillation_cfg) for ctx in contexts]
-        legacy_mask = [ctx.solution is not None or used for ctx, used in zip(contexts, feedback_used, strict=True)]
-
-        # The legacy trainer builds teacher_input_ids = cat(teacher_prompt, responses) together with
-        # the teacher attention mask and position ids. Here we store only the no-padding teacher
-        # sequence per sample (the teacher prompt, stripped of its left padding, followed by the real
-        # response tokens); the actor worker re-pads it and recomputes the mask / position ids.
-        if turn_mode:
-            # teacher_seq_meta maps spliced positions back to the response grid (verl.trainer.ppo.sdpo.teacher_meta)
-            prompt_list = data["prompts"].unbind()
-            template_kwargs = dict(self_distillation_cfg.chat_template_kwargs)
-            header_ids = torch.tensor(
-                sdpo_teacher.assistant_header_ids(self.tokenizer, template_kwargs=template_kwargs), dtype=torch.int64
-            )
-            # call-placed splices close the assistant turn and reopen it after the hint; the
-            # call span starts at the template's tool-call opening token
-            close_ids = torch.tensor(
-                self.tokenizer.encode(self.tokenizer.eos_token + "\n", add_special_tokens=False), dtype=torch.int64
-            )
-            call_open_ids = torch.tensor(
-                self.tokenizer.encode("<tool_call>", add_special_tokens=False), dtype=torch.int64
-            )
-
-            teacher_seqs, seq_meta, mask_rows = [], [], []
-            hint_fallbacks = 0
-            from verl.utils.debug_breakpoints import should_break
-            for i in range(batch_size):
-                response_ids = response_list[i]
-                if hinted_per_row[i]:
-                    if should_break("teacher_build"): breakpoint()
-                    hint_ids = [
-                        sdpo_teacher.hint_token_ids(self.tokenizer, hint, self_distillation_cfg, template_kwargs)
-                        for hint in hinted_per_row[i]
-                    ]
-                    seq, meta, fallbacks, spans = sdpo_teacher.build_spliced_teacher_row(
-                        prompt_list[i],
-                        response_ids,
-                        hinted_per_row[i],
-                        hint_ids,
-                        # the spliced prefix is the student's real prompt (segment rows reach ~24k):
-                        # cap with the student's own prompt budget, not the legacy reprompt one
-                        self.config.data.max_prompt_length,
-                        header_ids,
-                        close_ids=close_ids,
-                        call_open_ids=call_open_ids,
-                    )
-                    hint_fallbacks += fallbacks
-                    mask_row = sdpo_teacher.turn_token_mask(response_ids.shape[0], spans)
-                else:
-                    # hints-only: degenerate 1-token teacher row (padding-template pattern), zero mask.
-                    # The teacher must still score every row so dp-group collectives stay in lockstep.
-                    seq = torch.cat([prompt_list[i][-1:], response_ids[:1]])
-                    meta = DEGENERATE_META
-                    mask_row = torch.zeros(response_ids.shape[0], dtype=torch.float32)
-                teacher_seqs.append(seq)
-                seq_meta.append(torch.tensor(meta, dtype=torch.int64))
-                mask_rows.append(mask_row)
-            teacher_fields = {
-                "teacher_input_ids": torch.nested.nested_tensor(teacher_seqs, layout=torch.jagged),
-                "teacher_seq_meta": torch.nested.nested_tensor(seq_meta, layout=torch.jagged),
-                "self_distillation_mask": torch.nested.nested_tensor(mask_rows, layout=torch.jagged),
-            }
-        else:
-            teacher_input_ids = torch.nested.nested_tensor(
-                [torch.cat([stripped_prompts[i], response_list[i]]) for i in range(batch_size)],
-                layout=torch.jagged,
-            )
-            teacher_fields = {
-                "teacher_input_ids": teacher_input_ids,
-                "self_distillation_mask": torch.tensor(legacy_mask, dtype=torch.float32),
-            }
-
-        # loss_mask = supervised mask: batch_num_tokens all-reduces to the global supervised-token count
-        if turn_mode:
-            loss_mask_rows = [
-                response_mask_list[i] * mask_rows[i].to(response_mask_list[i].dtype) for i in range(batch_size)
-            ]
-        else:
-            loss_mask_rows = [response_mask_list[i] * int(legacy_mask[i]) for i in range(batch_size)]
-        teacher_fields["loss_mask"] = torch.nested.nested_tensor(loss_mask_rows, layout=torch.jagged)
-
-        # A condensed trajectory ships one row per segment; segment_index==0 marks it once so
-        # fractions count trajectories rather than segments (long, failing traces split most).
-        num_segments_per_row = [
-            max(1, int((ef or {}).get("num_segments", 1) or 1)) if isinstance(ef, dict) else 1
-            for ef in extra_fields_list
-        ]
-        first_seg = [
-            i
-            for i, ef in enumerate(extra_fields_list)
-            if not isinstance(ef, dict) or int(ef.get("segment_index", 0) or 0) == 0
-        ]
         # A trajectory counts once in total, and its segments split that weight by how much
         # supervision each carries: the loss is then a token-mean within a trajectory and a plain
         # mean across trajectories. Splitting evenly instead would over-weight a segment that only
-        # holds one short hinted turn. Keys are '{sample}_{session}_{segment}'.
-        supervised_per_row = [float(mask.sum()) for mask in loss_mask_rows]
-        traj_of_row = [tuple(key.rsplit("_", 2)[:2]) for key in batch.keys]
-        n_traces = len(set(traj_of_row))
-        # call-hinted rows carry ~10x the per-token divergence of turn-hinted ones, so they
-        # dominate the update at equal row weight; call_loss_weight rebalances the two channels
-        call_row = [any(hint.is_call for hint in hinted_per_row[i]) for i in range(batch_size)]
-        # Renormalized to the supervised-row count: raw shares sum to the number of supervised
-        # trajectories, which would otherwise shrink the update by the average segments-per-
-        # trajectory (~0.6x at our condensation rate) and confound comparisons across runs.
-        weights = sdpo_teacher.trace_weights(
-            supervised_per_row, traj_of_row, call_row,
-            self_distillation_cfg.call_loss_weight if turn_mode else 1.0,
-        )
-        teacher_fields["trace_weight"] = torch.tensor(weights, dtype=torch.float32).unsqueeze(-1)
+        # holds one short hinted turn. Renormalized to the supervised-row count: raw shares sum to
+        # the number of supervised trajectories, which would otherwise shrink the update by the
+        # average segments-per-trajectory (~0.6x at our condensation rate) and confound
+        # comparisons across runs. call_loss_weight rebalances the two hint channels, since
+        # call-hinted rows carry ~10x the per-token divergence of turn-hinted ones.
+        supervised_per_row = [float(mask.sum()) for mask in fields["loss_mask"].unbind()]
+        traj_of_row = [_session_key(key) for key in batch.keys]
+        hinted_per_row = teacher.hinted_per_row or [[] for _ in batch.keys]
+        call_row = [any(hint.is_call for hint in hinted) for hinted in hinted_per_row]
+        weights = trace_weights(supervised_per_row, traj_of_row, call_row, cfg.call_loss_weight)
+        fields["trace_weight"] = torch.tensor(weights, dtype=torch.float32).unsqueeze(-1)
         # Row -> trajectory, as a plain int the update path can carry: mini-batches are cut
         # from shuffled rows, so a condensed trajectory's supervised segments land in
         # different optimizer steps even though their weights are a single trajectory's share.
         traj_ids = {traj: i for i, traj in enumerate(dict.fromkeys(traj_of_row))}
-        teacher_fields["traj_id"] = torch.tensor(
-            [traj_ids[traj] for traj in traj_of_row], dtype=torch.int64
-        ).unsqueeze(-1)
+        fields["traj_id"] = torch.tensor([traj_ids[traj] for traj in traj_of_row], dtype=torch.int64).unsqueeze(-1)
 
-        segs_per_traj = Counter(traj_of_row)
-        sup_segs_per_traj = Counter(traj for traj, n in zip(traj_of_row, supervised_per_row) if n > 0)
-        unsup_rows = [i for i, n in enumerate(supervised_per_row) if n == 0]
+        supervised_rows = [bool(mask.sum() > 0) for mask in fields["self_distillation_mask"].unbind()]
         metrics.update(
-            {
-                "self_distillation/rows_per_step": float(batch_size),
-                "self_distillation/traces_per_step": float(n_traces),
-                "self_distillation/segments_per_trace_max": float(max(segs_per_traj.values(), default=0)),
-                "self_distillation/supervised_segments_per_trace_max": float(
-                    max(sup_segs_per_traj.values(), default=0)
-                ),
-                # rows that run a full student forward+backward for zero gradient
-                "self_distillation/unsupervised_row_fraction": len(unsup_rows) / max(batch_size, 1),
-                "self_distillation/unsupervised_row_tokens": float(
-                    sum(int(response_mask_list[i].sum()) for i in unsup_rows)
-                ),
-                "self_distillation/supervised_row_tokens": float(
-                    sum(int(response_mask_list[i].sum()) for i in range(batch_size) if supervised_per_row[i] > 0)
-                ),
-            }
-        )
-
-        unique_uids = set(uids)
-        num_with_feedback_available = sum(1 for i in first_seg if feedback_list[i] is not None)
-        num_with_feedback_used = sum(1 for i in first_seg if feedback_used[i])
-        num_with_solution = sum(1 for i in first_seg if contexts[i].solution is not None)
-        num_supervised = sum(
-            1 for i in range(batch_size) if hinted_per_row[i] or (not turn_mode and legacy_mask[i])
+            health.batch_metrics(supervised_per_row, supervised_rows, inputs.response_mask, traj_of_row, extra_fields)
         )
         metrics.update(
-            {
-                "self_distillation/success_group_fraction": len(
-                    [uid for uid in unique_uids if len(success_by_uid[uid]) > 0]
-                )
-                / len(unique_uids),
-                "self_distillation/success_sample_fraction": num_with_solution / n_traces,
-                "self_distillation/feedback_available_fraction": num_with_feedback_available / n_traces,
-                "self_distillation/feedback_used_fraction": num_with_feedback_used / n_traces,
-                "self_distillation/reprompt_sample_fraction": num_supervised / batch_size,
-            }
+            health.supervision_source_metrics(inputs.uids, seq_scores, feedback, extra_fields, traj_of_row, cfg)
         )
-        metrics.update(
-            self._condensation_metrics(
-                extra_fields_list, num_segments_per_row, reward_tensor, traj_of_row,
-                self_distillation_cfg.success_reward_threshold,
-            )
-        )
-        metrics.update(self._trajectory_timing_metrics(extra_fields_list))
-        # decode throughput needs the generated count: response_length also holds the observations
-        # fed back to the agent, which are ~3x the tokens the model actually produced
-        generated = sum(
-            sum(int(span[2]) - int(span[1]) for span in (ef if isinstance(ef, dict) else {}).get("turn_spans") or [])
-            for ef in extra_fields_list
-        )
-        metrics["rollout/generated_tokens"] = float(generated)
-        metrics["rollout/generated_tokens_per_trace"] = generated / n_traces if n_traces else 0.0
-        if turn_mode:
-            num_hinted = sum(1 for hinted in hinted_per_row if hinted)
-            hinted_traces = {traj_of_row[i] for i, hinted in enumerate(hinted_per_row) if hinted}
+        metrics.update(teacher.metrics)
+        metrics.update(health.condensation_metrics(extra_fields, seq_scores, cfg.success_reward_threshold))
+        metrics.update(health.trajectory_timing_metrics(extra_fields))
+        if teacher.hinted_per_row is not None:
             metrics.update(
-                {
-                    "self_distillation/hinted_sample_fraction": num_hinted / batch_size,
-                    "self_distillation/hinted_trace_fraction": len(hinted_traces) / n_traces,
-                    "self_distillation/hinted_turns_per_sample": (
-                        sum(len(hinted) for hinted in hinted_per_row) / num_hinted if num_hinted else 0.0
-                    ),
-                    "self_distillation/hinted_turns_per_trace": (
-                        sum(len(hinted) for hinted in hinted_per_row) / len(hinted_traces) if hinted_traces else 0.0
-                    ),
-                    "self_distillation/hint_injection_fallbacks": hint_fallbacks,
-                    # the two supervision channels, as the loss actually weighs them
-                    "self_distillation/call_row_fraction": (
-                        sum(1 for i, c in enumerate(call_row) if c and supervised_per_row[i] > 0)
-                        / max(sum(1 for n in supervised_per_row if n > 0), 1)
-                    ),
-                    "self_distillation/call_row_weight_share": (
-                        sum(w for w, c in zip(weights, call_row, strict=True) if c)
-                        / max(sum(weights), 1e-8)
-                    ),
-                    "self_distillation/call_loss_weight": float(
-                        self_distillation_cfg.call_loss_weight
-                    ),
-                }
+                health.hint_metrics(
+                    teacher.hinted_per_row, extra_fields, traj_of_row, supervised_per_row, weights, call_row
+                )
             )
-            metrics.update(self._hint_position_metrics(hinted_per_row, extra_fields_list, traj_of_row))
 
         tq.kv_batch_put(
             keys=batch.keys,
             partition_id=batch.partition_id,
-            fields=TensorDict(teacher_fields, batch_size=batch_size),
+            fields=TensorDict(fields, batch_size=batch_size),
         )
-
-    @staticmethod
-    def _condensation_metrics(
-        extra_fields_list, num_segments_per_row, reward_tensor, traj_of_row, success_threshold
-    ) -> dict:
-        """Condensation reach and whether it predicts the outcome.
-
-        Rows are segments; a trajectory is its segment_index==0 row, and all its segments carry
-        the same reward, so per-trace stats read off the first-segment rows.
-        """
-        seq_scores = reward_tensor.sum(dim=-1).detach().cpu().tolist()
-        traces, turns_by_seg = [], defaultdict(list)
-        for i, ef in enumerate(extra_fields_list):
-            ef = ef if isinstance(ef, dict) else {}
-            seg_idx = int(ef.get("segment_index", 0) or 0)
-            spans = ef.get("turn_spans") or []
-            if spans:  # failed rollouts ship empty rows; counting them as 0 turns skews the mean
-                turns_by_seg[min(seg_idx, 3)].append(len(spans))
-            if seg_idx == 0:
-                traces.append((num_segments_per_row[i], seq_scores[i], ef.get("traj_exit_reason")))
-        if not traces:
-            return {}
-        n = len(traces)
-        solved = lambda score: score >= success_threshold  # noqa: E731
-        out = {
-            "rollout/condensed_trace_fraction": sum(1 for s, _, _ in traces if s > 1) / n,
-            "rollout/segments_per_trace": sum(s for s, _, _ in traces) / n,
-        }
-        for bucket in (1, 2, 3):
-            sel = [sc for s, sc, _ in traces if (s == bucket if bucket < 3 else s >= 3)]
-            name = f"{bucket}seg" if bucket < 3 else "3plusseg"
-            if sel:
-                out[f"rollout/solve_rate_{name}"] = sum(1 for sc in sel if solved(sc)) / len(sel)
-                out[f"rollout/trace_fraction_{name}"] = len(sel) / n
-        reasons = [r for _, _, r in traces if r]
-        for reason in set(reasons):
-            sub = [sc for _, sc, r in traces if r == reason]
-            out[f"rollout/exit_{reason}_fraction"] = len(sub) / n
-            out[f"rollout/solve_rate_exit_{reason}"] = sum(1 for sc in sub if solved(sc)) / len(sub)
-        for seg_idx, counts in sorted(turns_by_seg.items()):
-            name = str(seg_idx) if seg_idx < 3 else "3plus"
-            out[f"rollout/turns_in_segment_{name}"] = sum(counts) / len(counts)
-        return out
-
-    @staticmethod
-    def _trajectory_timing_metrics(extra_fields_list) -> dict:
-        """Per-trajectory time split. The residual (loop_wall minus the parts) is the in-loop
-        overhead we have not attributed yet; step wall clock is set by the slowest trajectory,
-        so the max matters more than the mean."""
-        rows = [
-            (ef or {}).get("timings") or {}
-            for ef in extra_fields_list
-            if isinstance(ef, dict) and int((ef or {}).get("segment_index", 0) or 0) == 0
-        ]
-        rows = [t for t in rows if t.get("loop_wall")]
-        if not rows:
-            return {}
-        parts = ("generate_sequences", "tool_calls", "condense", "parse_action", "tokenize_observations")
-        out = {}
-        for key in parts + ("loop_wall", "env_setup", "reward_eval", "reflect"):
-            vals = [float(t.get(key, 0.0)) for t in rows]
-            out[f"traj_time/{key}_mean"] = sum(vals) / len(vals)
-        residual = [
-            max(0.0, float(t.get("loop_wall", 0.0)) - sum(float(t.get(k, 0.0)) for k in parts)) for t in rows
-        ]
-        totals = [
-            float(t.get("loop_wall", 0.0))
-            + float(t.get("env_setup", 0.0))
-            + float(t.get("reward_eval", 0.0))
-            + float(t.get("reflect", 0.0))
-            for t in rows
-        ]
-        # vLLM preemption count per trajectory: >0 means the KV cache could not hold the
-        # working set, so sequences were evicted and their prefill recomputed (wasted GPU
-        # work that shows up as high utilization with low goodput). -1 = engine did not report.
-        preempted = [float(t.get("num_preempted", -1)) for t in rows]
-        reported = [p for p in preempted if p >= 0]
-        out["rollout/preempted_reported_fraction"] = len(reported) / len(preempted)
-        if reported:
-            out["rollout/preempted_mean"] = sum(reported) / len(reported)
-            out["rollout/preempted_max"] = max(reported)
-            out["rollout/preempted_trace_fraction"] = sum(1 for p in reported if p > 0) / len(reported)
-        out["traj_time/unattributed_mean"] = sum(residual) / len(residual)
-        out["traj_time/total_mean"] = sum(totals) / len(totals)
-        out["traj_time/total_max"] = max(totals)
-        # the spread between these is the idle tail: the phase lasts as long as the max
-        ordered = sorted(totals)
-        out["traj_time/total_p50"] = ordered[len(ordered) // 2]
-        out["traj_time/total_p90"] = ordered[min(len(ordered) - 1, int(0.9 * len(ordered)))]
-        # the slowest trajectory sets the step's wall clock, so its own split is what matters
-        slowest = rows[max(range(len(rows)), key=lambda i: totals[i])]
-        for key in parts + ("loop_wall", "env_setup", "reward_eval", "reflect"):
-            out[f"traj_time/slowest_{key}"] = float(slowest.get(key, 0.0))
-        out["traj_time/unattributed_share"] = sum(residual) / max(sum(totals), 1e-6)
-        for key in ("eval_completed", "patch_apply_failed", "empty_patch", "reflect_failed", "reflect_empty"):
-            vals = [float(t[key]) for t in rows if key in t]  # absent means never measured, not OK
-            if vals:
-                out[f"reward_health/{key}_fraction"] = sum(vals) / len(vals)
-        capped = [float(t.get("capped_turns", 0.0)) for t in rows]
-        out["reward_health/capped_turns_mean"] = sum(capped) / len(capped)
-        out["reward_health/capped_rollouts_fraction"] = sum(1.0 for c in capped if c > 0) / len(capped)
-        return out
-
-    @staticmethod
-    def _hint_position_metrics(hinted_per_row, extra_fields_list, traj_of_row) -> dict:
-        """Where in a trajectory the hints land: late hints supervise turns nothing can still fix.
-
-        Step ranges are pooled per trajectory, since a condensed trace splits its turns across
-        rows and a per-row range would call every segment-final hint a last-turn hint.
-        """
-        traj_steps = defaultdict(list)
-        for traj, ef in zip(traj_of_row, extra_fields_list, strict=True):
-            spans = (ef if isinstance(ef, dict) else {}).get("turn_spans") or []
-            traj_steps[traj].extend(int(span[0]) for span in spans)
-        rel, gaps, last_two = [], [], 0
-        for hinted, traj in zip(hinted_per_row, traj_of_row, strict=True):
-            steps = sorted(traj_steps.get(traj) or [0])
-            lo, hi = steps[0], steps[-1]
-            span_len = max(hi - lo, 1)
-            hinted_steps = sorted(hint.step for hint in hinted)
-            rel.extend((step - lo) / span_len for step in hinted_steps)
-            gaps.extend(b - a for a, b in zip(hinted_steps, hinted_steps[1:]))
-            last_two += sum(1 for step in hinted_steps if step >= hi - 1)
-        if not rel:
-            return {}
-        srt = sorted(rel)
-        return {
-            "self_distillation/hint_position_mean": sum(rel) / len(rel),
-            "self_distillation/hint_position_median": srt[len(srt) // 2],
-            "self_distillation/hint_position_first_half": sum(1 for r in rel if r <= 0.5) / len(rel),
-            "self_distillation/hint_in_last_two_turns": last_two / len(rel),
-            "self_distillation/hint_gap_mean": (sum(gaps) / len(gaps)) if gaps else 0.0,
-            "self_distillation/hint_adjacent_fraction": (
-                (sum(1 for g in gaps if g <= 2) / len(gaps)) if gaps else 0.0
-            ),
-        }
 
     def _get_required_batch_multiple(self, dp_size: int) -> int:
         """Return the global batch multiple required by downstream train steps(e.g. critics, actors)."""
@@ -1870,16 +1431,15 @@ class PPOTrainer:
         # Notice lcm(a, b, c) == lcm(lcm(a, b), c), so it is optimal.
         return required_multiple
 
+    def _get_dp_size(self, worker_group, role: str) -> int:
+        """Data parallel size of ``role`` from the worker group's dispatch info (cached there)."""
+        if role not in worker_group._dispatch_info:
+            worker_group._dispatch_info[role] = worker_group._query_dispatch_info(role)
+        return max(worker_group._dispatch_info[role]) + 1
+
     def _balance_batch(self, batch: KVBatchMeta, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens."""
-        # get actor dp size
-        role, worker_group = "actor", self.actor_rollout_wg
-        if role not in worker_group._dispatch_info:
-            dp_rank_mapping = worker_group._query_dispatch_info(role)
-            worker_group._dispatch_info[role] = dp_rank_mapping
-        else:
-            dp_rank_mapping = worker_group._dispatch_info[role]
-        dp_size = max(dp_rank_mapping) + 1
+        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
 
         # Upsampling the batch with padding sequences
         batch_multiple = self._get_required_batch_multiple(dp_size)
@@ -2111,10 +1671,7 @@ class PPOTrainer:
             fields=batch.fields,
             extra_info=batch.extra_info,
         )
-        role, worker_group = "actor", self.actor_rollout_wg
-        if role not in worker_group._dispatch_info:
-            worker_group._dispatch_info[role] = worker_group._query_dispatch_info(role)
-        dp_size = max(worker_group._dispatch_info[role]) + 1
+        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
         return upsample_batch_to_divisible_size(
             batch, self._get_required_batch_multiple(dp_size), self.tokenizer.eos_token_id
         )
@@ -2376,11 +1933,6 @@ class PPOTrainer:
             batch = self.replay_buffer.sample(partition_id="train", global_steps=self.global_steps)
         batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         self.checkpoint_manager.sleep_replicas()
-
-        # 3. [OPTIONAL] compute reward score with colocated reward model
-        if self.reward_loop_manager.reward_loop_worker_handles is None:
-            with marked_timer("reward", timing_raw, color="yellow"):
-                batch = self._compute_reward_colocate(batch)
 
         if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.REMAX:
             batch = self._add_remax_reward_baselines(batch)

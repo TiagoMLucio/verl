@@ -18,7 +18,8 @@ isn't where expected. Meta must keep mapping each span's verbatim tokens on the 
 import pytest
 import torch
 
-from verl.trainer.ppo.sdpo_teacher import HintedTurn, build_spliced_teacher_row
+from verl.trainer.ppo.sdpo.hints import HintedTurn
+from verl.trainer.ppo.sdpo.splice import build_spliced_teacher_row
 
 HEADER = torch.tensor([90, 91, 92], dtype=torch.int64)
 
@@ -129,7 +130,7 @@ def test_call_hint_splices_between_reasoning_and_call():
     assert torch.equal(seq, expected), "close + hint + header must sit between reasoning and call"
     assert spans == [(4, 10)], "only the call tokens are scored"
     assert meta == [1, seq.shape[0], seq.shape[0] - 10, 4 + 2 + 2 + 3, 4, 10]
-    from verl.trainer.ppo.sdpo_teacher import turn_token_mask
+    from verl.trainer.ppo.sdpo.splice import turn_token_mask
     mask = turn_token_mask(10, spans)
     assert mask.tolist() == [0, 0, 0, 0, 1, 1, 1, 1, 1, 1]
 
@@ -164,7 +165,7 @@ def test_call_hint_without_splice_ids_falls_back():
 
 
 def test_select_hinted_turns_reads_call_placement():
-    from verl.trainer.ppo.sdpo_teacher import select_hinted_turns
+    from verl.trainer.ppo.sdpo.hints import select_hinted_turns
 
     extra = {"turn_spans": [[0, 0, 4], [1, 4, 9]],
              "turn_feedback": [[0, "a"], [1, "b", "call"], ]}
@@ -176,7 +177,7 @@ def test_select_hinted_turns_reads_call_placement():
 
 # --- channel balance (call_loss_weight) ----------------------------------------------------
 
-from verl.trainer.ppo.sdpo_teacher import trace_weights
+from verl.trainer.ppo.sdpo.splice import trace_weights
 
 
 def test_trace_weights_default_matches_one_per_supervised_row():

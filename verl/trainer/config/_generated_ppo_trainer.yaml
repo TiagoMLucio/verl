@@ -144,11 +144,30 @@ actor_rollout_ref:
       success_reward_threshold: 0.5
       teacher_regularization: ema
       teacher_update_rate: 0.05
+      is_clip: 2
+      teacher: reprompt
+      chat_template_kwargs: {}
+      turn_hint_template: '[Guidance for your next action: {hint}
+
+        Work out in your own words what this implies for the current state before
+        you act, then take the action it points to. Do not acknowledge it, thank anyone
+        for it, quote it, or refer to it: it is not part of the conversation, and
+        the turn you write must read as if it were never sent.]
+
+        '
+      call_hint_template: '[A note on the tool call you are about to write: {hint}
+
+        Continue exactly where you left off: your next output is the tool call itself
+        - no reply, no acknowledgement, no further reasoning, as if this note were
+        never sent.]
+
+        '
+      max_hinted_turns: null
+      call_loss_weight: 1.0
       max_reprompt_len: 10240
       reprompt_truncation: right
       dont_reprompt_on_self_success: true
       remove_thinking_from_demonstration: true
-      is_clip: 2
       reprompt_template: '{prompt}{solution}{feedback}
 
 
@@ -175,25 +194,6 @@ actor_rollout_ref:
         '
       include_environment_feedback: true
       environment_feedback_only_without_solution: true
-      use_turn_feedback: false
-      chat_template_kwargs: {}
-      turn_feedback_template: '[Guidance for your next action: {diagnosis}
-
-        Work out in your own words what this implies for the current state before
-        you act, then take the action it points to. Do not acknowledge it, thank anyone
-        for it, quote it, or refer to it: it is not part of the conversation, and
-        the turn you write must read as if it were never sent.]
-
-        '
-      call_feedback_template: '[A note on the tool call you are about to write: {diagnosis}
-
-        Continue exactly where you left off: your next output is the tool call itself
-        - no reply, no acknowledgement, no further reasoning, as if this note were
-        never sent.]
-
-        '
-      max_hinted_turns: null
-      call_loss_weight: 1.0
     router_replay:
       _target_: verl.workers.config.RouterReplayConfig
       mode: disabled

@@ -21,8 +21,9 @@ Runs under pytest, or as ``python tests/trainer/test_teacher_subrows.py``.
 
 import torch
 
+from verl.trainer.ppo.sdpo.hints import HintedTurn
+from verl.trainer.ppo.sdpo.splice import build_spliced_teacher_row
 from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META, SubRowSpan
-from verl.trainer.ppo.sdpo_teacher import HintedTurn, build_spliced_teacher_row
 from verl.workers.utils.sdpo import explode_turn_teacher_rows, response_keep_positions
 
 HEADER = torch.tensor([90, 91])
