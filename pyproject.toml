@@ -63,6 +63,8 @@ ignore = [
     "UP045",
     # deprecated import
     "UP035",
+    # `if should_break(...): breakpoint()` one-liners (verl/utils/debug_breakpoints.py)
+    "E701",
 ]
 
 # -------------------------------

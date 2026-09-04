@@ -222,6 +222,13 @@ def test_turn_mode_update_path_backprops(single_process_group, cpu_ops):
         val = m.aggregate() if hasattr(m, "aggregate") else m
         val = val if isinstance(val, torch.Tensor) else torch.tensor(float(val))
         assert torch.isfinite(val).all()
+    # the loss diagnostic is the same per-micro-batch share as pg_loss and adds up the same way
+    diag = outputs["metrics"]["self_distillation/loss"]
+    for m, d in zip(
+        metric if isinstance(metric, list) else [metric], diag if isinstance(diag, list) else [diag], strict=True
+    ):
+        assert d.aggregation == m.aggregation
+        assert float(d.aggregate()) == pytest.approx(float(m.aggregate()))
 
     grads = [p.grad for p in student_engine.module.parameters()]
     assert all(g is not None and torch.isfinite(g).all() for g in grads)

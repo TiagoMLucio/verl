@@ -66,20 +66,14 @@ def segment_prompt_of(extra_fields: dict) -> Optional[list[dict]]:
     return extra_fields.get("segment_prompt") if extra_fields.get("segment_index", 0) else None
 
 
-def collect_feedback(
-    include_environment_feedback: bool,
-    reward_extra_infos_dict: Optional[dict[str, Any]],
-    batch_size: int,
-) -> list[Any]:
-    """Collect non-empty textual environment feedback from reward extras."""
+def collect_feedback(feedback: Any, batch_size: int) -> list[Any]:
+    """The reward's per-row environment feedback, kept only where it is non-empty text."""
     feedback_list: list[Any] = [None] * batch_size
-    if include_environment_feedback and reward_extra_infos_dict is not None:
-        raw_feedback = reward_extra_infos_dict.get("feedback", [])
-        if isinstance(raw_feedback, np.ndarray):
-            raw_feedback = raw_feedback.tolist()
-        for i in range(min(len(raw_feedback), batch_size)):
-            if isinstance(raw_feedback[i], str) and raw_feedback[i].strip():
-                feedback_list[i] = raw_feedback[i]
+    if isinstance(feedback, np.ndarray):
+        feedback = feedback.tolist()
+    for i in range(min(len(feedback), batch_size)):
+        if isinstance(feedback[i], str) and feedback[i].strip():
+            feedback_list[i] = feedback[i]
     return feedback_list
 
 
@@ -171,8 +165,7 @@ def tokenize_reprompt_batch(
     )
     sides = tokenizer.padding_side, tokenizer.truncation_side
     tokenizer.padding_side = "left"
-    if cfg.reprompt_truncation in {"left", "right"}:
-        tokenizer.truncation_side = cfg.reprompt_truncation
+    tokenizer.truncation_side = cfg.reprompt_truncation
     try:
         try:
             teacher_prompt = tokenizer.apply_chat_template(messages, continue_final_message=False, **apply_kwargs)

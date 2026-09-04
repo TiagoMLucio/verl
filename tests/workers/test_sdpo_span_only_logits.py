@@ -63,7 +63,6 @@ def test_keep_positions_match_consumed_positions():
         teacher_input_ids=njt([hinted["teacher_input_ids"], stub["teacher_input_ids"]]),
         teacher_seq_meta=njt([hinted["teacher_seq_meta"], stub["teacher_seq_meta"]]),
         responses=njt([hinted["responses"], stub["responses"]]),
-        response_mask=njt([hinted["response_mask"], stub["response_mask"]]),
     )
     # one sub-row per hint, and every row keeps one (dp-collective lockstep); the stub's is 1 token
     assert [s.parent for s in sub_spans] == [0, 0, 1]

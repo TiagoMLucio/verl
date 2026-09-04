@@ -54,7 +54,9 @@ class SelfDistillationConfig(BaseConfig):
     Distillation is enabled when policy_loss.loss_mode == "sdpo". ``teacher`` picks which
     teacher builds the distillation targets; the keys after it apply only to the teacher
     they are listed under (under "turn_hints", the reprompt keys for the sibling solution
-    and the feedback only feed the supervision-source metrics).
+    and the feedback only feed the supervision-source metrics). The dataclass defaults are
+    the SDPO paper's; ``trainer/config/actor/actor.yaml`` is authoritative for every run and
+    differs on several of them.
 
     Args:
         full_logit_distillation (bool): Whether to use full-logit KL distillation.

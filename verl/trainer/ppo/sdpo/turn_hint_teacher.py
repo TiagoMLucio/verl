@@ -19,15 +19,14 @@ from verl.trainer.ppo.sdpo.batch import TeacherBatch, TeacherInputs
 from verl.trainer.ppo.sdpo.hints import assistant_header_ids, hint_token_ids, select_hinted_turns
 from verl.trainer.ppo.sdpo.splice import build_spliced_teacher_row, turn_token_mask
 from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META
-from verl.utils.debug_breakpoints import should_break
 
 
 class TurnHintTeacher:
     """Supervision is hints-only: a sample carrying reflection hints ships one spliced teacher
     sequence (each hint inserted before its turn, ``teacher_seq_meta`` mapping the scored spans
     back to the response grid) and a per-token distillation mask over those spans. Un-hinted
-    samples are not trained at all: a degenerate 1-token teacher row with a zero mask, scored
-    only so that dp-group collectives stay in lockstep.
+    samples are not trained at all: a degenerate 2-token teacher row (1-token body, ``DEGENERATE_META``)
+    with a zero mask, scored only so that dp-group collectives stay in lockstep.
 
     ``max_prefix_len`` caps the spliced prefix, which is the student's real prompt (segment
     rows reach ~24k): the student's own prompt budget, not the reprompt one.
@@ -51,6 +50,8 @@ class TurnHintTeacher:
         self.call_open_ids = torch.tensor(tokenizer.encode("<tool_call>", add_special_tokens=False), dtype=torch.int64)
 
     def build(self, inputs: TeacherInputs) -> TeacherBatch:
+        from verl.utils.debug_breakpoints import should_break
+
         cfg = self.cfg
         hinted_per_row = [
             select_hinted_turns(extra_fields, response.shape[0], cfg.max_hinted_turns)
@@ -62,7 +63,7 @@ class TurnHintTeacher:
             inputs.prompts, inputs.responses, inputs.response_mask, hinted_per_row, strict=True
         ):
             if hinted:
-                if should_break("teacher_build"): breakpoint()
+                if should_break("teacher_build_row"): breakpoint()
                 hint_ids = [hint_token_ids(self.tokenizer, hint, cfg, self.template_kwargs) for hint in hinted]
                 seq, meta, fallbacks, spans = build_spliced_teacher_row(
                     prompt_ids,

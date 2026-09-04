@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Worker-side half of :mod:`verl.trainer.ppo.sdpo`: re-pad the nested teacher tensors, explode
+spliced rows into sub-rows, mark the span-only logits positions, scatter the teacher outputs
+back to the response grid, and mix the trust-region teacher."""
 
 from types import SimpleNamespace
 
@@ -85,7 +88,7 @@ def explode_turn_teacher_rows(
     teacher_input_ids: torch.Tensor,
     teacher_seq_meta: torch.Tensor,
     responses: torch.Tensor,
-    response_mask: torch.Tensor,
+    mask_dtype: torch.dtype = torch.int64,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[SubRowSpan]]:
     """Unpack per-sample spliced teacher rows into the sub-batch the teacher forward scores.
 
@@ -94,12 +97,11 @@ def explode_turn_teacher_rows(
     One sub-row per hinted turn, each carrying only its own hint, so the teacher never scores
     a turn from a state where its earlier advice was visibly ignored. Un-hinted rows ship a
     degenerate 2-token sub-row: the teacher forward must run on every rank every micro-batch
-    so its dp-group collectives stay in lockstep. Returns nested sequences / bodies / body
-    masks plus one :class:`SubRowSpan` per sub-row.
+    so its dp-group collectives stay in lockstep. Returns nested sequences / bodies / all-ones
+    body presence masks (``mask_dtype``) plus one :class:`SubRowSpan` per sub-row.
     """
     seq_list = teacher_input_ids.unbind()
     meta_list = teacher_seq_meta.unbind()
-    mask_list = response_mask.unbind()
 
     sub_seqs, sub_resps, sub_masks, sub_spans = [], [], [], []
     resp_list = responses.unbind()
@@ -120,7 +122,7 @@ def explode_turn_teacher_rows(
             sub = seq[offset : offset + sub_row.total_len]
             sub_seqs.append(sub)
             sub_resps.append(sub[-sub_row.body_len :])
-            sub_masks.append(mask_list[i].new_ones(sub_row.body_len))
+            sub_masks.append(torch.ones(sub_row.body_len, dtype=mask_dtype, device=sub.device))
             sub_spans.append(SubRowSpan(i, sub_row.body_start, sub_row.start, sub_row.end))
             offset += sub_row.total_len
 
@@ -171,7 +173,7 @@ def response_keep_positions(
 
 
 def attach_response_keep_positions(data) -> None:
-    """Mark the SDPO update pass for span-only logits when turn-mode teacher meta is present."""
+    """Mark the SDPO update pass for span-only logits when spliced teacher meta is present."""
     turn_meta = data.get("teacher_seq_meta", None)
     if turn_meta is not None and turn_meta.is_nested:
         data["logits_keep_positions"] = response_keep_positions(data["input_ids"], data["responses"], turn_meta)

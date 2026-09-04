@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from verl.trainer.ppo.sdpo.hints import HintedTurn
+from verl.trainer.ppo.sdpo.batch import trace_weights
 from verl.trainer.ppo.sdpo.splice import build_spliced_teacher_row
 
 HEADER = torch.tensor([90, 91, 92], dtype=torch.int64)
@@ -176,8 +177,6 @@ def test_select_hinted_turns_reads_call_placement():
 
 
 # --- channel balance (call_loss_weight) ----------------------------------------------------
-
-from verl.trainer.ppo.sdpo.splice import trace_weights
 
 
 def test_trace_weights_default_matches_one_per_supervised_row():

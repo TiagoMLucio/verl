@@ -83,8 +83,8 @@ from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
 from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_advantage, compute_spec_decode_metrics
 from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
 from verl.trainer.ppo.sdpo import TeacherInputs, make_teacher
+from verl.trainer.ppo.sdpo.batch import trace_weights
 from verl.trainer.ppo.sdpo.reprompt import collect_feedback
-from verl.trainer.ppo.sdpo.splice import trace_weights
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_teacher_policy
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils import tensordict_utils as tu
@@ -587,8 +587,8 @@ class PPOTrainer:
             self.sdpo_teacher = make_teacher(
                 self_distillation_cfg,
                 self.tokenizer,
+                max_prefix_len=self.config.data.max_prompt_length,
                 apply_chat_template_kwargs=self.config.data.get("apply_chat_template_kwargs", {}),
-                max_prompt_length=self.config.data.max_prompt_length,
             )
         # Used for multimodal LLM, could be None
         self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
@@ -994,7 +994,7 @@ class PPOTrainer:
                     # how a val rollout ended lives at the top level of extra_fields, next to
                     # reward_extra_info rather than inside it; without it a dumped val
                     # trajectory cannot say whether it submitted, ran out of turns or got
-                    # stuck, which is the whole comparison between arms. Dump-only: the
+                    # stuck, which is the whole comparison between experiments. Dump-only: the
                     # value is a string and process_validation_metrics aggregates numerics.
                     sample_exit_reasons.append(
                         extra_field.get("traj_exit_reason") if isinstance(extra_field, dict) else None
@@ -1348,15 +1348,12 @@ class PPOTrainer:
         batch_size = len(batch.keys)
         extra_fields = [ef if isinstance(ef, dict) else {} for ef in data["extra_fields"]]
         seq_scores = data["rm_scores"].to_padded_tensor(padding=0.0).sum(dim=-1).tolist()
-        feedback = collect_feedback(
-            include_environment_feedback=cfg.include_environment_feedback,
-            reward_extra_infos_dict={
-                "feedback": [ef.get("reward_extra_info", {}).get("feedback") for ef in extra_fields]
-            },
-            batch_size=batch_size,
-        )
+        feedback = [None] * batch_size
+        if cfg.include_environment_feedback:
+            feedback = collect_feedback(
+                [ef.get("reward_extra_info", {}).get("feedback") for ef in extra_fields], batch_size
+            )
         inputs = TeacherInputs(
-            keys=list(batch.keys),
             prompts=list(data["prompts"].unbind()) if self.sdpo_teacher.needs_prompts else None,
             responses=list(data["responses"].unbind()),
             response_mask=list(data["response_mask"].unbind()),
@@ -1369,14 +1366,7 @@ class PPOTrainer:
         teacher = self.sdpo_teacher.build(inputs)
         fields = dict(teacher.fields)
 
-        # A trajectory counts once in total, and its segments split that weight by how much
-        # supervision each carries: the loss is then a token-mean within a trajectory and a plain
-        # mean across trajectories. Splitting evenly instead would over-weight a segment that only
-        # holds one short hinted turn. Renormalized to the supervised-row count: raw shares sum to
-        # the number of supervised trajectories, which would otherwise shrink the update by the
-        # average segments-per-trajectory (~0.6x at our condensation rate) and confound
-        # comparisons across runs. call_loss_weight rebalances the two hint channels, since
-        # call-hinted rows carry ~10x the per-token divergence of turn-hinted ones.
+        # call-hinted rows carry ~10x the per-token divergence of turn-hinted ones
         supervised_per_row = [float(mask.sum()) for mask in fields["loss_mask"].unbind()]
         traj_of_row = [_session_key(key) for key in batch.keys]
         hinted_per_row = teacher.hinted_per_row or [[] for _ in batch.keys]
@@ -1723,7 +1713,7 @@ class PPOTrainer:
         non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool)
         # One row per trajectory = each session's final segment. Trajectory-level metrics
         # (reward, num_turns) must use these, else they are weighted by segment count.
-        mb_keys = [k for k, keep in zip(batch.keys, non_padding_mask) if keep]
+        mb_keys = [k for k, keep in zip(batch.keys, non_padding_mask, strict=True) if keep]
         final_seg_idx = _final_segment_local_indices(mb_keys)
         multi_segment = 0 < len(final_seg_idx) < len(mb_keys)
         fields = [

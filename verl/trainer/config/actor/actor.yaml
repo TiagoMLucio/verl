@@ -263,7 +263,7 @@ profiler:
       # Whether to fail on unknown stage or missing msprobe
       strict: ${oc.select:global_profiler.global_tool_config.precision_debugger.strict,False}
 
-# Self-distillation (SDPO) configuration — only active when policy_loss.loss_mode == "sdpo"
+# Self-distillation (SDPO) configuration: only active when policy_loss.loss_mode == "sdpo"
 self_distillation:
 
   # Target dataclass for this configuration

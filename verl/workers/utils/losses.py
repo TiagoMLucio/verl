@@ -350,6 +350,8 @@ def sdpo_ppo_loss(
     )
     metrics.update(Metric.from_dict(summed, aggregation=AggregationType.SUM))
     metrics["actor/pg_loss"] = Metric(value=loss, aggregation=metric_aggregation)
+    # the loss is a per-micro-batch share of the global mean, so the diagnostic adds up like pg_loss
+    metrics["self_distillation/loss"] = Metric(value=loss, aggregation=metric_aggregation)
     policy_loss = loss
 
     entropy = model_output.get("entropy", None)
@@ -357,7 +359,11 @@ def sdpo_ppo_loss(
         entropy = no_padding_2_padding(entropy, data)
         # span-only update: entropy exists only at hinted-span positions, so average there
         entropy_mask = response_mask
-        if "logits_keep_positions" in data.keys() and self_distillation_mask is not None and self_distillation_mask.dim() > 1:
+        if (
+            "logits_keep_positions" in data.keys()
+            and self_distillation_mask is not None
+            and self_distillation_mask.dim() > 1
+        ):
             entropy_mask = response_mask * self_distillation_mask
         # a 0 batch_num_tokens would make entropy_loss inf with NaN grads (entropy connects to the graph unmasked)
         entropy_gbi = dict(config.global_batch_info or {})

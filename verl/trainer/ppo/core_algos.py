@@ -1235,7 +1235,7 @@ def _distillation_signal_metrics(
     """How much signal the hints carry, as summable numerator/denominator pairs.
 
     Sums with a stable key set: a mean would be diluted by the un-hinted micro-batches (the
-    majority in turn mode) and a conditional key set breaks dp aggregation. Ratios are taken
+    majority under the turn_hints teacher) and a conditional key set breaks dp aggregation. Ratios are taken
     once, after summing over micro-batches and ranks.
     """
     out = dict.fromkeys(

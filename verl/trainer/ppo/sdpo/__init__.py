@@ -25,8 +25,9 @@ from verl.trainer.ppo.sdpo.turn_hint_teacher import TurnHintTeacher
 __all__ = ["RepromptTeacher", "TeacherBatch", "TeacherInputs", "TurnHintTeacher", "make_teacher"]
 
 
-def make_teacher(cfg, tokenizer, apply_chat_template_kwargs=None, max_prompt_length=None):
-    """The teacher ``cfg.teacher`` names; ``max_prompt_length`` caps the turn-hint prefix."""
+def make_teacher(cfg, tokenizer, max_prefix_len: int, apply_chat_template_kwargs=None):
+    """The teacher ``cfg.teacher`` names; ``max_prefix_len`` (the student's prompt budget) caps
+    the turn-hint prefix."""
     if cfg.teacher == "turn_hints":
-        return TurnHintTeacher(tokenizer, cfg, max_prefix_len=max_prompt_length)
+        return TurnHintTeacher(tokenizer, cfg, max_prefix_len=max_prefix_len)
     return RepromptTeacher(tokenizer, cfg, apply_chat_template_kwargs)

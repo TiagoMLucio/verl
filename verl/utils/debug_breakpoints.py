@@ -12,7 +12,7 @@ import os
 
 GROUPS = {
     "trainer": {"taskrunner", "init_workers", "fit", "actor_init_model", "compute_log_prob", "compute_ref_log_prob"},
-    "sdpo": {"sdpo_teacher_loss", "update_actor", "teacher_build"},
+    "sdpo": {"sdpo_teacher_loss", "update_actor", "teacher_build", "teacher_build_row"},
     "rollout": {"agent_loop", "vllm_server", "postprocess"},
     "agent": {"agent_run", "tool", "reward", "reflection", "condense"},
 }

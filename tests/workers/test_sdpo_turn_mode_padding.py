@@ -60,7 +60,7 @@ def run_teacher_grid_path(micro):
         teacher_input_ids=micro["teacher_input_ids"],
         teacher_seq_meta=micro["teacher_seq_meta"],
         responses=micro["responses"],
-        response_mask=micro["response_mask"],
+        mask_dtype=micro["response_mask"].dtype,
     )
     max_body = max(r.shape[0] for r in sub_resps.unbind())
     fake_outputs = torch.randn(len(sub_spans), max_body)

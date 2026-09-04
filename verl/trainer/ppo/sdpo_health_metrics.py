@@ -37,7 +37,9 @@ def batch_metrics(
     traj_of_row: list,
     extra_fields: list[dict],
 ) -> dict:
-    """Row and trajectory counts, and which rows the update can learn from."""
+    """Row and trajectory counts, and which rows the update can learn from. ``reprompt_sample_fraction``
+    is the supervised-row fraction under either teacher; the W&B name is kept so runs stay
+    comparable (``cluster/clariden/joblogs.py`` reads it)."""
     batch_size = len(supervised_per_row)
     n_traces = len(set(traj_of_row))
     segs_per_traj = Counter(traj_of_row)

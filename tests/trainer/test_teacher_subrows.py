@@ -102,9 +102,8 @@ def test_exploder_returns_one_row_per_hint():
     seqs = torch.nested.nested_tensor([seq], layout=torch.jagged)
     metas = torch.nested.nested_tensor([torch.tensor(meta)], layout=torch.jagged)
     responses = torch.nested.nested_tensor([RESPONSE], layout=torch.jagged)
-    masks = torch.nested.nested_tensor([torch.ones(RESPONSE.shape[0])], layout=torch.jagged)
 
-    sub_seqs, sub_resps, _, sub_spans = explode_turn_teacher_rows(seqs, metas, responses, masks)
+    sub_seqs, sub_resps, _, sub_spans = explode_turn_teacher_rows(seqs, metas, responses)
     assert [s.parent for s in sub_spans] == [0, 0, 0]
     assert [(s.start, s.end) for s in sub_spans] == [(12, 16), (24, 28), (33, 36)]
     for j, sub in enumerate(sub_seqs.unbind()):
@@ -134,9 +133,8 @@ def test_degenerate_row_encoding_round_trips():
     seqs = torch.nested.nested_tensor([torch.tensor([100, 0])], layout=torch.jagged)
     metas = torch.nested.nested_tensor([meta], layout=torch.jagged)
     responses = torch.nested.nested_tensor([RESPONSE], layout=torch.jagged)
-    masks = torch.nested.nested_tensor([torch.ones(RESPONSE.shape[0])], layout=torch.jagged)
 
-    sub_seqs, sub_resps, _, sub_spans = explode_turn_teacher_rows(seqs, metas, responses, masks)
+    sub_seqs, sub_resps, _, sub_spans = explode_turn_teacher_rows(seqs, metas, responses)
     assert sub_spans == [SubRowSpan(parent=0, body_start=0, start=0, end=1)]
     assert sub_resps.unbind()[0].shape[0] == 1
 

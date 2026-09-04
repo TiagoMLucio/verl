@@ -69,8 +69,6 @@ from verl.workers.utils.sdpo import (
 )
 
 logger = logging.getLogger(__file__)
-
-_ATTACH_DIAG = 0
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
@@ -109,7 +107,7 @@ def _trace_mini_batch_groups(batch_idx: int, mini_batch_td) -> None:
     else:
         w = [0.0] * len(ids)
     per_traj = defaultdict(float)
-    for t, wt in zip(ids, w):
+    for t, wt in zip(ids, w, strict=True):
         if t >= 0:
             per_traj[t] += wt
     supervised = {t for t, wt in per_traj.items() if wt > 0}
@@ -765,16 +763,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self.sdpo_enabled:
             attach_response_keep_positions(data)
-            global _ATTACH_DIAG
-            if _ATTACH_DIAG < 2:
-                _ATTACH_DIAG += 1
-                _m = data.get("teacher_seq_meta", None)
-                _k = data.get("logits_keep_positions", None)
-                logger.warning(
-                    "[span-only] update_actor: teacher_seq_meta=%s nested=%s -> keep_positions=%s",
-                    type(_m).__name__ if _m is not None else None,
-                    getattr(_m, "is_nested", None),
-                    None if _k is None else int(_k.values().shape[0]))
         # SDPO reads top-k and a logsumexp off the real logits, which the fused kernel
         # never materializes; span-only keeps this pass cheap anyway. Other loss modes
         # never read logits, so they keep the engine's configured fused setting
@@ -817,14 +805,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         turn_meta = tu.get(data, "teacher_seq_meta", default=None)
         sub_spans = None
         if teacher_input_ids.is_nested and turn_meta is not None:
-            # Turn mode: score each spliced sequence's body, then scatter the span outputs back to the response grid.
+            # turn_hints teacher: score each spliced sub-row's body, then scatter the span outputs
+            # back to the response grid.
             batch_size = data["responses"].size(0)
             full_response_length = max(r.shape[0] for r in data["responses"].unbind())
             sub_seqs, sub_resps, sub_masks, sub_spans = explode_turn_teacher_rows(
                 teacher_input_ids=teacher_input_ids,
                 teacher_seq_meta=turn_meta,
                 responses=data["responses"],
-                response_mask=data["response_mask"],
+                mask_dtype=data["response_mask"].dtype,
             )
             (
                 teacher_input_ids,
@@ -905,7 +894,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         }
         tu.assign_non_tensor(teacher_td, **default_keys)
 
-        # Span-only lm_head: only hinted-span positions are ever consumed in turn mode.
+        # Span-only lm_head: only hinted-span positions are ever consumed from spliced teacher rows.
         if sub_spans is not None:
             teacher_td["logits_keep_positions"] = turn_keep_positions(sub_seqs, sub_resps, sub_spans)
 

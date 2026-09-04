@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The spliced teacher row: one sub-row per hint, its meta packed by
-:mod:`verl.trainer.ppo.sdpo.teacher_meta`, plus the per-token mask and row weights."""
+:mod:`verl.trainer.ppo.sdpo.teacher_meta`, plus the per-token mask."""
 
-from collections import defaultdict
 from typing import Optional
 
 import torch
@@ -22,7 +21,7 @@ import torch
 from verl.trainer.ppo.sdpo.hints import HintedTurn
 from verl.trainer.ppo.sdpo.teacher_meta import SubRow, pack
 
-__all__ = ["build_spliced_teacher_row", "trace_weights", "turn_token_mask"]
+__all__ = ["build_spliced_teacher_row", "turn_token_mask"]
 
 
 def _find_subseq(haystack: torch.Tensor, needle: torch.Tensor, start: int, end: int) -> Optional[int]:
@@ -135,32 +134,3 @@ def turn_token_mask(response_len: int, spans: list[tuple[int, int]]) -> torch.Te
         mask[start:end] = 1.0
     return mask
 
-
-def trace_weights(
-    supervised_per_row: list[float],
-    traj_of_row: list,
-    call_row: list[bool],
-    call_weight: float = 1.0,
-) -> list[float]:
-    """Per-row weight for the seq-mean loss: a trajectory counts once in total, its segments
-    split that weight by how much supervision each carries.
-
-    ``call_weight`` (lambda) rescales rows supervised by a mid-turn call hint relative to
-    rows supervised by turn-level (pipeline) hints. It belongs here rather than on the token
-    mask because the per-row loss is a token-mean, in which a uniform within-row scale
-    cancels; a trajectory carries one kind of hint or the other, so the mix is across rows.
-    Weights are renormalised to the supervised-row count, so lambda re-allocates influence
-    between the two channels without changing the update's overall scale.
-    """
-    traj_supervised: dict = defaultdict(float)
-    for traj, n_supervised in zip(traj_of_row, supervised_per_row, strict=True):
-        traj_supervised[traj] += n_supervised
-    weights = [
-        (n / traj_supervised[traj] if traj_supervised[traj] > 0 else 0.0)
-        * (call_weight if is_call else 1.0)
-        for traj, n, is_call in zip(traj_of_row, supervised_per_row, call_row, strict=True)
-    ]
-    n_supervised_rows = sum(1 for n in supervised_per_row if n > 0)
-    total = sum(weights)
-    scale = (n_supervised_rows / total) if total > 0 else 1.0
-    return [w * scale for w in weights]

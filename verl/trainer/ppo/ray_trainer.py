@@ -598,11 +598,9 @@ class RayPPOTrainer:
         uids = list(batch.non_tensor_batch["uid"])
         raw_prompts = batch.non_tensor_batch["raw_prompt"]
 
-        feedback_list = reprompt.collect_feedback(
-            include_environment_feedback=self_distillation_cfg.include_environment_feedback,
-            reward_extra_infos_dict=reward_extra_infos_dict,
-            batch_size=batch_size,
-        )
+        feedback_list = [None] * batch_size
+        if self_distillation_cfg.include_environment_feedback and reward_extra_infos_dict is not None:
+            feedback_list = reprompt.collect_feedback(reward_extra_infos_dict.get("feedback", []), batch_size)
         seq_scores = reward_tensor.sum(dim=-1).detach().cpu().tolist()
         success_by_uid = reprompt.success_rows_by_uid(
             uids, seq_scores, success_reward_threshold=self_distillation_cfg.success_reward_threshold

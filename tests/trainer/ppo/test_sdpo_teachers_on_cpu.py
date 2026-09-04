@@ -95,7 +95,6 @@ def _inputs(extra_fields, uids, seq_scores, feedback, responses=None):
     for m in mask:
         m[1] = 0  # a tool-observation token the student never wrote
     return TeacherInputs(
-        keys=[f"{uid}_0_{i}" for i, uid in enumerate(uids)],
         prompts=[PROMPT.clone() for _ in range(n)],
         responses=responses,
         response_mask=mask,
@@ -112,7 +111,7 @@ def _inputs(extra_fields, uids, seq_scores, feedback, responses=None):
 def test_turn_hint_teacher_matches_the_splice_and_decodes_nothing():
     tok = ToyTokenizer()
     cfg = SelfDistillationConfig(teacher="turn_hints", max_hinted_turns=None)
-    teacher = make_teacher(cfg, tok, max_prompt_length=4096)
+    teacher = make_teacher(cfg, tok, max_prefix_len=4096)
     assert isinstance(teacher, TurnHintTeacher) and teacher.needs_prompts
     extra = [
         {"turn_spans": SPANS, "turn_hints": [[0, "h0"], [1, "h1", "call"]]},
@@ -167,7 +166,7 @@ def test_reprompt_teacher_messages_masks_and_lazy_decode():
         max_reprompt_len=512,
         reprompt_truncation="left",
     )
-    teacher = make_teacher(cfg, tok, apply_chat_template_kwargs={})
+    teacher = make_teacher(cfg, tok, max_prefix_len=4096, apply_chat_template_kwargs={})
     assert isinstance(teacher, RepromptTeacher) and not teacher.needs_prompts
     # uid a: row 0 failed with feedback, row 1 solved (its solution serves row 0, not itself);
     # uid b: row 2 failed without feedback, row 3 a condensation segment with feedback
@@ -216,7 +215,7 @@ def test_reprompt_truncation_side_scoped_to_the_reprompt():
 def test_turn_hint_teacher_counts_one_fallback_per_hint():
     tok = ToyTokenizer()
     cfg = SelfDistillationConfig(teacher="turn_hints")
-    teacher = make_teacher(cfg, tok, max_prompt_length=4096)
+    teacher = make_teacher(cfg, tok, max_prefix_len=4096)
     mid_turn = [[0, 1, len(TURN0)], SPANS[1]]
     extra = [
         # a call hint on a turn without <tool_call> whose span also starts mid-turn: one fallback
@@ -300,7 +299,7 @@ def test_trainer_turn_hints_batch_fields_and_metrics(monkeypatch):
         {"actor_rollout_ref": {"actor": {"policy_loss": {"loss_mode": "sdpo"}, "self_distillation": sd}}}
     )
     trainer.tokenizer = tok
-    trainer.sdpo_teacher = make_teacher(sd, tok, max_prompt_length=4096)
+    trainer.sdpo_teacher = make_teacher(sd, tok, max_prefix_len=4096)
     metrics = {}
     trainer._maybe_build_self_distillation_batch(SimpleNamespace(keys=keys, partition_id="train"), metrics)
 
