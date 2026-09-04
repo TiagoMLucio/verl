@@ -103,6 +103,7 @@ def make_engine(module):
         use_torch_compile=False,
         entropy_checkpointing=False,
     )
+    eng.model_config = SimpleNamespace(use_fused_kernels=False, get=lambda key, default=None: default)
     eng.ulysses_device_mesh = None
     eng.ulysses_parallel_group = None
     eng.ulysses_sequence_parallel_size = 1
