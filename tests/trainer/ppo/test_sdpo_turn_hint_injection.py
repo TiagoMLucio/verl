@@ -45,7 +45,7 @@ def test_hint_inserted_before_assistant_header():
     hinted = [(1, 12, 16, "hint", "turn")]
     hint = torch.tensor([70, 71], dtype=torch.int64)
 
-    seq, meta, fallbacks, _, _ = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER)
+    seq, meta, fallbacks, _ = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER)
 
     assert fallbacks == 0
     expected = torch.cat([prompt, response[:9], hint, response[9:16]])
@@ -59,7 +59,7 @@ def test_first_turn_hint_joins_prompt_tail():
     hinted = [(0, 0, 4, "hint", "turn")]
     hint = torch.tensor([70, 71], dtype=torch.int64)
 
-    seq, meta, fallbacks, _, _ = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER)
+    seq, meta, fallbacks, _ = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER)
 
     assert fallbacks == 0
     expected = torch.cat([prompt[:-3], hint, HEADER, response])
@@ -74,7 +74,7 @@ def test_missing_header_falls_back_to_bare_splice():
     hinted = [(1, 7, 10, "hint", "turn")]
     hint = torch.tensor([70, 71], dtype=torch.int64)
 
-    seq, meta, fallbacks, _, _ = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER)
+    seq, meta, fallbacks, _ = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER)
 
     assert fallbacks == 1
     expected = torch.cat([prompt, response[:7], hint, response[7:10]])
@@ -98,7 +98,7 @@ def test_cumulative_hints_and_truncation_after_last_span():
     hinted = [(0, 5, 8, "a", "turn"), (1, 13, 15, "b", "turn")]
     hints = [torch.tensor([70], dtype=torch.int64), torch.tensor([71], dtype=torch.int64)]
 
-    seq, meta, fallbacks, _, _ = build_spliced_teacher_row(prompt, response, hinted, hints, 100, HEADER)
+    seq, meta, fallbacks, _ = build_spliced_teacher_row(prompt, response, hinted, hints, 100, HEADER)
 
     assert fallbacks == 0
     expected = torch.cat(
@@ -121,7 +121,7 @@ def test_call_hint_splices_between_reasoning_and_call():
     hinted = [(0, 0, 10, "h", "call")]
     hint = torch.tensor([70, 71], dtype=torch.int64)
 
-    seq, meta, fallbacks, spans, placed = build_spliced_teacher_row(
+    seq, meta, fallbacks, spans = build_spliced_teacher_row(
         prompt, response, hinted, [hint], 100, HEADER, close_ids=CLOSE, call_open_ids=CALL_OPEN)
 
     assert fallbacks == 0
@@ -141,7 +141,7 @@ def test_call_hint_without_call_opening_falls_back_to_turn_splice():
     hinted = [(1, 5, 9, "h", "call")]
     hint = torch.tensor([70, 71], dtype=torch.int64)
 
-    seq, meta, fallbacks, spans, placed = build_spliced_teacher_row(
+    seq, meta, fallbacks, spans = build_spliced_teacher_row(
         prompt, response, hinted, [hint], 100, HEADER, close_ids=CLOSE, call_open_ids=CALL_OPEN)
 
     assert fallbacks == 1, "a call hint with no call opening is a fallback"
@@ -156,7 +156,7 @@ def test_call_hint_without_splice_ids_falls_back():
     hinted = [(1, 5, 9, "h", "call")]
     hint = torch.tensor([70, 71], dtype=torch.int64)
 
-    seq, meta, fallbacks, spans, placed = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER)
+    seq, meta, fallbacks, spans = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER)
 
     assert fallbacks == 1
     assert spans == [(5, 9)]
@@ -171,229 +171,6 @@ def test_select_hinted_turns_reads_call_placement():
     assert select_hinted_turns(extra, 9) == [(0, 0, 4, "a", "turn", None), (1, 4, 9, "b", "call", None)]
     extra["turn_feedback"] = [[1, "b", "call", "TARGET"]]
     assert select_hinted_turns(extra, 9) == [(1, 4, 9, "b", "call", "TARGET")]
-
-
-# --- divergence-window narrowing ----------------------------------------------------------
-
-from verl.trainer.ppo.sdpo_teacher import divergence_spans, narrowed_call_spans, turn_token_mask
-
-
-def test_divergence_single_replace_first_equals_all():
-    student, target = [1, 9, 3, 4], [1, 2, 3, 4]
-    assert divergence_spans(student, target, "first") == [(1, 2)]
-    assert divergence_spans(student, target, "all") == [(1, 2)]
-
-
-def test_divergence_two_independent_blocks():
-    student, target = [9, 2, 3, 8], [1, 2, 3, 4]
-    assert divergence_spans(student, target, "first") == [(0, 1)]
-    assert divergence_spans(student, target, "all") == [(0, 1), (3, 4)]
-
-
-def test_divergence_insert_masks_the_boundary_token():
-    # student is MISSING a token: the position that should have produced it is masked
-    assert divergence_spans([1, 2, 4], [1, 2, 3, 4], "all") == [(2, 3)]
-
-
-def test_divergence_delete_masks_the_extra_tokens():
-    assert divergence_spans([1, 2, 7, 7, 3], [1, 2, 3], "all") == [(2, 4)]
-
-
-def test_divergence_realigns_after_a_shifted_block():
-    # a wrong prefix, then identical content: only the prefix is masked
-    assert divergence_spans([5, 5, 1, 2, 3], [1, 2, 3], "all") == [(0, 2)]
-
-
-def test_divergence_identical_yields_nothing():
-    assert divergence_spans([1, 2, 3], [1, 2, 3], "all") == []
-
-
-def test_narrowing_applies_only_to_placed_call_hints_with_targets():
-    response = torch.tensor([1, 2, 3, 4, 5, 9, 7, 8], dtype=torch.int64)
-    hinted = [(0, 0, 4, "h", "turn", None), (1, 4, 8, "h", "call", "T")]
-    spans = [(0, 4), (4, 8)]
-    encode = lambda t: [5, 6, 7, 8]  # student [5,9,7,8] vs target: token 9 wrong
-    out = narrowed_call_spans(spans, [False, True], hinted, response, encode, "first")
-    assert out == [(0, 4), (5, 6)], "turn span untouched; call span narrowed to the wrong token"
-    mask = turn_token_mask(8, out)
-    assert mask.tolist() == [1, 1, 1, 1, 0, 1, 0, 0]
-
-
-def test_narrowing_skips_fallback_call_hints():
-    response = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
-    hinted = [(0, 0, 4, "h", "call", "T")]
-    out = narrowed_call_spans([(0, 4)], [False], hinted, response, lambda t: [9], "all")
-    assert out == [(0, 4)], "a call hint that fell back to turn splice keeps the whole span"
-
-
-def test_narrowing_keeps_span_when_diff_is_empty():
-    response = torch.tensor([1, 2, 3], dtype=torch.int64)
-    hinted = [(0, 0, 3, "h", "call", "T")]
-    out = narrowed_call_spans([(0, 3)], [True], hinted, response, lambda t: [1, 2, 3], "all")
-    assert out == [(0, 3)]
-
-
-def test_span_mode_is_passthrough():
-    hinted = [(0, 0, 3, "h", "call", "T")]
-    assert narrowed_call_spans([(0, 3)], [True], hinted, torch.tensor([9, 9, 9]), lambda t: [1], "span") == [(0, 3)]
-
-
-# --- one-hot forcing targets --------------------------------------------------------------
-
-from verl.trainer.ppo.sdpo_teacher import call_target_rows
-from verl.workers.utils.losses import apply_onehot_call_targets
-
-
-def test_call_target_rows_map_replace_and_insert_positions():
-    resp = torch.tensor([1, 2, 3, 4, 5, 9, 7, 8], dtype=torch.int64)
-    hinted = [(1, 4, 8, "h", "call", "T")]
-    rows = call_target_rows([(4, 8)], [True], hinted, resp, lambda t: [5, 6, 7, 8], 8)
-    assert rows.tolist() == [-1, -1, -1, -1, -1, 6, -1, -1]
-    rows = call_target_rows([(0, 3)], [True], [(0, 0, 3, "h", "call", "T")],
-                            torch.tensor([1, 2, 4], dtype=torch.int64), lambda t: [1, 2, 3, 4], 3)
-    assert rows.tolist() == [-1, -1, 3], "insert boundary maps to the first missing token"
-
-
-def test_call_target_rows_skip_fallback_and_turn_hints():
-    resp = torch.tensor([1, 2, 3], dtype=torch.int64)
-    rows = call_target_rows([(0, 3)], [False], [(0, 0, 3, "h", "call", "T")], resp, lambda t: [9], 3)
-    assert rows.tolist() == [-1, -1, -1]
-    rows = call_target_rows([(0, 3)], [True], [(0, 0, 3, "h", "turn", None)], resp, lambda t: [9], 3)
-    assert rows.tolist() == [-1, -1, -1]
-
-
-def test_onehot_override_hits_only_target_positions():
-    resp = torch.tensor([[5, 9, 7]])
-    tgt = torch.tensor([[-1, 6, 7]])
-    tlp = torch.zeros(1, 3) - 1.0
-    topk_lp = torch.zeros(1, 3, 2) - 2.0
-    topk_idx = torch.tensor([[[5, 1], [6, 9], [7, 2]]])
-    out_lp, out_topk = apply_onehot_call_targets(tlp, resp, tgt, topk_lp, topk_idx)
-    assert out_lp[0].tolist() == [-1.0, -30.0, 0.0]
-    assert out_topk[0, 1].tolist() == [0.0, -30.0]
-    assert out_topk[0, 0].tolist() == [-2.0, -2.0]
-
-
-def test_onehot_override_keeps_teacher_when_target_not_in_topk():
-    resp = torch.tensor([[9]])
-    tgt = torch.tensor([[6]])
-    tlp = torch.zeros(1, 1) - 1.0
-    topk_lp = torch.zeros(1, 1, 2) - 2.0
-    topk_idx = torch.tensor([[[9, 3]]])  # 6 absent from student's top-k
-    out_lp, out_topk = apply_onehot_call_targets(tlp, resp, tgt, topk_lp, topk_idx)
-    assert out_lp[0].tolist() == [-30.0], "per-token logp still one-hot (student token != target)"
-    assert out_topk[0, 0].tolist() == [-2.0, -2.0], "topk falls back to the real teacher"
-
-
-def test_onehot_override_noop_without_targets():
-    tlp = torch.zeros(1, 2) - 1.0
-    out_lp, out_topk = apply_onehot_call_targets(tlp, torch.tensor([[1, 2]]), torch.tensor([[-1, -1]]), None, None)
-    assert torch.equal(out_lp, tlp) and out_topk is None
-
-
-# --- forced swap (call_target == "forced") -------------------------------------------------
-
-from verl.trainer.ppo.sdpo_teacher import forced_call_swap, forced_target_spans, splice_row
-
-FCLOSE = torch.tensor([96], dtype=torch.int64)
-# one turn [0:12): reasoning [0:4), call [4:11) framed by 95/96, turn tail 99
-FRESP = torch.tensor([1, 2, 3, 4, 95, 30, 31, 32, 33, 34, 96, 99], dtype=torch.int64)
-
-
-def _enc(table):
-    return lambda t: table[t]
-
-
-def test_forced_target_spans_modes():
-    orig = [95, 30, 31, 32, 96]
-    tgt = [95, 30, 41, 42, 32, 96]  # one replace (31->41) that also inserts 42
-    assert forced_target_spans(orig, tgt, "first") == [(2, 4)]
-    assert forced_target_spans(orig, tgt, "all") == [(2, 4)]
-    assert forced_target_spans(orig, tgt, "span") == [(0, 6)]
-    two = [95, 40, 31, 33, 96]  # two independent replaces
-    assert forced_target_spans(orig, two, "first") == [(1, 2)]
-    assert forced_target_spans(orig, two, "all") == [(1, 2), (3, 4)]
-
-
-def test_forced_target_spans_delete_supervises_boundary():
-    # correction removes 31: the target position after the removal is supervised
-    assert forced_target_spans([95, 30, 31, 32, 96], [95, 30, 32, 96], "all") == [(2, 3)]
-    # removal at the very end has no following target position: nothing to supervise
-    assert forced_target_spans([95, 30, 31], [95, 30], "all") == []
-
-
-def test_forced_swap_same_length_replace():
-    table = {"T": [95, 30, 41, 32, 33, 34, 96]}  # rel pos 2 changes
-    hinted = [(0, 0, 12, "h", "call", "T")]
-    swap = forced_call_swap(FRESP, hinted, _enc(table), CALL_OPEN, FCLOSE, "first")
-    assert swap is not None and swap["hint_idx"] == 0
-    assert swap["at"] == 4 and swap["removed"] == 7 and swap["inserted"] == 7
-    assert swap["response_ids"].tolist() == [1, 2, 3, 4, 95, 30, 41, 32, 33, 34, 96, 99]
-    assert swap["mask_spans"] == [(6, 7)]
-    assert swap["hinted_turns"] == [(0, 0, 12, "h", "call", "T")], "delta 0 leaves spans alone"
-
-
-def test_forced_swap_shifts_later_spans():
-    resp = torch.cat([FRESP, torch.tensor([50, 90, 91, 92, 60, 61], dtype=torch.int64)])
-    table = {"T": [95, 30, 41, 42, 32, 33, 34, 96]}  # delta +1
-    hinted = [(0, 0, 12, "h", "call", "T"), (1, 14, 18, "g", "turn", None)]
-    swap = forced_call_swap(resp, hinted, _enc(table), CALL_OPEN, FCLOSE, "all")
-    assert swap is not None
-    assert swap["response_ids"].shape[0] == resp.shape[0] + 1
-    assert swap["hinted_turns"][0] == (0, 0, 13, "h", "call", "T"), "own turn end follows the swap"
-    assert swap["hinted_turns"][1] == (1, 15, 19, "g", "turn", None), "later turn shifts by delta"
-    assert swap["mask_spans"] == [(6, 8)], "insert block supervised as real target tokens"
-
-
-def test_forced_swap_skips_unswappable_rows():
-    enc = _enc({"T": [95, 30, 96]})
-    no_target = [(0, 0, 12, "h", "call", None)]
-    assert forced_call_swap(FRESP, no_target, enc, CALL_OPEN, FCLOSE, "first") is None
-    turn_hint_only = [(0, 0, 12, "h", "turn", "T")]
-    assert forced_call_swap(FRESP, turn_hint_only, enc, CALL_OPEN, FCLOSE, "first") is None
-    no_open = torch.tensor([1, 2, 3, 4, 30, 31, 96, 99], dtype=torch.int64)
-    assert forced_call_swap(no_open, [(0, 0, 8, "h", "call", "T")], enc, CALL_OPEN, FCLOSE, "first") is None
-    truncated = FRESP[:9]  # call opening present, closing cut off
-    assert forced_call_swap(truncated, [(0, 0, 9, "h", "call", "T")], enc, CALL_OPEN, FCLOSE, "first") is None
-    identical = _enc({"T": FRESP[4:11].tolist()})
-    assert forced_call_swap(FRESP, [(0, 0, 12, "h", "call", "T")], identical, CALL_OPEN, FCLOSE, "first") is None
-
-
-def test_forced_swap_picks_the_call_hint_among_turn_hints():
-    resp = torch.cat([FRESP, torch.tensor([50, 90, 91, 92, 60, 61], dtype=torch.int64)])
-    table = {"T": [95, 30, 41, 32, 33, 34, 96]}
-    hinted = [(1, 14, 18, "g", "turn", None), (0, 0, 12, "h", "call", "T")]
-    swap = forced_call_swap(resp, hinted, _enc(table), CALL_OPEN, FCLOSE, "first")
-    assert swap is not None and swap["hint_idx"] == 1
-
-
-def test_splice_row_keeps_dtype_and_positions():
-    row = torch.tensor([0.5, 1.5, 2.5, 3.5])
-    out = splice_row(row, 1, 2, torch.zeros(3))
-    assert out.tolist() == [0.5, 0.0, 0.0, 0.0, 3.5] and out.dtype == row.dtype
-    mask = torch.tensor([1, 1, 0, 1], dtype=torch.int64)
-    out = splice_row(mask, 2, 1, torch.ones(2))
-    assert out.tolist() == [1, 1, 1, 1, 1] and out.dtype == torch.int64
-
-
-def test_forced_swap_then_teacher_build_stays_aligned():
-    table = {"T": [95, 30, 41, 42, 32, 33, 34, 96]}  # delta +1
-    hinted = [(0, 0, 12, "h", "call", "T")]
-    swap = forced_call_swap(FRESP, hinted, _enc(table), CALL_OPEN, FCLOSE, "all")
-    new_resp, new_hinted = swap["response_ids"], swap["hinted_turns"]
-    prompt = torch.arange(10, dtype=torch.int64)
-    hint = torch.tensor([70, 71], dtype=torch.int64)
-    seq, meta, fallbacks, spans, placed = build_spliced_teacher_row(
-        prompt, new_resp, new_hinted, [hint], 100, HEADER, close_ids=CLOSE, call_open_ids=CALL_OPEN)
-    assert fallbacks == 0 and placed == [True]
-    assert spans == [(4, 13)], "teacher scores the corrected call span on the new grid"
-    expected = torch.cat([prompt, new_resp[:4], CLOSE, hint, HEADER, new_resp[4:13]])
-    assert torch.equal(seq, expected)
-    for a, b in swap["mask_spans"]:
-        assert spans[0][0] <= a < b <= spans[0][1], "supervised spans sit inside the scored span"
-    from verl.trainer.ppo.sdpo_teacher import turn_token_mask
-    mask = turn_token_mask(new_resp.shape[0], swap["mask_spans"])
-    assert mask.tolist() == [0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0], "only the changed corrected tokens train"
 
 
 # --- channel balance (call_loss_weight) ----------------------------------------------------
@@ -437,165 +214,3 @@ def test_call_loss_weight_is_inert_when_every_row_is_one_channel():
     for lam in (0.1, 1.0, 5.0):
         assert trace_weights(sup, rows, [True, True], lam) == pytest.approx([1.0, 1.0])
         assert trace_weights(sup, rows, [False, False], lam) == pytest.approx([1.0, 1.0])
-
-
-from verl.trainer.ppo.sdpo_teacher import FORCED_LP_MARKER, restore_forced_rollout_lp
-
-
-def test_forced_rollout_lp_marker_restores_ratio_one():
-    """The forced tokens were never sampled: their IS weight must be exp(0), not the policy's
-    own probability of the call the correction is trying to teach."""
-    old = torch.tensor([-0.1, -8.0, -7.0, -0.2])
-    rollout = splice_row(torch.tensor([-0.1, -0.3, -0.2]), 1, 1,
-                         torch.full((2,), FORCED_LP_MARKER))
-    fixed = restore_forced_rollout_lp(rollout, old)
-    assert fixed.tolist() == pytest.approx([-0.1, -8.0, -7.0, -0.2])
-    assert torch.exp(old - fixed).tolist() == pytest.approx([1.0] * 4)
-    # what the zero fill did instead: the weight IS the policy's probability of the token
-    zeroed = splice_row(torch.tensor([-0.1, -0.3, -0.2]), 1, 1, torch.zeros(2))
-    assert torch.exp(old - zeroed)[1].item() < 1e-3
-
-
-def test_forced_rollout_lp_restore_is_inert_without_a_marker():
-    rollout = torch.tensor([-0.1, -0.3, -0.2])
-    out = restore_forced_rollout_lp(rollout, torch.tensor([-1.0, -2.0, -3.0]))
-    assert out is rollout
-
-
-from verl.trainer.ppo.sdpo_teacher import divergence_spans as _dspans
-
-
-def test_divergence_never_supervises_the_turn_closer():
-    """The student span ends on <|im_end|> tokens the corrected call cannot contain: the
-    trailing delete past the target's end is the closer, not a divergence."""
-    stu = [10, 20, 30, 96, 99]  # ... </tool_call> <|im_end|>
-    tgt = [10, 21, 30, 96]
-    assert _dspans(stu, tgt, "all") == [(1, 2)]
-    assert _dspans(stu, tgt, "first") == [(1, 2)]
-    # a genuine trailing replace is NOT the closer and stays supervised
-    assert _dspans([10, 20, 31], [10, 20, 32], "all") == [(2, 3)]
-
-
-def test_divergence_token_modes_keep_one_position_per_block():
-    stu = [1, 2, 3, 4, 5, 6, 7, 99]
-    tgt = [1, 8, 9, 4, 5, 60, 7]  # two changed blocks + trailing closer delete
-    assert _dspans(stu, tgt, "all") == [(1, 3), (5, 6)]
-    assert _dspans(stu, tgt, "all_tokens") == [(1, 2), (5, 6)]
-    assert _dspans(stu, tgt, "first_token") == [(1, 2)]
-    assert _dspans(stu, tgt, "first") == [(1, 3)]
-
-
-def test_forced_target_spans_token_modes():
-    orig = [95, 30, 31, 32, 96]
-    tgt = [95, 40, 41, 32, 96]
-    assert forced_target_spans(orig, tgt, "all") == [(1, 3)]
-    assert forced_target_spans(orig, tgt, "all_tokens") == [(1, 2)]
-    assert forced_target_spans(orig, tgt, "first_token") == [(1, 2)]
-
-
-from verl.trainer.ppo.sdpo_teacher import char_divergence_spans
-
-
-def test_char_divergence_is_immune_to_bpe_boundary_drag():
-    """The escape case from the lab: the divergent characters sit inside a merged
-    punctuation token; the mask must cover that token, never its equal neighbours."""
-    tab = {1: "x = ", 7: "()`.\\", 4: "\\n", 9: "bar", 6: "<|im_end|>"}
-    dec = lambda ids: "".join(tab[i] for i in ids)  # noqa: E731
-    stu = [1, 7, 4, 9, 6]
-    tgt = "x = ()`.\nbar"
-    assert char_divergence_spans(stu, tgt, dec, "first_token") == [(1, 2)]
-    assert char_divergence_spans(stu, tgt, dec, "first") == [(1, 3)]
-    assert char_divergence_spans(stu, tgt, dec, "all_tokens") == [(1, 2)]
-
-
-def test_char_divergence_skips_the_turn_closer_and_identical_text():
-    tab = {5: "foo", 9: "bar", 6: "<|im_end|>"}
-    dec = lambda ids: "".join(tab[i] for i in ids)  # noqa: E731
-    assert char_divergence_spans([5, 6], "foo", dec, "all") == []
-    assert char_divergence_spans([5, 9], "foobar", dec, "all") == []
-
-
-from verl.trainer.ppo.sdpo_teacher import segmented_char_opcodes
-
-
-def test_segmented_diff_cannot_jump_the_field_boundary():
-    """When new_str repeats old_str, an unanchored diff matches the student's old_str
-    against the target's new_str and produces giant cross-field blocks; the per-field
-    diff must yield only the real per-field edits."""
-    body = "import (\\\\n    A,\\\\n    B\\\\n)"
-    fixed = "import (\\n    A,\\n    B\\n)"
-    stu = '<tool_call>{"a": 1, "old_str": "' + body + '", "new_str": "' + body + ' # x"}</tool_call><|im_end|>'
-    tgt = '<tool_call>{"a": 1, "old_str": "' + fixed + '", "new_str": "' + fixed + ' # x"}</tool_call>'
-    ops = [o for o in segmented_char_opcodes(stu, tgt) if o[0] not in ("equal", "closer")]
-    assert len(ops) == 6 and all(o[0] == "delete" and o[2] - o[1] == 1 for o in ops), ops
-    closer = [o for o in segmented_char_opcodes(stu, tgt) if o[0] == "closer"]
-    assert len(closer) == 1 and stu[closer[0][1]:closer[0][2]] == "<|im_end|>"
-
-
-def test_segmented_diff_falls_back_without_call_structure():
-    ops = segmented_char_opcodes("plain a text", "plain b text")
-    assert [o[0] for o in ops] == ["equal", "replace", "equal"]
-
-
-def test_char_divergence_slides_indels_to_the_run_start():
-    """Inserting spaces into an indent run is position-ambiguous; difflib parks the indel
-    at the run's end (right before the `if`). The wrong generation decision is the run's
-    first token - the whitespace token - so the mask must slide left onto it."""
-    tab = {1: "x:\n", 2: "        ", 3: "if", 4: " y:\n", 5: "            ", 6: "<|im_end|>"}
-    dec = lambda ids: "".join(tab[i] for i in ids)  # noqa: E731
-    insert_case = char_divergence_spans([1, 2, 3, 4, 6], "x:\n            if y:\n", dec, "first_token")
-    assert insert_case == [(1, 2)], insert_case
-    delete_case = char_divergence_spans([1, 5, 3, 4, 6], "x:\n        if y:\n", dec, "first_token")
-    assert delete_case == [(1, 2)], delete_case
-
-
-def test_mixed_indels_rotate_to_the_true_decision_point():
-    """A comment insertion ending in `)` next to a `)` must not land on the closing
-    quote token; the shared characters rotate right and the boundary is the token the
-    model wrote instead of starting the comment."""
-    tab = {1: "msg.append(x'", 2: "')", 3: "\n\n", 4: "        if s:", 6: "<|im_end|>"}
-    dec = lambda ids: "".join(tab[i] for i in ids)  # noqa: E731
-    got = char_divergence_spans(
-        [1, 2, 3, 4, 6], "msg.append(x'') # Swapped a and b(message)\n\n        if s:", dec, "first_token")
-    assert got == [(2, 3)], got
-    tab2 = {1: "f(a", 2: ")extra", 3: ")x", 6: "<|im_end|>"}
-    dec2 = lambda ids: "".join(tab2[i] for i in ids)  # noqa: E731
-    assert char_divergence_spans([1, 2, 3, 6], "f(a)x", dec2, "first_token") == [(1, 2)]
-
-
-def _toy_tokenizer(vocab):
-    def enc(text):
-        out, i = [], 0
-        while i < len(text):
-            best = max((v for v in range(len(vocab)) if text.startswith(vocab[v], i)),
-                       key=lambda v: len(vocab[v]), default=None)
-            assert best is not None, repr(text[i: i + 10])
-            out.append(best)
-            i += len(vocab[best])
-        return out
-    return enc, (lambda ids: "".join(vocab[i] for i in ids))
-
-
-def test_decision_token_follows_the_corrected_tokenization():
-    """Tokenizer-aware placement: a docstring quote that MERGES with the previous
-    quote-pair token puts the mask on that token; when the previous token survives in
-    the corrected tokenization, the mask falls on the following token."""
-    vocab = ["file", '.\\"', '\\"\n', '\\"\\"', "\n", "x"]
-    enc, dec = _toy_tokenizer(vocab)
-    got = char_divergence_spans([0, 1, 2, 5], 'file.\\"\\"\\"\nx', dec, "first_token", encode_fn=enc)
-    assert got == [(2, 3)], got
-    vocab2 = ["d(", '\\"\\"', '\\"\\"\\"', "\n", "x"]
-    enc2, dec2 = _toy_tokenizer(vocab2)
-    got = char_divergence_spans([0, 1, 3, 4], 'd(\\"\\"\\"\nx', dec2, "first_token", encode_fn=enc2)
-    assert got == [(1, 2)], got
-
-
-def test_decision_walk_crosses_the_field_boundary_for_quote_merges():
-    """When the corrected wire merges the opening quote with the first content char, the
-    walk-back must cross the value boundary (two adjacent equal opcodes are one stretch)
-    or the merged token is unreachable and the mask lands one token late."""
-    vocab = ['"old_str":', ' "', "def", ' x"', "}", "<|im_end|>", ' "@', "@"]
-    enc, dec = _toy_tokenizer(vocab)
-    got = char_divergence_spans([0, 1, 2, 3, 4, 5], '"old_str": "@def x"}', dec,
-                                "first_token", encode_fn=enc)
-    assert got == [(1, 2)], got

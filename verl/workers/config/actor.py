@@ -120,21 +120,6 @@ class SelfDistillationConfig(BaseConfig):
         "Continue exactly where you left off: your next output is the tool call itself - "
         "no reply, no acknowledgement, no further reasoning, as if this note were never sent.]\n"
     )
-    # how much of an at-call hinted span the distillation mask covers: the whole call
-    # (span), the first token block the corrected call changes (first), every changed block
-    # (all), or only each block's first position (first_token, all_tokens) - the one place
-    # whose prefix the corrected call still agrees with. Narrow masks remove the copy-token
-    # dilution: the loss denominator follows the mask, so decisive tokens train at full
-    # strength.
-    call_mask: str = "span"
-    # what the teacher distribution IS at forcing positions: the real (hinted) teacher, a
-    # one-hot on the corrected token (exact CE toward the correction; with call_mask=first the
-    # masked window sits where student and corrected contexts are identical, so this is true
-    # forcing there), or `forced`: the corrected call replaces the student's failed call in the
-    # training row itself, so student and teacher both score the corrected tokens under the
-    # corrected prefix and every changed position is well-defined (call_mask picks which
-    # corrected tokens are supervised)
-    call_target: str = "teacher"
     max_hinted_turns: Optional[int] = None
     #: lambda in `L = L_turn + lambda * L_call`: weight of rows supervised by a mid-turn call
     #: hint relative to rows supervised by turn-level hints. Call rows carry ~10x the
@@ -186,15 +171,6 @@ class SelfDistillationConfig(BaseConfig):
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
         if self.use_turn_feedback:
-            if self.call_target not in ("teacher", "onehot", "forced"):
-                raise ValueError(
-                    f"self_distillation.call_target must be teacher|onehot|forced, got {self.call_target!r}"
-                )
-            if self.call_mask not in ("span", "first", "first_token", "all", "all_tokens"):
-                raise ValueError(
-                    "self_distillation.call_mask must be span|first|first_token|all|all_tokens, "
-                    f"got {self.call_mask!r}"
-                )
             if self.call_loss_weight < 0:
                 raise ValueError(
                     f"self_distillation.call_loss_weight must be >= 0, got {self.call_loss_weight}"

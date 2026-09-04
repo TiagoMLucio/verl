@@ -36,7 +36,6 @@ __all__ = [
     "extract_prompt_text",
     "feedback_used",
     "remove_thinking_trace",
-    "restore_forced_rollout_lp",
     "select_hinted_turns",
     "select_solution",
     "turn_token_mask",
@@ -206,7 +205,7 @@ def build_spliced_teacher_row(
     header_ids: torch.Tensor,
     close_ids: Optional[torch.Tensor] = None,
     call_open_ids: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, list[int], int, list[tuple[int, int]], list[bool]]:
+) -> tuple[torch.Tensor, list[int], int, list[tuple[int, int]]]:
     """One teacher sub-row per hinted turn, concatenated into a single row.
 
     Each sub-row is the trajectory up to its own turn with only its own hint spliced in,
@@ -223,16 +222,14 @@ def build_spliced_teacher_row(
 
     The prompt is left-truncated to ``max_prefix_len``. Returns the concatenation, a flat
     meta ``[n_sub, (total_len, body_len, body_start, start, end) per sub-row]``, the
-    number of fallback placements, the effective (start, end) spans for the
-    distillation mask (== the meta spans), and per-hint whether the call splice was
-    actually placed (False for turn hints and for call hints that fell back).
+    number of fallback placements and the (start, end) spans for the distillation mask
+    (== the meta spans).
     """
     base_prefix = prompt_ids if prompt_ids.shape[0] <= max_prefix_len else prompt_ids[-max_prefix_len:]
     header = header_ids.shape[0]
     pieces: list[torch.Tensor] = []
     meta: list[int] = []
     spans: list[tuple[int, int]] = []
-    call_placed: list[bool] = []
     fallbacks = 0
 
     for (_, start, end, _, at, *_), hint_ids in zip(hinted_turns, hint_ids_list, strict=True):
@@ -279,298 +276,12 @@ def build_spliced_teacher_row(
                 body_start = start + hint_ids.shape[0]
             span = (start, end)
 
-        call_placed.append(call_at is not None)
         body_len = sum(part.shape[0] for part in body)
         pieces.append(torch.cat([prefix, *body]))
         meta.extend([prefix.shape[0] + body_len, body_len, body_start, *span])
         spans.append(span)
 
-    return torch.cat(pieces), [len(hinted_turns), *meta], fallbacks, spans, call_placed
-
-
-def divergence_spans(student_ids, target_ids, mode: str) -> list[tuple[int, int]]:
-    """Positions (relative to the student call) where the corrected call changes tokens.
-
-    Token-level diff via matching blocks, so independent errors at different offsets are
-    found even when lengths shift. ``replace``/``delete`` blocks mask the student's wrong
-    tokens; an ``insert`` (student missing tokens) masks the single boundary position that
-    should have produced them. ``first`` keeps the first differing block and ``all`` every
-    one; only a block's first position sees a prefix the corrected call agrees with, so
-    ``first_token``/``all_tokens`` keep just that position per block. Identical sequences
-    yield no spans.
-
-    The student span closes the assistant turn (``<|im_end|>``) while the corrected call
-    does not, so a trailing block past the target's end is the turn closer, not a
-    divergence, and is never supervised.
-    """
-    import difflib
-
-    sm = difflib.SequenceMatcher(None, list(student_ids), list(target_ids), autojunk=False)
-    spans: list[tuple[int, int]] = []
-    n, m = len(student_ids), len(target_ids)
-    for tag, i1, i2, j1, _j2 in sm.get_opcodes():
-        if tag == "equal":
-            continue
-        if i2 == n and j1 == m:
-            continue
-        span = (i1, i2) if i2 > i1 else (i1, min(i1 + 1, n))
-        if mode in ("first_token", "all_tokens"):
-            span = (span[0], min(span[0] + 1, n))
-        if span[0] < span[1]:
-            spans.append(span)
-        if mode in ("first", "first_token"):
-            break
-    return spans
-
-
-def token_char_offsets(ids, decode_fn):
-    """Per-token [start, end) character offsets, or None when per-token decoding does not
-    concatenate to the full decode (byte-fallback tokens); callers then keep the id diff."""
-    pieces = [decode_fn([int(i)]) for i in ids]
-    if "".join(pieces) != decode_fn([int(i) for i in ids]):
-        return None
-    offsets, pos = [], 0
-    for piece in pieces:
-        offsets.append((pos, pos + len(piece)))
-        pos += len(piece)
-    return offsets
-
-
-_WIRE_VALUES = re.compile(r'"(old_str|new_str)":\s*("(?:[^"\\]|\\.)*")')
-
-
-def _aligned_call_segments(a: str, b: str):
-    """Segment two renderings of the SAME call into alternating fixed/value chunks, or
-    None when they do not share structure. tool_fix builds the corrected call by swapping
-    field values inside the student's own text, so everything outside old_str/new_str is
-    char-equal (the student text may end with the turn closer the target lacks)."""
-    ma, mb = list(_WIRE_VALUES.finditer(a)), list(_WIRE_VALUES.finditer(b))
-    if not ma or len(ma) != len(mb) or [m.group(1) for m in ma] != [m.group(1) for m in mb]:
-        return None
-    segments, pa, pb = [], 0, 0
-    for x, y in zip(ma, mb, strict=True):
-        if a[pa: x.start(2)] != b[pb: y.start(2)]:
-            return None
-        segments.append((pa, x.start(2), pb, y.start(2), "fixed"))
-        segments.append((x.start(2), x.end(2), y.start(2), y.end(2), "value"))
-        pa, pb = x.end(2), y.end(2)
-    tail_a, tail_b = a[pa:], b[pb:]
-    if not tail_a.startswith(tail_b):
-        return None
-    segments.append((pa, pa + len(tail_b), pb, len(b), "fixed"))
-    if len(tail_a) > len(tail_b):
-        segments.append((pa + len(tail_b), len(a), len(b), len(b), "closer"))
-    return segments
-
-
-def segmented_char_opcodes(a: str, b: str):
-    """difflib opcodes in whole-text coordinates, diffed per call field when possible.
-
-    An unanchored minimal edit script goes wrong exactly when new_str repeats old_str:
-    matching the student's old_str against the target's new_str is "cheaper" than the real
-    correction, and the diff jumps the field boundary. Per-field diffing makes that jump
-    impossible; texts without the call structure fall back to the plain diff. The turn
-    closer the target cannot contain is emitted as its own ``closer`` opcode so span
-    builders can ignore it."""
-    import difflib
-
-    segments = _aligned_call_segments(a, b)
-    if segments is None:
-        return difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes()
-    ops = []
-    for a1, a2, b1, b2, kind in segments:
-        if kind == "closer":
-            ops.append(("closer", a1, a2, b1, b2))
-        elif kind == "fixed":
-            if a2 > a1:
-                ops.append(("equal", a1, a2, b1, b2))
-        else:
-            for t, i1, i2, j1, j2 in difflib.SequenceMatcher(
-                    None, a[a1:a2], b[b1:b2], autojunk=False).get_opcodes():
-                ops.append((t, a1 + i1, a1 + i2, b1 + j1, b1 + j2))
-    return ops
-
-
-def _decision_token(offsets, text, t_offsets, target_text, a, ja, lo):
-    """The student token index where generation truly diverged, or None.
-
-    Walk left from the divergent char to the nearest position that is a token boundary in
-    BOTH the student's sampled tokenization and the canonical tokenization of the corrected
-    text, then compare token texts forward: the first mismatch is the decision token. This
-    is tokenizer-aware placement: when the corrected tokenization merges the divergent
-    characters into the previous token (a docstring quote joining a quote-pair token),
-    the mismatch - and the mask - lands where the model should have emitted the bigger
-    merged token; when the previous token survives in the corrected tokenization, the
-    mask falls on the following token instead.
-    """
-    s_bound = {cs: k for k, (cs, _ce) in enumerate(offsets)}
-    t_bound = {cs: k for k, (cs, _ce) in enumerate(t_offsets)}
-    c = a
-    while c >= lo:
-        tc = ja - (a - c)
-        if c in s_bound and tc >= 0 and tc in t_bound:
-            si, ti = s_bound[c], t_bound[tc]
-            while si < len(offsets) and ti < len(t_offsets):
-                ss, se = offsets[si]
-                ts, te = t_offsets[ti]
-                if text[ss:se] != target_text[ts:te]:
-                    return si
-                si, ti = si + 1, ti + 1
-            return si if si < len(offsets) else len(offsets) - 1
-        c -= 1
-    return None
-
-
-def char_divergence_spans(student_ids, target_text, decode_fn, mode: str, encode_fn=None,
-                          target_offsets=None):
-    """Divergence-mask spans placed by a CHARACTER diff projected onto the token grid.
-
-    A token-id diff drags equal characters into a block whenever the divergence sits
-    inside a BPE-merged token: the id block then opens at the merged token's first
-    character and first_token can land on a token whose own characters match the
-    correction. The character diff cannot be fooled: a token is masked iff its characters
-    overlap a real divergence. ``first``/``all`` take every overlapping token of the
-    first/each char span; ``first_token``/``all_tokens`` only the first. The trailing
-    turn-closer (student text past the target's end) is never a divergence. Returns None
-    when offsets are unavailable; callers fall back to the id diff.
-    """
-    ids = [int(i) for i in student_ids]
-    offsets = token_char_offsets(ids, decode_fn)
-    if offsets is None:
-        return None
-    text = "".join(decode_fn([i]) for i in ids)
-    n, m = len(text), len(target_text)
-    t_offsets = target_offsets
-    if t_offsets is None and encode_fn is not None:
-        t_offsets = token_char_offsets(encode_fn(target_text), decode_fn)
-    spans: list[tuple[int, int]] = []
-    prev_end = 0
-    equal_run_start = 0
-    prev_was_equal = True
-    # a right-slide must not leave the field segment its opcode came from: sliding into
-    # the scaffolding after a value would mask tokens outside the corrected field
-    segs = _aligned_call_segments(text, target_text)
-    seg_ends = [(a1, a2, b1, b2) for a1, a2, b1, b2, _k in segs] if segs is not None else None
-    for tag, i1, i2, j1, j2 in segmented_char_opcodes(text, target_text):
-        if tag in ("equal", "closer"):
-            # consecutive equal opcodes (a field boundary abuts an equal run inside the
-            # value) are ONE equal stretch: the decision walk may cross all of it, or a
-            # merged token straddling the boundary (quote+content) is unreachable
-            if not prev_was_equal:
-                equal_run_start = i1
-            prev_was_equal = True
-            continue
-        was_equal, prev_was_equal = prev_was_equal, False
-        # An indel's position is ambiguous up to rotation, and difflib parks it at
-        # whichever end its anchor blocks happened to prefer. Canonicalize to the
-        # DECISION POINT - the first position where the model's next character truly
-        # differs from the corrected continuation. A homogeneous indel (an indentation
-        # or backslash run) slides LEFT to its run start: the too-short whitespace
-        # token after the newline is the wrong decision, not the `if` after it. A
-        # mixed indel slides RIGHT while its first character equals the corrected
-        # continuation: those shared characters were emitted correctly (a comment
-        # insertion ending in `)` otherwise lands on the `')` before it).
-        decided = None
-        if t_offsets is not None:
-            # the walk-back may cross opcode borders (a value boundary abuts the equal run
-            # inside the field) but not the whole equal stretch: a BPE merge induced by
-            # the divergence spans a few characters, while far-back boundary mismatches
-            # are sampling-noise segmentation of identical text
-            lo = max(equal_run_start if was_equal else i1, prev_end, i1 - 16)
-            decided = _decision_token(offsets, text, t_offsets, target_text, i1, j1, lo)
-        if decided is None and tag in ("delete", "insert"):
-            indel = text[i1:i2] if tag == "delete" else target_text[j1:j2]
-            if indel and indel == indel[0] * len(indel):
-                width = i2 - i1
-                while i1 > prev_end and text[i1 - 1] == indel[0]:
-                    i1 -= 1
-                i2 = i1 + width
-            elif tag == "insert":
-                stop = next((a2 for a1, a2, b1, b2 in seg_ends if b1 <= j1 < b2), n) \
-                    if seg_ends is not None else n
-                while i1 < stop and j1 < j2 and target_text[j1] == text[i1]:
-                    i1 += 1
-                    j1 += 1
-                i2 = i1
-            else:
-                stop = next((a2 for a1, a2, b1, b2 in seg_ends if a1 <= i1 < a2), n) \
-                    if seg_ends is not None else n
-                while i2 < stop and text[i1] == text[i2]:
-                    i1 += 1
-                    i2 += 1
-        prev_end = max(prev_end, i2 if i2 > i1 else i1 + 1)
-        if i2 == n and j1 == m:
-            continue
-        a, b = (i1, i2) if i2 > i1 else (i1, min(i1 + 1, n))
-        if a >= b:
-            continue
-        toks = [k for k, (cs, ce) in enumerate(offsets) if cs < b and ce > a]
-        if decided is not None:
-            toks = sorted({decided, *[k for k in toks if k >= decided]})
-        if not toks:
-            continue
-        span = (toks[0], toks[0] + 1) if mode in ("first_token", "all_tokens") else (toks[0], toks[-1] + 1)
-        if not spans or span[0] >= spans[-1][1]:
-            spans.append(span)
-        elif span[1] > spans[-1][1]:
-            spans[-1] = (spans[-1][0], span[1])
-        if mode in ("first", "first_token"):
-            break
-    return spans
-
-
-def narrowed_call_spans(spans, call_placed, hinted_turns, student_ids, encode_fn, mode: str,
-                        decode_fn=None):
-    """Mask spans with target-bearing, actually-placed call hints narrowed to the tokens
-    the corrected call changes; everything else passes through. With ``decode_fn`` the
-    narrowing is a character diff projected onto tokens (immune to BPE-boundary drag);
-    without it, or when offsets are unavailable, the token-id diff. A diff that comes
-    back empty keeps the full span rather than dropping the hint."""
-    if mode == "span":
-        return spans
-    out = []
-    for span, placed, (*_, at, target) in zip(spans, call_placed, hinted_turns, strict=True):
-        s, e = span
-        if placed and at == "call" and target and e > s:
-            subs = None
-            if decode_fn is not None:
-                subs = char_divergence_spans(student_ids[s:e], target, decode_fn, mode,
-                                             encode_fn=encode_fn)
-            if subs is None:
-                subs = divergence_spans(student_ids[s:e].tolist(), encode_fn(target), mode)
-            out += [(s + a, s + b) for a, b in subs] or [span]
-        else:
-            out.append(span)
-    return out
-
-
-def call_target_rows(
-    spans, call_placed, hinted_turns, student_ids, encode_fn, response_len: int
-):
-    """Per-position corrected-token ids for placed, target-bearing call hints, aligned by
-    the same token diff as the mask narrowing: position i of a replace block maps to the
-    corrected block's token at the same offset; an insert's boundary position maps to the
-    first inserted token; everywhere else -1 (no forcing target)."""
-    import difflib
-
-    out = torch.full((response_len,), -1, dtype=torch.int64)
-    for span, placed, (*_, at, target) in zip(spans, call_placed, hinted_turns, strict=True):
-        s, e = span
-        if not (placed and at == "call" and target and e > s):
-            continue
-        t_ids = encode_fn(target)
-        sm = difflib.SequenceMatcher(None, student_ids[s:e].tolist(), list(t_ids), autojunk=False)
-        for tag, i1, i2, j1, j2 in sm.get_opcodes():
-            if tag == "equal":
-                continue
-            if i2 == i1:  # insert: the boundary position should have produced t_ids[j1]
-                if i1 < e - s:
-                    out[s + i1] = int(t_ids[j1])
-                continue
-            for k in range(i2 - i1):
-                if j1 + k < j2:
-                    out[s + i1 + k] = int(t_ids[j1 + k])
-    return out
+    return torch.cat(pieces), [len(hinted_turns), *meta], fallbacks, spans
 
 
 def trace_weights(
@@ -601,123 +312,6 @@ def trace_weights(
     total = sum(weights)
     scale = (n_supervised_rows / total) if total > 0 else 1.0
     return [w * scale for w in weights]
-
-
-def forced_target_spans(orig_ids: list[int], target_ids: list[int], mode: str) -> list[tuple[int, int]]:
-    """Supervised positions on the CORRECTED call's own grid (``call_target=forced``).
-
-    Mirrors ``divergence_spans`` but keeps the target side of each differing block: those
-    are the positions that exist after the corrected call replaces the student's, so
-    insertions are supervised as real tokens rather than a boundary. A ``delete`` (the
-    student wrote tokens the correction removes) supervises the single target position
-    that follows the removal — the token that must not be the student's deleted one.
-    ``span`` covers the whole corrected call.
-    """
-    import difflib
-
-    n = len(target_ids)
-    if mode == "span":
-        return [(0, n)] if n else []
-    sm = difflib.SequenceMatcher(None, list(orig_ids), list(target_ids), autojunk=False)
-    spans: list[tuple[int, int]] = []
-    for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
-        if tag == "equal":
-            continue
-        span = (j1, j2) if j2 > j1 else (j1, min(j1 + 1, n))
-        if mode in ("first_token", "all_tokens"):
-            span = (span[0], min(span[0] + 1, n))
-        if span[0] < span[1]:
-            spans.append(span)
-        if mode in ("first", "first_token"):
-            break
-    return spans
-
-
-def forced_call_swap(
-    response_ids: torch.Tensor,
-    hinted_turns: list[tuple],
-    encode_fn,
-    call_open_ids: torch.Tensor,
-    call_close_ids: torch.Tensor,
-    mode: str,
-) -> Optional[dict]:
-    """Replace the first target-bearing call hint's failed call with its corrected call.
-
-    Returns None when no trustworthy swap exists: no call hint with a target, the call's
-    opening or closing tokens are not found inside the hinted turn (truncated call), or
-    the correction tokenizes identically to the student's call. Otherwise a dict:
-
-    - ``response_ids``: the modified row
-    - ``at`` / ``removed`` / ``inserted``: splice coordinates for sibling per-position rows
-      (``row[:at] + fill*inserted + row[at+removed:]``)
-    - ``hinted_turns``: the input hints with spans shifted onto the modified grid
-    - ``mask_spans``: supervised (start, end) spans on the modified response grid
-    - ``hint_idx``: which hint was swapped (its build span must not be re-narrowed:
-      student and target are now identical there, so a diff would keep the full span)
-    """
-    hint_idx = next(
-        (k for k, (*_, at, target) in enumerate(hinted_turns) if at == "call" and target), None
-    )
-    if hint_idx is None:
-        return None
-    _, start, end, *_ , target = hinted_turns[hint_idx]
-    call_open_ids = call_open_ids.to(response_ids.dtype)
-    call_close_ids = call_close_ids.to(response_ids.dtype)
-    call_at = _find_subseq(response_ids, call_open_ids, start, end)
-    if call_at is None:
-        return None
-    close_at = _find_subseq(response_ids, call_close_ids, call_at, end)
-    if close_at is None:
-        return None
-    close_end = close_at + call_close_ids.shape[0]
-    orig = response_ids[call_at:close_end]
-    t_ids = torch.tensor(encode_fn(target), dtype=response_ids.dtype)
-    if t_ids.shape[0] == 0 or torch.equal(orig, t_ids):
-        return None
-
-    delta = t_ids.shape[0] - orig.shape[0]
-    new_response = torch.cat([response_ids[:call_at], t_ids, response_ids[close_end:]])
-    adjusted = [
-        (step, s + delta if s >= close_end else s, e + delta if e >= close_end else e, *rest)
-        for step, s, e, *rest in hinted_turns
-    ]
-    mask_spans = [
-        (call_at + a, call_at + b)
-        for a, b in forced_target_spans(orig.tolist(), t_ids.tolist(), mode)
-    ]
-    return {
-        "response_ids": new_response,
-        "at": call_at,
-        "removed": int(orig.shape[0]),
-        "inserted": int(t_ids.shape[0]),
-        "hinted_turns": adjusted,
-        "mask_spans": mask_spans,
-        "hint_idx": hint_idx,
-    }
-
-
-def splice_row(row: torch.Tensor, at: int, removed: int, fill: torch.Tensor) -> torch.Tensor:
-    """Per-position sibling of a forced swap: cut ``removed`` positions at ``at``, insert ``fill``."""
-    return torch.cat([row[:at], fill.to(row.dtype), row[at + removed:]])
-
-
-#: rollout log-prob written at positions the forced swap inserted; a sampled log-prob is never
-#: positive, so the marker cannot be mistaken for one
-FORCED_LP_MARKER = 1.0
-
-
-def restore_forced_rollout_lp(rollout_log_probs: torch.Tensor, old_log_probs: torch.Tensor) -> torch.Tensor:
-    """Rollout-correction ratio 1 at the positions the forced swap inserted.
-
-    Those tokens were never sampled, so no rollout policy scored them. Any stand-in makes
-    ``exp(old_lp - rollout_lp)`` scale the loss by the policy's own probability of the corrected
-    call, which is the term the correction exists to raise: the arm would suppress exactly the
-    tokens it is teaching. Matching the two log-probs leaves the weight at 1.
-    """
-    marked = rollout_log_probs > 0
-    if not bool(marked.any()):
-        return rollout_log_probs
-    return torch.where(marked, old_log_probs.to(rollout_log_probs.dtype), rollout_log_probs)
 
 
 def turn_token_mask(response_len: int, spans: list[tuple[int, int]]) -> torch.Tensor:

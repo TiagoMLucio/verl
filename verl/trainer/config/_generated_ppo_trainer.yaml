@@ -193,8 +193,6 @@ actor_rollout_ref:
         never sent.]
 
         '
-      call_mask: span
-      call_target: teacher
       max_hinted_turns: null
       call_loss_weight: 1.0
       token_gate: none

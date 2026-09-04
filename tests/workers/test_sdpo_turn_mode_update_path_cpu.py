@@ -128,7 +128,7 @@ def make_batch(include_hinted=True, include_unhinted=True):
         hinted = [(1, 2, 7, "h1", "turn")]
         hint_ids = [torch.tensor([50, 51, 52], dtype=torch.long)]
         header = torch.tensor([60, 61], dtype=torch.long)
-        seq, meta, _, spans, _ = sdpo_teacher.build_spliced_teacher_row(prompt, resp, hinted, hint_ids, 4096, header)
+        seq, meta, _, spans = sdpo_teacher.build_spliced_teacher_row(prompt, resp, hinted, hint_ids, 4096, header)
         sd_mask = sdpo_teacher.turn_token_mask(12, spans)
         rows.append(dict(prompt=prompt, resp=resp, teacher_seq=seq, meta=torch.tensor(meta), sd_mask=sd_mask))
     if include_unhinted:

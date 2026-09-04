@@ -345,20 +345,6 @@ self_distillation:
   # the turn wrapper (12.9 vs 12.5 nats) while bare and prefill framings roughly halve the shift.
   call_feedback_template: "[A note on the tool call you are about to write: {diagnosis}\nContinue exactly where you left off: your next output is the tool call itself - no reply, no acknowledgement, no further reasoning, as if this note were never sent.]\n"
 
-  # How much of an at-call hinted span the distillation mask covers: span = the whole
-  # call (bit-identical legacy), first = the first token block the corrected call changes,
-  # all = every changed block, first_token / all_tokens = only each block's first position
-  # (the one whose prefix the corrected call still agrees with). Narrow masks follow into
-  # the loss denominator, so decisive tokens train at full strength instead of being
-  # diluted by copy tokens.
-  call_mask: span
-
-  # teacher = distill toward the (hinted) teacher distribution at forcing positions;
-  # onehot = exact CE toward the corrected token there (pair with call_mask=first);
-  # forced = splice the corrected call into the training row and distill the student's
-  # recomputed log-probs of it (call_mask picks which corrected tokens are supervised)
-  call_target: teacher
-
   # Cap on hinted turns per sample (keeps the first ones; null = all)
   max_hinted_turns: null
 
