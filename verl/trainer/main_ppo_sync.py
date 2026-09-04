@@ -1512,7 +1512,7 @@ class PPOTrainer:
         # sequence per sample (the teacher prompt, stripped of its left padding, followed by the real
         # response tokens); the actor worker re-pads it and recomputes the mask / position ids.
         if turn_mode:
-            # meta [body_len, (body_start, start, end)...] maps spliced positions back to the response grid
+            # meta [n_sub, (total_len, body_len, body_start, start, end) per sub-row] maps spliced positions back to the response grid
             prompt_list = data["prompts"].unbind()
             hint_template = self_distillation_cfg.turn_feedback_template
             call_template = self_distillation_cfg.call_feedback_template

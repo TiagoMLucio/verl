@@ -200,7 +200,7 @@ def _find_subseq(haystack: torch.Tensor, needle: torch.Tensor, lo: int, hi: int)
 def build_spliced_teacher_row(
     prompt_ids: torch.Tensor,
     response_ids: torch.Tensor,
-    hinted_turns: list[tuple[int, int, int, str, str]],
+    hinted_turns: list[tuple[int, int, int, str, str, "Optional[str]"]],
     hint_ids_list: list[torch.Tensor],
     max_prefix_len: int,
     header_ids: torch.Tensor,
