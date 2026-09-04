@@ -492,7 +492,15 @@ def index_select_tensor_dict(batch: TensorDict, indices: torch.Tensor | list[int
             if isinstance(tensor, torch.Tensor) and not tensor.is_nested:
                 data_dict[key] = tensor[indices]
             elif isinstance(tensor, torch.Tensor) and tensor.is_nested:
-                tensor_lst = tensor.unbind()  # for performance
+                try:
+                    tensor_lst = tensor.unbind()  # for performance
+                except RuntimeError as e:
+                    off = tensor.offsets()
+                    raise RuntimeError(
+                        f"index_select unbind failed for key={key!r}: "
+                        f"values={tuple(tensor.values().shape)} offsets[:6]={off[:6].tolist()} "
+                        f"_ragged_idx={getattr(tensor, '_ragged_idx', None)}"
+                    ) from e
                 selected_tensors = [tensor_lst[idx] for idx in indices]
                 data_dict[key] = nested_tensor_from_tensor_list(
                     selected_tensors, ragged_idx=getattr(tensor, "_ragged_idx", tensor.dim() - 1)

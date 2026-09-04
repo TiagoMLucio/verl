@@ -1,6 +1,6 @@
 # Self-Distillation Policy Optimization (SDPO)
 
-Last updated: 03/03/2026.
+Last updated: 09/04/2026.
 
 SDPO is a policy optimization variant that augments actor updates with self-distillation from successful trajectories in the same rollout batch.
 
@@ -17,6 +17,8 @@ At each training step:
 5. The actor is updated with PPO-style optimization where policy loss is replaced by SDPO distillation loss (`loss_mode=sdpo`).
 6. A colocated teacher is updated with EMA from the student weights.
 
+With `teacher: turn_hints`, steps 2-4 are replaced by splicing each reflector hint into the trajectory right before the turn it was written for, and only that turn's span is scored.
+
 ## Key Configs
 
 - `actor_rollout_ref.actor.policy_loss.loss_mode: sdpo`
@@ -24,8 +26,9 @@ At each training step:
 - `actor_rollout_ref.actor.self_distillation.distillation_topk`
 - `actor_rollout_ref.actor.self_distillation.alpha`
 - `actor_rollout_ref.actor.self_distillation.success_reward_threshold`
+- `actor_rollout_ref.actor.self_distillation.teacher` (`reprompt`, the paper's sibling solution plus feedback, or `turn_hints`, per-turn reflector hints spliced into the trajectory)
 - `actor_rollout_ref.actor.self_distillation.teacher_regularization` (`ema`, `trust_region`, or `none`)
-- `actor_rollout_ref.actor.self_distillation.teacher_update_rate` (or `ema_update_rate` alias)
+- `actor_rollout_ref.actor.self_distillation.teacher_update_rate`
 - `actor_rollout_ref.actor.self_distillation.include_environment_feedback`
 - `actor_rollout_ref.actor.self_distillation.environment_feedback_only_without_solution`
 
@@ -49,5 +52,5 @@ Or override from `ppo_trainer`:
 ```bash
 python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.policy_loss.loss_mode=sdpo \
-  actor_rollout_ref.actor.self_distillation.ema_update_rate=0.05
+  actor_rollout_ref.actor.self_distillation.teacher_update_rate=0.05
 ```

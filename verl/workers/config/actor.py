@@ -51,26 +51,53 @@ __all__ = [
 class SelfDistillationConfig(BaseConfig):
     """Configuration for self-distillation loss.
 
+    Distillation is enabled when policy_loss.loss_mode == "sdpo". ``teacher`` picks which
+    teacher builds the distillation targets; the keys after it apply only to the teacher
+    they are listed under (under "turn_hints", the reprompt keys for the sibling solution
+    and the feedback only feed the supervision-source metrics). The dataclass defaults are
+    the SDPO paper's; ``trainer/config/actor/actor.yaml`` is authoritative for every run and
+    differs on several of them.
+
     Args:
-        Distillation is enabled when policy_loss.loss_mode == "sdpo".
         full_logit_distillation (bool): Whether to use full-logit KL distillation.
         alpha (float): KL interpolation coefficient.
             0.0=forward KL, 1.0=reverse KL, in-between=JSD.
         success_reward_threshold (float): Minimum sequence reward to be considered successful.
         teacher_regularization (str): Teacher regularization mode.
             Options: "ema", "trust_region" / "trust-region", "none".
-        teacher_update_rate (Optional[float]): Teacher update/mixing rate in [0,1].
-            If null, falls back to ema_update_rate.
-        ema_update_rate (float): Deprecated alias for teacher_update_rate.
+        teacher_update_rate (float): Teacher update/mixing rate in [0,1]: the EMA step
+            toward the student ("ema") or the trust-region mixing coefficient.
         distillation_topk (Optional[int]): If set, use top-k logits for distillation.
         distillation_add_tail (bool): Whether to add a tail bucket for top-k distillation.
+        is_clip (Optional[float]): Clip value for distillation IS ratio; None disables IS weighting.
+        teacher (str): Which teacher builds the distillation targets. "reprompt" is the
+            paper's: a fresh prompt carrying a successful sibling's solution and the
+            environment feedback. "turn_hints" builds one spliced teacher sequence per sample
+            from reflection hints (``extra_fields["turn_spans"]``/``["turn_hints"]``), each
+            hint inserted right before its turn; samples without hints ship a degenerate
+            teacher row with a zero mask (scored only to keep dp-group collectives in
+            lockstep) and contribute nothing to the loss.
+
+        turn_hints teacher:
+        chat_template_kwargs (dict): The rollout's apply_chat_template kwargs (e.g.
+            {"enable_thinking": False}); header and hint fragments are rendered under them
+            so they match the rollout tokens.
+        turn_hint_template (str): Template for one turn-placed hint, spliced immediately
+            before the hinted turn's tokens. Uses the {hint} placeholder.
+        call_hint_template (str): Template for one call-placed hint, spliced between the
+            turn's reasoning and its tool call. Uses the {hint} placeholder.
+        max_hinted_turns (Optional[int]): Cap on hinted turns per sample (keeps the first
+            ones, earliest before the trajectory loses coherence); None hints every turn the
+            reflector wrote for.
+        call_loss_weight (float): Weight of rows supervised by a call-placed hint relative
+            to rows supervised by turn-placed ones.
+
+        reprompt teacher:
         max_reprompt_len (int): Maximum length of the reprompted prompt.
-        reprompt_truncation (str): Truncation method for the reprompted prompt
-            (recommended to use "right" or "error").
+        reprompt_truncation (str): Truncation side for the reprompted prompt: "right" or "left".
         dont_reprompt_on_self_success (bool): Whether to not reprompt on self-success.
         remove_thinking_from_demonstration (bool): Whether to remove <think>...</think>
             tags from successful demonstrations before reprompting.
-        is_clip (Optional[float]): Clip value for distillation IS ratio; None disables IS weighting.
         reprompt_template (str): Template for reprompting. Uses {prompt}, {solution}, {feedback} placeholders.
         solution_template (str): Template for formatting solution section.
             Uses {successful_previous_attempt} placeholder.
@@ -85,15 +112,43 @@ class SelfDistillationConfig(BaseConfig):
     alpha: float = 0.0
     success_reward_threshold: float = 1.0
     teacher_regularization: str = "ema"
-    teacher_update_rate: Optional[float] = None
-    ema_update_rate: float = 0.05
+    teacher_update_rate: float = 0.05
     distillation_topk: Optional[int] = None
     distillation_add_tail: bool = True
+    is_clip: Optional[float] = None
+    teacher: str = "reprompt"
+
+    # turn_hints teacher
+    # must mirror the rollout's apply_chat_template kwargs (e.g. {"enable_thinking": False}):
+    # header/hint fragments are derived under these kwargs to match rollout tokens
+    chat_template_kwargs: dict = field(default_factory=dict)
+    turn_hint_template: str = (
+        "[Guidance for your next action: {hint}\n"
+        "Work out in your own words what this implies for the current state before you act, then take "
+        "the action it points to. Do not acknowledge it, thank anyone for it, quote it, or refer to it: "
+        "it is not part of the conversation, and the turn you write must read as if it were never sent.]\n"
+    )
+    # wraps hints the rollout marks `at: call` (spliced between a turn's reasoning and its
+    # tool call): the next token after it must be the call itself, so unlike the turn
+    # template it must never invite further deliberation
+    call_hint_template: str = (
+        "[A note on the tool call you are about to write: {hint}\n"
+        "Continue exactly where you left off: your next output is the tool call itself - "
+        "no reply, no acknowledgement, no further reasoning, as if this note were never sent.]\n"
+    )
+    max_hinted_turns: Optional[int] = None
+    #: lambda in `L = L_turn + lambda * L_call`: weight of rows supervised by a mid-turn call
+    #: hint relative to rows supervised by turn-level hints. Call rows carry ~10x the
+    #: per-token divergence, so at lambda=1 they contribute ~85-90% of the update while being
+    #: a small minority of rows; a trajectory carries one kind of hint or the other, so this
+    #: is a row weight (a within-row scale would cancel in the token-mean).
+    call_loss_weight: float = 1.0
+
+    # reprompt teacher
     max_reprompt_len: int = 10240
     reprompt_truncation: str = "right"
     dont_reprompt_on_self_success: bool = False
     remove_thinking_from_demonstration: bool = False
-    is_clip: Optional[float] = None
     reprompt_template: str = "{prompt}{solution}{feedback}\n\nCorrectly solve the original question.\n"
     solution_template: str = "\nCorrect solution:\n\n{successful_previous_attempt}\n\n"
     feedback_template: str = "\nThe following is feedback from your unsuccessful earlier attempt:\n\n{feedback_raw}\n\n"
@@ -117,16 +172,38 @@ class SelfDistillationConfig(BaseConfig):
                 f"{sorted(canonical_regularization_modes)}, got {self.teacher_regularization}"
             )
         object.__setattr__(self, "teacher_regularization", regularization_mode)
-        if not 0.0 <= self.ema_update_rate <= 1.0:
-            raise ValueError(f"self_distillation.ema_update_rate must be in [0,1], got {self.ema_update_rate}")
-        if self.teacher_update_rate is not None and not 0.0 <= self.teacher_update_rate <= 1.0:
+        if self.teacher_update_rate is None or not 0.0 <= self.teacher_update_rate <= 1.0:
             raise ValueError(f"self_distillation.teacher_update_rate must be in [0,1], got {self.teacher_update_rate}")
+        if self.reprompt_truncation not in ("right", "left"):
+            raise ValueError(
+                f"self_distillation.reprompt_truncation must be right|left, got {self.reprompt_truncation!r}"
+            )
         if self.distillation_topk is not None and self.distillation_topk <= 0:
             raise ValueError(
                 f"self_distillation.distillation_topk must be a positive integer, got {self.distillation_topk}"
             )
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
+        if self.teacher not in ("reprompt", "turn_hints"):
+            raise ValueError(f"self_distillation.teacher must be reprompt|turn_hints, got {self.teacher!r}")
+        if self.teacher == "turn_hints":
+            if self.call_loss_weight < 0:
+                raise ValueError(
+                    f"self_distillation.call_loss_weight must be >= 0, got {self.call_loss_weight}"
+                )
+            for name in ("turn_hint_template", "call_hint_template"):
+                template = getattr(self, name)
+                try:
+                    template.format(hint="")
+                except (KeyError, IndexError) as exc:
+                    raise ValueError(
+                        f"self_distillation.{name} must format on {{hint}} alone, got {template!r}"
+                    ) from exc
+                if "{hint}" not in template:
+                    raise ValueError(
+                        f"self_distillation.{name} must contain the {{hint}} "
+                        f"placeholder or the hint is silently dropped, got {template!r}"
+                    )
 
 
 @dataclass
@@ -263,6 +340,10 @@ class ActorConfig(BaseConfig):
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
     use_fused_kernels: bool = False
+
+    # Skip rows the update cannot learn from. They carry no supervision, so seq-mean-token-mean
+    # already gives them zero weight, but they still cost a forward and a backward.
+    drop_unsupervised_rows: bool = False
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     engine: BaseConfig = field(default_factory=BaseConfig)
     rollout_n: int = MISSING  # must be override by sampling config

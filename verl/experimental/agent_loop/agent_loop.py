@@ -84,6 +84,18 @@ class AgentLoopMetrics(BaseModel):
     tool_calls: float = 0.0
     compute_score: float = 0.0
     num_preempted: int = -1  # -1 means not available
+    # Everything below the model call: without it a trajectory's wall clock cannot be accounted
+    # for (env setup and reward run outside the turn loop, so loop_wall excludes them). Only the
+    # async trainer aggregates this model; the sync path reads the same values from extra_fields.
+    loop_wall: float = 0.0
+    env_setup: float = 0.0
+    reward_eval: float = 0.0
+    reflect: float = 0.0
+    condense: float = 0.0
+    parse_action: float = 0.0
+    tokenize_observations: float = 0.0
+    eval_completed: float = 1.0
+    patch_apply_failed: float = 0.0
 
 
 class AgentLoopOutput(BaseModel):
@@ -527,7 +539,13 @@ class AgentLoopWorker:
 
         # For n rollouts per sample, we trace all n rollouts for selected samples
         # Note: This sampling happens per-worker, so total traces = max_samples_per_worker * num_workers * n
-        if max_samples_per_worker is not None:
+        if batch.meta_info.get("validate", False):
+            # Validation floods the trace backend (n>1, long trajectories, token2text
+            # payloads) and a self-hosted server drops batches under the burst; val
+            # outcomes are already dumped to validation_data_dir, so skip backend
+            # traces for val. File-sink profiler spans are unaffected.
+            traced_indices = set()
+        elif max_samples_per_worker is not None:
             unique_sample_indices = np.unique(index)
             if max_samples_per_worker < len(unique_sample_indices):
                 selected_samples = set(
@@ -598,6 +616,7 @@ class AgentLoopWorker:
                 tools=ToolListWrap(self.tools),
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            kwargs.pop("validate", None)  # threaded to agent_loop.run only; postprocess takes it positionally
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
     def _pad_token_ids(
@@ -772,6 +791,11 @@ class AgentLoopWorker:
         images = multi_modal_data.get("images")
         videos = multi_modal_data.get("videos")
         audios = multi_modal_data.get("audios")
+        # Text-only episodes: skip the mm processor entirely -- its output carries
+        # non-empty bookkeeping tensors (mm_token_type_ids, attention_mask) that read
+        # as real multi-modal inputs downstream (the SDPO loss refuses such batches).
+        if not images and not videos and not audios:
+            return multi_modal_inputs
         current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
 
         multi_modal_inputs = build_multimodal_processor_inputs(
@@ -811,6 +835,11 @@ class AgentLoopWorker:
             "image_grid_thw": multi_modal_inputs.get("image_grid_thw"),
             "video_grid_thw": multi_modal_inputs.get("video_grid_thw"),
         }
+        # Text-only episodes: mrope degenerates to the text arange, so emit 1-D rows and
+        # keep every downstream consumer (TQ packing, SDPO splice, teacher rows) on the
+        # text-rope layout instead of (components, seq_len) rows.
+        if multi_modal_kwargs["image_grid_thw"] is None and multi_modal_kwargs["video_grid_thw"] is None:
+            return compute_position_id_with_mask(attention_mask)  # (1, seq_len)
         # For transformers>=5.3.0, mm_token_type_ids is only used to calculate position ids.
         if multi_modal_inputs.pop("mm_token_type_ids", None) is not None:
             mm_token_type_ids = torch.zeros_like(input_ids)
@@ -1032,12 +1061,12 @@ async def get_trajectory_info(step, index, validate):
         list: trajectory.
     """
     trajectory_info = []
-    rollout_n = 0
+    # count repeats per index across the whole batch: adjacency cannot be assumed
+    # (TransferQueue interleaves repeated rows), and rollout_n must distinguish them
+    counts: dict = {}
     for i in range(len(index)):
-        if i > 0 and index[i - 1] == index[i]:
-            rollout_n += 1
-        else:
-            rollout_n = 0
+        rollout_n = counts.get(index[i], 0)
+        counts[index[i]] = rollout_n + 1
         trajectory_info.append({"step": step, "sample_index": index[i], "rollout_n": rollout_n, "validate": validate})
     return trajectory_info
 

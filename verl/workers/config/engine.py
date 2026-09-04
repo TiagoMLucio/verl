@@ -238,6 +238,9 @@ class FSDPEngineConfig(EngineConfig):
             debugging.
         mixed_precision (Optional[dict[str, Any]]): Mixed precision configuration for FSDP, default None
         dtype (str): Mixed precision training param dtype, default "bfloat16"
+        compile_transformer_layers (bool): torch.compile each transformer block before FSDP wraps
+            it, default False. Regional by construction: the wrapped module cannot be compiled as
+            a whole, and a vision tower is skipped.
         qat (QATEngineConfig): QAT configuration, default disabled
     """
 
@@ -256,6 +259,7 @@ class FSDPEngineConfig(EngineConfig):
     ulysses_sequence_parallel_size: int = 1
     entropy_from_logits_with_chunking: bool = False
     use_torch_compile: bool = True
+    compile_transformer_layers: bool = False
     entropy_checkpointing: bool = False
     strategy: str = "fsdp"
     qat: QATEngineConfig = field(default_factory=QATEngineConfig)

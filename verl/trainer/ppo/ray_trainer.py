@@ -20,7 +20,6 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
-import re
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -50,6 +49,7 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import extract_reward
+from verl.trainer.ppo.sdpo import reprompt
 from verl.trainer.ppo.utils import (
     Role,
     WorkerType,
@@ -329,12 +329,6 @@ class RayPPOTrainer:
 
         # Store the tokenizer for text processing
         self.tokenizer = tokenizer
-        loss_mode = config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-        if loss_mode == "sdpo":
-            self.tokenizer.padding_side = "left"
-            reprompt_truncation = config.actor_rollout_ref.actor.get("self_distillation", {}).get("reprompt_truncation")
-            if reprompt_truncation in {"left", "right"}:
-                self.tokenizer.truncation_side = reprompt_truncation
         self.processor = processor
         self.config = config
 
@@ -580,62 +574,6 @@ class RayPPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
-    @staticmethod
-    def _collect_feedback(
-        include_environment_feedback: bool,
-        reward_extra_infos_dict: Optional[dict[str, Any]],
-        batch_size: int,
-    ) -> list[Any]:
-        """Collect non-empty textual environment feedback from reward extras."""
-        feedback_list: list[Any] = [None] * batch_size
-        if include_environment_feedback and reward_extra_infos_dict is not None:
-            raw_feedback = reward_extra_infos_dict.get("feedback", [])
-            if isinstance(raw_feedback, np.ndarray):
-                raw_feedback = raw_feedback.tolist()
-            for i in range(min(len(raw_feedback), batch_size)):
-                if isinstance(raw_feedback[i], str) and raw_feedback[i].strip():
-                    feedback_list[i] = raw_feedback[i]
-        return feedback_list
-
-    def _collect_solutions_by_uid(
-        self, batch: DataProto, reward_tensor: torch.Tensor, success_reward_threshold: float
-    ) -> dict[Any, list[int]]:
-        """Collect successful sample indices per UID based on sequence-level reward threshold."""
-        seq_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
-        uids = batch.non_tensor_batch["uid"]
-        success_by_uid: dict[Any, list[int]] = defaultdict(list)
-        for idx, uid in enumerate(uids):
-            if seq_scores[idx] >= success_reward_threshold:
-                success_by_uid[uid].append(idx)
-        return success_by_uid
-
-    @staticmethod
-    def _remove_thinking_trace(text: str) -> str:
-        """Remove <think>...</think> sections from a demonstration."""
-        return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
-
-    def _get_solution(
-        self,
-        idx: int,
-        success_by_uid: dict[Any, list[int]],
-        uids: list[Any],
-        response_texts: list[str],
-        dont_reprompt_on_self_success: bool = False,
-        remove_thinking_from_demonstration: bool = False,
-    ) -> Optional[str]:
-        """Select a successful demonstration for one sample from its UID group."""
-        uid = uids[idx]
-        solution_idxs = success_by_uid[uid]
-        if dont_reprompt_on_self_success:
-            solution_idxs = [j for j in solution_idxs if j != idx]
-        if len(solution_idxs) == 0:
-            return None
-        solution_idx = solution_idxs[0]
-        solution_str = response_texts[solution_idx]
-        if remove_thinking_from_demonstration:
-            solution_str = self._remove_thinking_trace(solution_str)
-        return solution_str
-
     def _maybe_build_self_distillation_batch(
         self,
         batch: DataProto,
@@ -657,104 +595,46 @@ class RayPPOTrainer:
         responses = batch.batch["responses"]
         response_mask = batch.batch["response_mask"]
         batch_size = batch.batch.batch_size[0]
-
-        response_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in responses]
+        uids = list(batch.non_tensor_batch["uid"])
         raw_prompts = batch.non_tensor_batch["raw_prompt"]
 
-        prompt_texts: list[str] = []
-        for messages in raw_prompts:
-            if len(messages) == 0:
-                prompt_texts.append("")
-                continue
-            content = messages[-1].get("content", "")
-            if not isinstance(content, str):
-                raise ValueError("SDPO currently only supports textual single-turn prompts.")
-            prompt_texts.append(content)
-
-        feedback_list = self._collect_feedback(
-            include_environment_feedback=self_distillation_cfg.include_environment_feedback,
-            reward_extra_infos_dict=reward_extra_infos_dict,
-            batch_size=batch_size,
+        feedback_list = [None] * batch_size
+        if self_distillation_cfg.include_environment_feedback and reward_extra_infos_dict is not None:
+            feedback_list = reprompt.collect_feedback(reward_extra_infos_dict.get("feedback", []), batch_size)
+        seq_scores = reward_tensor.sum(dim=-1).detach().cpu().tolist()
+        success_by_uid = reprompt.success_rows_by_uid(
+            uids, seq_scores, success_reward_threshold=self_distillation_cfg.success_reward_threshold
         )
-
-        success_by_uid = self._collect_solutions_by_uid(
-            batch,
-            reward_tensor,
-            success_reward_threshold=self_distillation_cfg.success_reward_threshold,
-        )
-        solution_strs = [
-            self._get_solution(
-                i,
-                success_by_uid,
-                batch.non_tensor_batch["uid"],
-                response_texts,
-                self_distillation_cfg.dont_reprompt_on_self_success,
-                self_distillation_cfg.get("remove_thinking_from_demonstration", False),
+        solution_row = [
+            reprompt.select_solution_row(
+                i, success_by_uid, uids, self_distillation_cfg.dont_reprompt_on_self_success
             )
             for i in range(batch_size)
         ]
-
-        def _build_teacher_message(i: int) -> list[dict]:
-            system_messages = raw_prompts[i][:-1]
-            has_solution = solution_strs[i] is not None
-            has_feedback = feedback_list[i] is not None
-            feedback_only_without_solution = self_distillation_cfg.get(
-                "environment_feedback_only_without_solution",
-                False,
+        remove_thinking = self_distillation_cfg.get("remove_thinking_from_demonstration", False)
+        solution_text = {}
+        for row in set(solution_row) - {None}:
+            text = self.tokenizer.decode(responses[row], skip_special_tokens=True)
+            solution_text[row] = reprompt.remove_thinking_trace(text) if remove_thinking else text
+        messages = [
+            reprompt.build_reprompt_messages(
+                reprompt.RepromptContext(raw_prompt=raw_prompts[i], feedback=feedback_list[i]),
+                None if solution_row[i] is None else solution_text[solution_row[i]],
+                self_distillation_cfg,
             )
-            use_feedback = has_feedback and (not feedback_only_without_solution or not has_solution)
-
-            solution_section = ""
-            if has_solution:
-                solution_section = self_distillation_cfg.solution_template.format(
-                    successful_previous_attempt=solution_strs[i]
-                )
-
-            feedback_section = ""
-            if use_feedback:
-                feedback_section = self_distillation_cfg.feedback_template.format(feedback_raw=feedback_list[i])
-
-            if use_feedback or has_solution:
-                reprompt_text = self_distillation_cfg.reprompt_template.format(
-                    prompt=prompt_texts[i],
-                    solution=solution_section,
-                    feedback=feedback_section,
-                )
-            else:
-                reprompt_text = prompt_texts[i]
-
-            return system_messages + [{"role": "user", "content": reprompt_text}]
-
-        messages = [_build_teacher_message(i) for i in range(batch_size)]
-        apply_kwargs = dict(self.config.data.get("apply_chat_template_kwargs", {}))
-        chat_template_kwargs = dict(
-            tokenize=True,
-            return_tensors="pt",
-            return_dict=True,
-            add_generation_prompt=True,
-            max_length=self_distillation_cfg.max_reprompt_len,
-            padding=True,
-            truncation=True,
-            **apply_kwargs,
+            for i in range(batch_size)
+        ]
+        prompts = reprompt.tokenize_reprompt_batch(
+            self.tokenizer, messages, self_distillation_cfg, self.config.data.get("apply_chat_template_kwargs", {})
         )
-        try:
-            teacher_prompt = self.tokenizer.apply_chat_template(
-                messages,
-                continue_final_message=False,
-                **chat_template_kwargs,
-            )
-        except TypeError:
-            teacher_prompt = self.tokenizer.apply_chat_template(messages, **chat_template_kwargs)
 
-        if isinstance(teacher_prompt, torch.Tensor):
-            teacher_prompt_input_ids = teacher_prompt
-            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-            teacher_prompt_attention_mask = (teacher_prompt_input_ids != pad_token_id).to(dtype=torch.long)
-        else:
-            teacher_prompt_input_ids = teacher_prompt["input_ids"]
-            teacher_prompt_attention_mask = teacher_prompt.get("attention_mask")
-            if teacher_prompt_attention_mask is None:
-                teacher_prompt_attention_mask = torch.ones_like(teacher_prompt_input_ids, dtype=torch.long)
+        prompt_len = max(prompt.shape[0] for prompt in prompts)
+        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        teacher_prompt_input_ids = torch.full((batch_size, prompt_len), pad_token_id, dtype=torch.long)
+        teacher_prompt_attention_mask = torch.zeros((batch_size, prompt_len), dtype=torch.long)
+        for i, prompt in enumerate(prompts):
+            teacher_prompt_input_ids[i, prompt_len - prompt.shape[0] :] = prompt
+            teacher_prompt_attention_mask[i, prompt_len - prompt.shape[0] :] = 1
 
         response_mask_dtype = teacher_prompt_attention_mask.dtype
         teacher_input_ids = torch.cat([teacher_prompt_input_ids.to(device), responses], dim=1)
@@ -764,21 +644,20 @@ class RayPPOTrainer:
         )
         teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
 
-        feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
         feedback_used = [
-            feedback_list[i] is not None and (not feedback_only_without_solution or solution_strs[i] is None)
+            reprompt.prompt_feedback_used(feedback_list[i], solution_row[i] is not None, self_distillation_cfg)
             for i in range(batch_size)
         ]
         self_distillation_mask = torch.tensor(
-            [solution_strs[i] is not None or feedback_used[i] for i in range(batch_size)],
+            [solution_row[i] is not None or feedback_used[i] for i in range(batch_size)],
             dtype=torch.float32,
             device=device,
         )
 
-        unique_uids = set(batch.non_tensor_batch["uid"])
+        unique_uids = set(uids)
         num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
         num_with_feedback_used = sum(1 for f in feedback_used if f)
-        num_with_solution = sum(1 for s in solution_strs if s is not None)
+        num_with_solution = sum(1 for row in solution_row if row is not None)
         metrics = {
             "self_distillation/success_group_fraction": len(
                 [uid for uid in unique_uids if len(success_by_uid[uid]) > 0]

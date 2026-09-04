@@ -14,6 +14,7 @@
 
 import contextlib
 import functools
+import time as _time
 import inspect
 import json
 import os
@@ -21,6 +22,8 @@ from contextvars import ContextVar
 from typing import Optional
 
 from pydantic import BaseModel
+
+from verl.utils import trace_file
 
 from verl.utils.ray_utils import get_event_loop
 
@@ -185,15 +188,25 @@ def rollout_trace_attr(
 
     if should_skip:
         token = _trace_enabled.set(False)
+        # langfuse sampling skips this rollout, but the local trace sink still
+        # wants its lane identity: set attributes without touching the backend
+        attrs_token = None
+        if trace_file.enabled():
+            attrs_token = _trace_attributes.set(
+                {"sample_index": sample_index, "step": step, "rollout_n": rollout_n, "validate": validate}
+            )
         try:
             yield
         finally:
             _trace_enabled.reset(token)
+            if attrs_token is not None:
+                _trace_attributes.reset(attrs_token)
         return
 
-    # Build attributes for the trace
+    # Build attributes for the trace (also for file-only tracing: they carry the
+    # per-rollout lane identity for the local trace sink)
     attributes = {}
-    if backend:
+    if backend or trace_file.enabled():
         if sample_index is not None:
             attributes["sample_index"] = sample_index
         if step is not None:
@@ -201,10 +214,21 @@ def rollout_trace_attr(
         if rollout_n is not None:
             attributes["rollout_n"] = rollout_n
         attributes["validate"] = validate
-        attributes["experiment_name"] = RolloutTraceConfig.get_instance().experiment_name
+        try:
+            attributes["experiment_name"] = RolloutTraceConfig.get_instance().experiment_name
+        except Exception:
+            pass
 
-    if not attributes or backend is None:
+    if not attributes or (backend is None and not trace_file.enabled()):
         yield
+        return
+
+    if backend is None:
+        token = _trace_attributes.set(attributes)
+        try:
+            yield
+        finally:
+            _trace_attributes.reset(token)
         return
 
     token = _trace_attributes.set(attributes)
@@ -372,16 +396,45 @@ def _current_trace_attributes():
     return {**(_trace_attributes.get() or {})}
 
 
+def trace_clip(text, cap=8000):
+    """Clip a payload for tracing, keeping both ends and saying what was dropped.
+
+    Middle-out: a test log's setup errors are at the top and the failure summary at the
+    bottom, so a tail-only clip loses half the story.
+    """
+    if text is None:
+        return None
+    text = text if isinstance(text, str) else str(text)
+    if cap <= 0 or len(text) <= cap:
+        return text
+    head = cap // 2
+    tail = cap - head
+    return "{}\n...[clipped {} chars]...\n{}".format(text[:head], len(text) - cap, text[-tail:])
+
+
 def _apply_trace_identity(client):
     """Set the trace identity (name/session/metadata/tags) from the stashed rollout attributes."""
     attrs = _trace_attributes.get() or {}
     si = attrs.get("sample_index")
+    cfg = RolloutTraceConfig.get_instance()
+    experiment, project = cfg.experiment_name, cfg.project_name
     metadata = {k: v for k, v in attrs.items() if k != "validate"}
+    if experiment:
+        metadata["experiment"] = experiment
+    if project:
+        metadata["project"] = project
     tags = ["validate" if attrs.get("validate") else "train"]
+    if experiment:
+        tags.append(experiment)
+    # scope the session by run: a bare sample_index groups unrelated runs together,
+    # since the same dataset row is replayed by every experiment
+    session = None
+    if si is not None:
+        session = "{}/{}".format(experiment, si) if experiment else str(si)
     try:
         client.update_current_trace(
             name="agent_loop",
-            session_id=str(si) if si is not None else None,
+            session_id=session,
             metadata=metadata,
             tags=tags,
         )
@@ -442,13 +495,76 @@ def rollout_trace_set_attr(key, value):
     _trace_attributes.set(attrs)
 
 
+def _langfuse_client():
+    """The langfuse client when tracing is active, else None. All rollout_trace_* helpers
+    are no-ops without it and swallow client errors: tracing must never break a rollout."""
+    if not _trace_enabled.get() or RolloutTraceConfig.get_backend() != "langfuse":
+        return None
+    return RolloutTraceConfig.get_client()
+
+
+def _drop_none(**kwargs):
+    return {k: v for k, v in kwargs.items() if v is not None}
+
+
+def rollout_trace_update_trace(input=None, output=None, metadata=None, tags=None):
+    """Update the active trace's input/output/metadata/tags."""
+    client = _langfuse_client()
+    kw = _drop_none(input=input, output=output, metadata=metadata, tags=tags)
+    if client is None or not kw:
+        return
+    try:
+        client.update_current_trace(**kw)
+    except Exception:
+        pass
+
+
+def rollout_trace_update_span(input=None, output=None, metadata=None):
+    """Update the active span's input/output/metadata."""
+    client = _langfuse_client()
+    kw = _drop_none(input=input, output=output, metadata=metadata)
+    if client is None or not kw:
+        return
+    try:
+        client.update_current_span(**kw)
+    except Exception:
+        pass
+
+
+@contextlib.contextmanager
+def rollout_trace_span(name, input=None, metadata=None, as_type="span"):
+    """Open an observation for an inline block. Yields the span, or None when untraced;
+    callers may ``span.update(output=...)``. Exceptions mark the span ERROR and propagate.
+    With VERL_TRACE_DIR set, the wall-clock interval is also appended to the local
+    trace file regardless of backend."""
+    with trace_file.span(name, attrs_getter=_trace_attributes.get):
+        yield from _rollout_trace_span_backend(name, input=input, metadata=metadata, as_type=as_type)
+
+
+def _rollout_trace_span_backend(name, input=None, metadata=None, as_type="span"):
+    client = _langfuse_client()
+    if client is None:
+        yield None
+        return
+    try:
+        cm = client.start_as_current_observation(as_type=as_type, name=name, input=input, metadata=metadata)
+    except Exception:
+        yield None
+        return
+    with cm as span:
+        try:
+            yield span
+        except Exception as e:
+            try:
+                span.update(level="ERROR", status_message=str(e))
+            except Exception:
+                pass
+            raise
+
+
 def rollout_trace_event(name, metadata=None, input=None, output=None):
-    """Emit a zero-duration event observation on the active trace (langfuse only)."""
-    if not _trace_enabled.get():
-        return
-    if RolloutTraceConfig.get_backend() != "langfuse":
-        return
-    client = RolloutTraceConfig.get_client()
+    """Emit a zero-duration event observation on the active trace."""
+    client = _langfuse_client()
     if client is None:
         return
     try:
@@ -457,22 +573,27 @@ def rollout_trace_event(name, metadata=None, input=None, output=None):
         pass
 
 
-def rollout_trace_generation(name, model=None, input=None, output=None, usage=None):
-    """Record an LLM call as a generation observation with chat I/O and token usage (langfuse only)."""
-    if not _trace_enabled.get():
-        return
-    if RolloutTraceConfig.get_backend() != "langfuse":
-        return
-    client = RolloutTraceConfig.get_client()
+def rollout_trace_generation(name, model=None, input=None, output=None, usage=None, num_preempted=None):
+    """Record an LLM call as a generation observation with chat I/O and token usage.
+
+    ``num_preempted`` is the engine's per-request preemption count: >0 means the KV
+    cache could not hold the working set, so the sequence was evicted and its prefill
+    recomputed. Emitted per request so preemption can be correlated with in-flight load.
+    """
+    if trace_file.enabled() and usage:
+        now = _time.time()
+        trace_file.emit(
+            "llm_generation", now, now, attrs=_trace_attributes.get(),
+            completion_tokens=usage.get("completion_tokens") or usage.get("output") or 0,
+            prompt_tokens=usage.get("prompt_tokens") or usage.get("input") or 0,
+            **({"num_preempted": int(num_preempted)} if num_preempted is not None else {}),
+        )
+    client = _langfuse_client()
     if client is None:
         return
     try:
         with client.start_as_current_observation(as_type="generation", name=name, model=model, input=input) as gen:
-            upd = {}
-            if output is not None:
-                upd["output"] = output
-            if usage is not None:
-                upd["usage_details"] = usage
+            upd = _drop_none(output=output, usage_details=usage)
             if upd:
                 gen.update(**upd)
     except Exception:
@@ -480,19 +601,11 @@ def rollout_trace_generation(name, model=None, input=None, output=None, usage=No
 
 
 def rollout_trace_score(name, value, comment=None, data_type=None):
-    """Attach a typed score to the active trace (langfuse only; never raises)."""
-    if not _trace_enabled.get():
-        return
-    if RolloutTraceConfig.get_backend() != "langfuse":
-        return
-    client = RolloutTraceConfig.get_client()
+    """Attach a typed score to the active trace."""
+    client = _langfuse_client()
     if client is None:
         return
-    kw = {"name": name, "value": value}
-    if comment is not None:
-        kw["comment"] = comment
-    if data_type is not None:
-        kw["data_type"] = data_type
+    kw = {"name": name, "value": value, **_drop_none(comment=comment, data_type=data_type)}
     try:
         if hasattr(client, "score_current_trace"):
             client.score_current_trace(**kw)
@@ -502,7 +615,28 @@ def rollout_trace_score(name, value, comment=None, data_type=None):
         pass
 
 
+def _with_file_span(func):
+    """Innermost wall-clock file timing for a traced op (any backend, or none)."""
+    if inspect.iscoroutinefunction(func):
+
+        @functools.wraps(func)
+        async def timed(self, *args, **kwargs):
+            with trace_file.span(func.__qualname__, attrs_getter=_trace_attributes.get):
+                return await func(self, *args, **kwargs)
+
+    else:
+
+        @functools.wraps(func)
+        def timed(self, *args, **kwargs):
+            with trace_file.span(func.__qualname__, attrs_getter=_trace_attributes.get):
+                return func(self, *args, **kwargs)
+
+    return timed
+
+
 def rollout_trace_op(func):
+    func = _with_file_span(func)
+
     @functools.wraps(func)
     async def async_wrapper(self, *args, **kwargs):
         if not _trace_enabled.get():

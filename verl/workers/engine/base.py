@@ -24,6 +24,7 @@ from typing import Any, Callable, ContextManager, Generator, Optional
 import torch
 from tensordict import TensorDict
 
+from verl.utils import trace_file
 from verl.utils.device import get_device_name, get_vendor
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 
@@ -126,7 +127,9 @@ class BaseEngine:
 
         self.optimizer_zero_grad()
         outputs = self.forward_backward_batch(data, loss_function, forward_only=False)
-        grad_norm = self.optimizer_step()
+        # offloaded Adam plus the FSDP reduce-scatter: host-side work the phase timers hide
+        with trace_file.span("update/optim_step"):
+            grad_norm = self.optimizer_step()
         did_update = math.isfinite(float(grad_norm))
         if self.is_mp_src_rank_with_outputs():
             assert "grad_norm" not in outputs["metrics"]

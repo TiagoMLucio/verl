@@ -14,6 +14,8 @@
 import functools
 import logging
 import os
+import time
+from collections import defaultdict
 from contextlib import nullcontext
 from copy import deepcopy
 from functools import partial
@@ -31,13 +33,15 @@ from verl.checkpoint_engine import CheckpointEngineRegistry
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
+from verl.trainer.ppo.sdpo.teacher_meta import body_slices
 from verl.utils import tensordict_utils as tu
+from verl.utils import trace_file
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_device_name, get_torch_device, set_expandable_segments
+from verl.utils.device import get_device_name, set_expandable_segments
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
-from verl.utils.memory_utils import aggressive_empty_cache
+from verl.utils.memory_utils import aggressive_empty_cache, run_peak_bytes
 from verl.utils.metric.utils import Metric
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
 from verl.utils.py_functional import append_to_dict
@@ -56,8 +60,12 @@ from verl.workers.utils.losses import _sdpo_teacher_extractor, ppo_loss, sdpo_pp
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 from verl.workers.utils.sdpo import (
     TrustRegionTeacher,
+    attach_response_keep_positions,
+    explode_turn_teacher_rows,
     has_non_empty_multi_modal_inputs,
     reconstruct_padded_teacher_from_nested,
+    scatter_turn_teacher_outputs,
+    turn_keep_positions,
 )
 
 logger = logging.getLogger(__file__)
@@ -77,6 +85,47 @@ def _with_routing_replay_flag(enabled: bool):
         return wrapper
 
     return decorator
+
+
+def _trace_mini_batch_groups(batch_idx: int, mini_batch_td) -> None:
+    """Record which trajectories each mini-batch drew rows from.
+
+    Mini-batches are cut from shuffled rows, so a condensed trajectory's segments can land in
+    different optimizer steps while their weights encode a single trajectory's share. This
+    says how often that happens and how large a whole-trajectory group would be.
+    """
+    if not trace_file.enabled():
+        return
+    traj = tu.get(mini_batch_td, "traj_id", default=None)
+    if traj is None:
+        return
+    weight = tu.get(mini_batch_td, "trace_weight", default=None)
+    ids = traj.to_padded_tensor(-1) if traj.is_nested else traj
+    ids = ids.reshape(-1).tolist()
+    if weight is not None:
+        w = (weight.to_padded_tensor(0.0) if weight.is_nested else weight).reshape(-1).tolist()
+    else:
+        w = [0.0] * len(ids)
+    per_traj = defaultdict(float)
+    for t, wt in zip(ids, w, strict=True):
+        if t >= 0:
+            per_traj[t] += wt
+    supervised = {t for t, wt in per_traj.items() if wt > 0}
+    now = time.time()
+    trace_file.emit(
+        "mini_batch",
+        now,
+        now,
+        batch_idx=batch_idx,
+        rows=len(ids),
+        trajectories=len(per_traj),
+        supervised_trajectories=len(supervised),
+        rows_of_supervised=sum(1 for t in ids if t in supervised),
+        weight_sum=round(sum(per_traj.values()), 4),
+        # the ids themselves: whether one trajectory's segments span several mini-batches
+        # is only answerable by intersecting these across the step
+        supervised_ids=sorted(supervised),
+    )
 
 
 class TrainingWorker(Worker, DistProfilerExtension):
@@ -217,8 +266,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
             final_metrics["lr"] = lr
 
         # log memory
-        final_metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
-        final_metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+        # run_peak_bytes, not the device counters: per-micro-batch sampling resets them,
+        # and the peak that matters is the fleet's, not this rank's
+        run_peak_allocated, run_peak_reserved = run_peak_bytes(group=dp_group)
+        final_metrics["perf/max_memory_allocated_gb"] = run_peak_allocated / (1024**3)
+        final_metrics["perf/max_memory_reserved_gb"] = run_peak_reserved / (1024**3)
         final_metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
         # TODO: confirm the mtp loss IS same across dp
@@ -310,7 +362,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     update_lr_scheduler=batch_idx == total_num_iterations - 1,
                     disable_auto_offload=True,
                 )
-                actor_output = self.train_batch(mini_batch_td)
+                _trace_mini_batch_groups(batch_idx, mini_batch_td)
+                with trace_file.span("update/mini_batch", mini=batch_idx, rows=len(mini_batch_td)):
+                    actor_output = self.train_batch(mini_batch_td)
                 output_lst.append(actor_output)
 
             if self.engine.is_mp_src_rank_with_outputs():
@@ -606,11 +660,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 from verl.workers.config.actor import SelfDistillationConfig
 
                 self.sdpo_config = _to_dc(self.config.actor.self_distillation, SelfDistillationConfig)
-                if self.sdpo_config.full_logit_distillation:
-                    actor_uses_fused_kernels = actor_training_config.engine_config.use_fused_kernels
-                    ref_uses_fused_kernels = self.ref is not None and self.ref.engine_config.use_fused_kernels
-                    if actor_uses_fused_kernels or ref_uses_fused_kernels:
-                        raise ValueError("Logit distillation requires disabling fused kernels.")
                 self.loss_fn = partial(
                     sdpo_ppo_loss,
                     config=actor_config,
@@ -690,9 +739,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def compute_log_prob(self, data: TensorDict) -> TensorDict:
         from verl.utils.debug_breakpoints import should_break
         if should_break("compute_log_prob"): breakpoint()
+        # Log-probs and entropy are all this pass returns, and the fused kernel produces
+        # both straight from the hidden states: a full sequence would otherwise widen to
+        # (tokens x vocab) logits plus a same-sized softmax copy to yield one float
+        # per token (17.5 GiB each at 61k tokens, measured).
+        tu.assign_non_tensor(data, use_fused_kernels=self.actor.engine_config.use_fused_kernels)
         output = self.actor.infer_batch(data)
 
         return output.cpu() if output is not None else None
+
+    def _chunked_distill_topk(self):
+        """Top-k width when the head should reduce each chunk itself, else None."""
+        if not (self.sdpo_enabled and self.actor.model_config.get("use_chunked_lm_head", False)):
+            return None
+        return self.sdpo_config.distillation_topk
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
@@ -700,6 +760,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def update_actor(self, data: TensorDict) -> TensorDict:
         from verl.utils.debug_breakpoints import should_break
         if should_break("update_actor"): breakpoint()
+
+        if self.sdpo_enabled:
+            attach_response_keep_positions(data)
+        # SDPO reads top-k and a logsumexp off the real logits, which the fused kernel
+        # never materializes; span-only keeps this pass cheap anyway. Other loss modes
+        # never read logits, so they keep the engine's configured fused setting
+        # (train_batch injects it when the key is absent): forcing it off on vanilla
+        # PPO materializes full-vocab logits over the whole sequence with nothing to
+        # bound them -- 43.8k tokens x 248320 x bf16 = the 20.26 GiB OOM of job 3206010.
+        if self.sdpo_enabled:
+            tu.assign_non_tensor(data, use_fused_kernels=False)
+        if self._chunked_distill_topk() is not None:
+            tu.assign_non_tensor(data, chunked_distill_topk=self._chunked_distill_topk())
 
         output = self.actor.train_mini_batch(data=data)
         if self.sdpo_enabled and tu.get_non_tensor_data(output, "did_update", default=True):
@@ -729,7 +802,39 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # sequence as a nested (no-padding) tensor and we rebuild the padded layout here, while
         # the legacy path already carries the padded teacher tensors (and precomputed mask/pos).
         teacher_input_ids = data["teacher_input_ids"]
-        if teacher_input_ids.is_nested:
+        turn_meta = tu.get(data, "teacher_seq_meta", default=None)
+        sub_spans = None
+        if teacher_input_ids.is_nested and turn_meta is not None:
+            # turn_hints teacher: score each spliced sub-row's body, then scatter the span outputs
+            # back to the response grid.
+            batch_size = data["responses"].size(0)
+            full_response_length = max(r.shape[0] for r in data["responses"].unbind())
+            sub_seqs, sub_resps, sub_masks, sub_spans = explode_turn_teacher_rows(
+                teacher_input_ids=teacher_input_ids,
+                teacher_seq_meta=turn_meta,
+                responses=data["responses"],
+                mask_dtype=data["response_mask"].dtype,
+            )
+            (
+                teacher_input_ids,
+                teacher_attention_mask,
+                teacher_position_ids,
+                responses,
+                response_mask,
+            ) = reconstruct_padded_teacher_from_nested(
+                teacher_input_ids=sub_seqs,
+                responses=sub_resps,
+                response_mask=sub_masks,
+                pad_token_id=tu.get_non_tensor_data(data=data, key="pad_token_id", default=0),
+            )
+            if student_topk_indices is not None:
+                sub_indices = student_topk_indices.new_zeros(
+                    (len(sub_spans), responses.shape[1], student_topk_indices.shape[-1])
+                )
+                for j, parent, body_slice, response_slice in body_slices(sub_spans):
+                    sub_indices[j, body_slice] = student_topk_indices[parent, response_slice]
+                student_topk_indices = sub_indices
+        elif teacher_input_ids.is_nested:
             (
                 teacher_input_ids,
                 teacher_attention_mask,
@@ -781,14 +886,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             ),
             "use_dynamic_bsz": False,
             "max_token_len_per_gpu": None,
-            "micro_batch_size_per_gpu": data.batch_size[0],
-            "use_fused_kernels": tu.get_non_tensor_data(
-                data=data, key="use_fused_kernels", default=self.ref.engine_config.use_fused_kernels
-            ),
+            "micro_batch_size_per_gpu": responses.shape[0],
+            # the teacher's outputs are top-k logps read off the logits, same as the student
+            "use_fused_kernels": False,
             "calculate_entropy": False,
             "distillation_use_topk": use_logits_processor,
         }
         tu.assign_non_tensor(teacher_td, **default_keys)
+
+        # Span-only lm_head: only hinted-span positions are ever consumed from spliced teacher rows.
+        if sub_spans is not None:
+            teacher_td["logits_keep_positions"] = turn_keep_positions(sub_seqs, sub_resps, sub_spans)
 
         # When full-logit distillation is on (top-k or all-vocab), run the teacher
         # extractor as the engine's logits processor; otherwise only plain log_probs
@@ -798,11 +906,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with self.ref.engine.eval_mode(disable_auto_offload=False):
             output = self.ref.engine.infer_batch(teacher_td, loss_function=loss_function)
         model_output = output["model_output"]
-        result = {"teacher_log_probs": no_padding_2_padding(model_output["log_probs"], teacher_td).float()}
+
+        def to_response_grid(values: torch.Tensor) -> torch.Tensor:
+            padded = no_padding_2_padding(values, teacher_td).float()
+            if sub_spans is None:
+                return padded
+            return scatter_turn_teacher_outputs(padded, sub_spans, batch_size, full_response_length)
+
+        result = {"teacher_log_probs": to_response_grid(model_output["log_probs"])}
         if return_all_logps:
-            result["teacher_all_log_probs"] = no_padding_2_padding(model_output["all_logps"], teacher_td).float()
+            result["teacher_all_log_probs"] = to_response_grid(model_output["all_logps"])
         elif student_topk_indices is not None:
-            result["teacher_topk_log_probs"] = no_padding_2_padding(model_output["topk_logps"], teacher_td).float()
+            result["teacher_topk_log_probs"] = to_response_grid(model_output["topk_logps"])
         return result
 
     def _update_teacher_ema(self) -> None:
@@ -812,7 +927,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         teacher_regularization = self.sdpo_config.teacher_regularization
         if teacher_regularization != "ema":
             return
-        update_rate = self._resolve_sdpo_teacher_update_rate()
+        update_rate = float(self.sdpo_config.teacher_update_rate)
         if update_rate == 0.0:
             return
         with torch.no_grad():
@@ -838,18 +953,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         trust_region_teacher = TrustRegionTeacher(
             ref_module=self.ref.engine.module,
             student_module=self.actor.engine.module,
-            mix_coef=self._resolve_sdpo_teacher_update_rate(),
+            mix_coef=float(self.sdpo_config.teacher_update_rate),
         )
 
         set_inference_module = getattr(self.ref.engine, "set_inference_module", None)
         if set_inference_module is None:
             raise RuntimeError("SDPO trust_region teacher requires an engine that supports an inference module.")
         set_inference_module(trust_region_teacher)
-
-    def _resolve_sdpo_teacher_update_rate(self) -> float:
-        rate = getattr(self.sdpo_config, "teacher_update_rate", None)
-        legacy = getattr(self.sdpo_config, "ema_update_rate", 0.05)
-        return float(legacy if rate is None else rate)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):

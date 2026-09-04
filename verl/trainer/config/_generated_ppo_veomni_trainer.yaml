@@ -100,6 +100,7 @@ actor_rollout_ref:
       async_save: false
       strict: true
     use_fused_kernels: ${oc.select:actor_rollout_ref.model.use_fused_kernels,false}
+    drop_unsupervised_rows: false
     profiler:
       _target_: verl.utils.profiler.ProfilerConfig
       tool: ${oc.select:global_profiler.tool,null}
@@ -139,13 +140,31 @@ actor_rollout_ref:
       alpha: 0.5
       success_reward_threshold: 0.5
       teacher_regularization: ema
-      teacher_update_rate: null
-      ema_update_rate: 0.05
+      teacher_update_rate: 0.05
+      is_clip: 2
+      teacher: reprompt
+      chat_template_kwargs: {}
+      turn_hint_template: '[Guidance for your next action: {hint}
+
+        Work out in your own words what this implies for the current state before
+        you act, then take the action it points to. Do not acknowledge it, thank anyone
+        for it, quote it, or refer to it: it is not part of the conversation, and
+        the turn you write must read as if it were never sent.]
+
+        '
+      call_hint_template: '[A note on the tool call you are about to write: {hint}
+
+        Continue exactly where you left off: your next output is the tool call itself
+        - no reply, no acknowledgement, no further reasoning, as if this note were
+        never sent.]
+
+        '
+      max_hinted_turns: null
+      call_loss_weight: 1.0
       max_reprompt_len: 10240
       reprompt_truncation: right
       dont_reprompt_on_self_success: true
       remove_thinking_from_demonstration: true
-      is_clip: 2
       reprompt_template: '{prompt}{solution}{feedback}
 
 
@@ -408,6 +427,7 @@ actor_rollout_ref:
     override_config: {}
     enable_gradient_checkpointing: true
     enable_activation_offload: false
+    freeze_vision_tower: false
     use_remove_padding: true
     lora_rank: 0
     lora_alpha: 16
@@ -418,6 +438,8 @@ actor_rollout_ref:
     use_fused_kernels: false
     fused_kernel_options:
       impl_backend: torch
+    use_chunked_lm_head: false
+    chunked_lm_head_size: 512
     tiled_mlp:
       enabled: false
       num_shards: 4
@@ -611,6 +633,7 @@ critic:
     override_config: {}
     enable_gradient_checkpointing: true
     enable_activation_offload: false
+    freeze_vision_tower: false
     use_remove_padding: true
     lora_rank: 0
     lora_alpha: 16
@@ -621,6 +644,8 @@ critic:
     use_fused_kernels: false
     fused_kernel_options:
       impl_backend: torch
+    use_chunked_lm_head: false
+    chunked_lm_head_size: 512
     tiled_mlp:
       enabled: false
       num_shards: 4

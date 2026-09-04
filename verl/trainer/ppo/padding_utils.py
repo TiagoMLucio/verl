@@ -34,6 +34,7 @@ try:
 except ImportError:
     from verl.utils.transferqueue_utils import KVBatchMeta, tq
 
+from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 
@@ -118,6 +119,23 @@ def construct_minimal_padding_template(
         template_sample["routed_experts"] = routed_experts
     else:
         template_sample.pop("routed_experts", None)
+
+    # SDPO teacher fields precede balancing; a real row's spans on the 1-token stub poison the turn-mode teacher scatter
+    if "teacher_input_ids" in template_sample:
+        template_sample["teacher_input_ids"] = input_ids.clone()
+    if "teacher_seq_meta" in template_sample:
+        template_sample["teacher_seq_meta"] = torch.tensor(DEGENERATE_META, dtype=torch.int64)
+    if "trace_weight" in template_sample:
+        template_sample["trace_weight"] = torch.zeros_like(template_sample["trace_weight"])
+    if "traj_id" in template_sample:
+        # sentinel: a synthetic row belongs to no trajectory, and inheriting the template's
+        # id would fold it into a real trajectory's group
+        template_sample["traj_id"] = torch.full_like(template_sample["traj_id"], -1)
+    if "self_distillation_mask" in template_sample:
+        sd_mask = template_sample["self_distillation_mask"]
+        template_sample["self_distillation_mask"] = (
+            torch.zeros_like(sd_mask) if sd_mask.dim() == 0 else torch.zeros(1, dtype=sd_mask.dtype)
+        )
 
     # Padding flag is deployed to protect metrics calculation (e.g. response length, score, reward).
     template_tag.update(is_padding=True, prompt_len=1, response_len=1, seq_len=2)

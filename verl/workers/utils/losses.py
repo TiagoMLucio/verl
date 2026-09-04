@@ -39,6 +39,9 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
     dp_size = data["dp_size"]
     batch_num_tokens = data["batch_num_tokens"]
+    if not batch_num_tokens:
+        # zero-supervised mini: 0/0 would NaN the loss value (its grads are already zero)
+        batch_num_tokens = 1
 
     log_prob = model_output["log_probs"]
 
@@ -64,6 +67,20 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     return loss, {}
 
 
+def _loss_metric_aggregation(config: ActorConfig, data: TensorDict) -> AggregationType:
+    # assumes that if any of the global batch info is set, the policy_loss_fn will
+    # normalize using dp_size/global_bsz/global_token; in this case, metric aggregation should be SUM
+    # to reflect the mean loss over the global batch
+    if (
+        data["dp_size"] > 1
+        or data["batch_num_tokens"] is not None
+        or data["global_batch_size"] is not None
+        or config.loss_scale_factor is not None
+    ):
+        return AggregationType.SUM
+    return AggregationType.MEAN
+
+
 def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     """Computes ppo loss from model output (log_prob, entropy, values, etc. ) and old_log_probs from data."""
     log_prob = no_padding_2_padding(model_output["log_probs"], data)
@@ -77,18 +94,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     config.global_batch_info["global_batch_size"] = data["global_batch_size"]
     config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
 
-    # assumes that if any of the global batch info is set, the policy_loss_fn will
-    # normalize using dp_size/global_bsz/global_token; in this case, metric aggregation should be SUM
-    # to reflect the mean loss over the global batch
-    if (
-        data["dp_size"] > 1
-        or data["batch_num_tokens"] is not None
-        or data["global_batch_size"] is not None
-        or config.loss_scale_factor is not None
-    ):
-        metric_aggregation = AggregationType.SUM
-    else:
-        metric_aggregation = AggregationType.MEAN
+    metric_aggregation = _loss_metric_aggregation(config, data)
 
     metrics = {}
 
@@ -154,7 +160,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     return policy_loss, metrics
 
 
-def _sdpo_response_topk_indices_to_no_padding(data: TensorDict, logits: torch.Tensor) -> Optional[torch.Tensor]:
+def _sdpo_response_topk_indices_to_no_padding(
+    data: TensorDict, logits: torch.Tensor, logits_keep_idx: Optional[torch.Tensor] = None
+) -> Optional[torch.Tensor]:
     """Map padded response top-k indices onto the flattened no-padding sequence."""
     topk_indices = tu.get(data, "student_topk_indices", default=None)
     if topk_indices is None:
@@ -176,6 +184,8 @@ def _sdpo_response_topk_indices_to_no_padding(data: TensorDict, logits: torch.Te
 
     indices = tu.get_non_tensor_data(data=data, key="indices", default=None)
     gathered_indices = index_first_axis(rearrange(full_topk_indices, "b s k -> (b s) k"), indices)
+    if logits_keep_idx is not None:
+        gathered_indices = gathered_indices[logits_keep_idx]
     sp_size = tu.get_non_tensor_data(data=data, key="sp_size", default=1)
     if sp_size > 1:
         from verl.utils.ulysses import slice_input_tensor
@@ -185,8 +195,11 @@ def _sdpo_response_topk_indices_to_no_padding(data: TensorDict, logits: torch.Te
 
 
 def _sdpo_logits_processor(student_logits: torch.Tensor, sdpo_config) -> dict:
-    """Logits-processor call during actor forward: compute student top-k or full logps."""
-    logits = student_logits.squeeze(0)  # (total_nnz, vocab_size)
+    """Logits-processor call during actor forward: compute student top-k or full logps.
+
+    Keeps the (1, total_nnz, ...) leading batch dim so the engine's squeeze(0) stays
+    unambiguous when only a single packed position is kept."""
+    logits = student_logits  # (1, total_nnz, vocab_size)
     distill_topk = sdpo_config.distillation_topk
     if distill_topk is not None:
         topk = min(distill_topk, logits.shape[-1])
@@ -201,18 +214,26 @@ def _sdpo_logits_processor(student_logits: torch.Tensor, sdpo_config) -> dict:
 def _sdpo_teacher_extractor(
     student_logits: Optional[torch.Tensor] = None,
     data=None,
+    logits_keep_idx: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> dict | tuple[torch.Tensor, dict]:
-    """Teacher logits processor for full-vocab or student-top-k SDPO targets."""
+    """Teacher logits processor for full-vocab or student-top-k SDPO targets.
+
+    With ``logits_keep_idx``, ``student_logits`` holds only those packed positions
+    (span-only lm_head) and the top-k index map is subset accordingly.
+    """
     if student_logits is None:
         return torch.tensor(1.0, device=get_device_name()), {}
     logits = student_logits.squeeze(0)
-    topk_indices = _sdpo_response_topk_indices_to_no_padding(data=data, logits=logits)
+    topk_indices = _sdpo_response_topk_indices_to_no_padding(
+        data=data, logits=logits, logits_keep_idx=logits_keep_idx
+    )
+    # outputs keep the (1, total_nnz, ...) batch dim: engine contract shared with _sdpo_logits_processor
     if topk_indices is None:
-        return {"all_logps": torch.log_softmax(logits, dim=-1)}
+        return {"all_logps": torch.log_softmax(logits, dim=-1).unsqueeze(0)}
     topk_logits = torch.gather(logits, dim=-1, index=topk_indices)
     logsumexp = torch.logsumexp(logits, dim=-1, keepdim=True)
-    return {"topk_logps": topk_logits - logsumexp}
+    return {"topk_logps": (topk_logits - logsumexp).unsqueeze(0)}
 
 
 def sdpo_ppo_loss(
@@ -223,9 +244,12 @@ def sdpo_ppo_loss(
     model_output: Optional[dict] = None,
     data: Optional[TensorDict] = None,
     dp_group=None,
+    logits_keep_idx: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]] | dict:
     """SDPO loss function used as both logits processor and final policy loss."""
     if student_logits is not None:
+        # span-only passes already subset student_logits; logits_keep_idx is only needed
+        # by the teacher extractor's top-k index map
         return _sdpo_logits_processor(student_logits=student_logits, sdpo_config=sdpo_config)
 
     student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
@@ -245,15 +269,20 @@ def sdpo_ppo_loss(
         for field in ("response_mask", "self_distillation_mask", "old_log_probs", "rollout_is_weights")
         if field in data
     ]
+    # one row per condensation segment: each row weighs its share of the trajectory's supervised tokens
+    trace_weight = tu.get(data, "trace_weight", default=None)
+    if trace_weight is not None:
+        if trace_weight.is_nested:
+            trace_weight = trace_weight.to_padded_tensor(0.0)
+        trace_weight = trace_weight.reshape(-1).to(torch.float32)
     padded = data.select(*pad_fields).to_padded_tensor()
     response_mask = padded["response_mask"]
     self_distillation_mask = tu.get(padded, "self_distillation_mask", default=None)
     old_log_probs = tu.get(padded, "old_log_probs", default=None)
     rollout_is_weights = tu.get(padded, "rollout_is_weights", default=None)
 
-    # The per-sample self-distillation mask is stored as a scalar field in the transfer queue,
-    # which can materialize as (batch,) or (batch, 1); collapse it to (batch,) as the legacy path.
-    if self_distillation_mask is not None and self_distillation_mask.dim() > 1:
+    # collapse the TQ-materialized (batch, 1) scalar mask; per-token (batch, response_len) masks pass through
+    if self_distillation_mask is not None and self_distillation_mask.dim() > 1 and self_distillation_mask.shape[1] == 1:
         self_distillation_mask = self_distillation_mask.reshape(self_distillation_mask.shape[0])
 
     full_logit_distillation = sdpo_config.full_logit_distillation
@@ -287,6 +316,12 @@ def sdpo_ppo_loss(
     if full_logit_distillation and distill_topk is None and teacher_all_logps is None:
         raise ValueError("SDPO: teacher_all_log_probs missing for full-logit distillation.")
 
+    # batch_num_tokens is the global supervised-token count: the SDPO update ships loss_mask = supervised mask
+    config.global_batch_info["dp_size"] = data["dp_size"]
+    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
+    config.global_batch_info["global_batch_size"] = data["global_batch_size"]
+    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
+
     loss, metrics = compute_self_distillation_loss(
         student_log_probs=student_log_probs,
         teacher_log_probs=teacher_log_probs,
@@ -300,41 +335,56 @@ def sdpo_ppo_loss(
         self_distillation_mask=self_distillation_mask,
         loss_agg_mode=config.loss_agg_mode,
         rollout_is_weights=rollout_is_weights,
+        global_batch_info=config.global_batch_info,
+        seq_weights=trace_weight,
     )
     metrics["self_distillation/empty_target_batch"] = (
         self_distillation_mask.sum().item() == 0 if self_distillation_mask is not None else False
     )
+    metric_aggregation = _loss_metric_aggregation(config, data)
 
-    config.global_batch_info["dp_size"] = data["dp_size"]
-    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
-    config.global_batch_info["global_batch_size"] = data["global_batch_size"]
-    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
-
-    if (
-        data["dp_size"] > 1
-        or data["batch_num_tokens"] is not None
-        or data["global_batch_size"] is not None
-        or config.loss_scale_factor is not None
-    ):
-        metric_aggregation = AggregationType.SUM
-    else:
-        metric_aggregation = AggregationType.MEAN
-
-    metrics = Metric.from_dict(metrics, aggregation=AggregationType.MEAN)
+    # '__sum' pairs must add across micro-batches; everything else is a per-micro-batch mean
+    summed = {k: v for k, v in metrics.items() if k.endswith("__sum")}
+    metrics = Metric.from_dict(
+        {k: v for k, v in metrics.items() if not k.endswith("__sum")}, aggregation=AggregationType.MEAN
+    )
+    metrics.update(Metric.from_dict(summed, aggregation=AggregationType.SUM))
     metrics["actor/pg_loss"] = Metric(value=loss, aggregation=metric_aggregation)
+    # the loss is a per-micro-batch share of the global mean, so the diagnostic adds up like pg_loss
+    metrics["self_distillation/loss"] = Metric(value=loss, aggregation=metric_aggregation)
     policy_loss = loss
 
     entropy = model_output.get("entropy", None)
     if entropy is not None:
         entropy = no_padding_2_padding(entropy, data)
+        # span-only update: entropy exists only at hinted-span positions, so average there
+        entropy_mask = response_mask
+        if (
+            "logits_keep_positions" in data.keys()
+            and self_distillation_mask is not None
+            and self_distillation_mask.dim() > 1
+        ):
+            entropy_mask = response_mask * self_distillation_mask
+        # a 0 batch_num_tokens would make entropy_loss inf with NaN grads (entropy connects to the graph unmasked)
+        entropy_gbi = dict(config.global_batch_info or {})
+        if not entropy_gbi.get("batch_num_tokens"):
+            entropy_gbi["batch_num_tokens"] = entropy_mask.sum().clamp(min=1.0)
         entropy_loss = agg_loss(
             loss_mat=entropy,
-            loss_mask=response_mask,
+            loss_mask=entropy_mask,
             loss_agg_mode=config.loss_agg_mode,
-            **config.global_batch_info,
+            **entropy_gbi,
         )
         policy_loss -= config.entropy_coeff * entropy_loss
         metrics["actor/entropy_loss"] = Metric(value=entropy_loss, aggregation=metric_aggregation)
+        # Is the policy sharpening only where we train it, or everywhere? Summed, not meaned:
+        # un-hinted micro-batches would otherwise drag the average toward zero.
+        metrics["entropy_hinted__sum"] = Metric(
+            value=(entropy.detach() * entropy_mask).sum(), aggregation=AggregationType.SUM
+        )
+        metrics["entropy_hinted_tokens__sum"] = Metric(
+            value=entropy_mask.sum(), aggregation=AggregationType.SUM
+        )
 
     return policy_loss, metrics
 

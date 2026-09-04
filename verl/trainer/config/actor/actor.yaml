@@ -162,6 +162,9 @@ optim:
 # Whether to use custom fused kernels (e.g., FlashAttention, fused MLP)
 use_fused_kernels: ${oc.select:actor_rollout_ref.model.use_fused_kernels,false}
 
+# whether to skip rows carrying no supervision, which cost a forward and backward for no gradient.
+drop_unsupervised_rows: False
+
 # profile the actor model in `update_policy` 
 profiler:
 
@@ -260,7 +263,7 @@ profiler:
       # Whether to fail on unknown stage or missing msprobe
       strict: ${oc.select:global_profiler.global_tool_config.precision_debugger.strict,False}
 
-# Self-distillation (SDPO) configuration — only active when policy_loss.loss_mode == "sdpo"
+# Self-distillation (SDPO) configuration: only active when policy_loss.loss_mode == "sdpo"
 self_distillation:
 
   # Target dataclass for this configuration
@@ -284,11 +287,47 @@ self_distillation:
   # Teacher regularization: ema | trust_region | none
   teacher_regularization: ema
 
-  # EMA mixing rate toward student (null falls back to ema_update_rate)
-  teacher_update_rate: null
+  # Teacher update rate in [0,1]: EMA step toward the student (ema) or trust-region mixing coefficient
+  teacher_update_rate: 0.05
 
-  # Deprecated alias for teacher_update_rate
-  ema_update_rate: 0.05
+  # IS-clipping coefficient for distillation loss (null = disabled)
+  is_clip: 2
+
+  # Which teacher builds the distillation targets: reprompt (the paper's: a fresh prompt with a
+  # successful sibling's solution and the environment feedback) | turn_hints (per-turn reflector
+  # hints: the teacher scores each hinted turn on [context<t + hint])
+  teacher: reprompt
+
+  # turn_hints teacher
+
+  # Rollout-side apply_chat_template kwargs, mirrored when deriving header/hint fragments
+  # (e.g. {enable_thinking: false} for Qwen3.5); must match the agent config's value
+  chat_template_kwargs: {}
+
+  # Template for one injected hint; spliced immediately before the hinted turn's tokens.
+  # The splice is a real user turn, so the teacher's instinct is to answer it: 9.9% of scored
+  # turns opened with "Thank you for the guidance" against 0 of 514 the student ever wrote.
+  # Those tokens exist only because the note appeared, and the student has no mass on them.
+  # "Act on this directly in your next tool call" asked for the reasoning collapse it produced:
+  # bare-call turns went 2.3% -> 91% over five steps, and the teacher's own continuations open
+  # straight with a tool call. Deliberation is restored here; the no-acknowledgement half stays.
+  turn_hint_template: "[Guidance for your next action: {hint}\nWork out in your own words what this implies for the current state before you act, then take the action it points to. Do not acknowledge it, thank anyone for it, quote it, or refer to it: it is not part of the conversation, and the turn you write must read as if it were never sent.]\n"
+
+  # Wraps hints the rollout marks `at: call` (spliced between a turn's reasoning and its tool
+  # call). The next token after it must be the call itself, so unlike the turn template it must
+  # never invite deliberation; measured at the decisive token this framing conditions as hard as
+  # the turn wrapper (12.9 vs 12.5 nats) while bare and prefill framings roughly halve the shift.
+  call_hint_template: "[A note on the tool call you are about to write: {hint}\nContinue exactly where you left off: your next output is the tool call itself - no reply, no acknowledgement, no further reasoning, as if this note were never sent.]\n"
+
+  # Cap on hinted turns per sample (keeps the first ones; null = all)
+  max_hinted_turns: null
+
+  # lambda in `L = L_turn + lambda * L_call`: weight of call-hinted rows relative to
+  # turn-hinted (pipeline) ones. 1.0 = today, where call rows carry ~85-90% of the update
+  call_loss_weight: 1.0
+
+  # reprompt teacher; under turn_hints the solution and feedback keys only feed the
+  # supervision-source metrics
 
   # Maximum token length of the reprompted teacher input
   max_reprompt_len: 10240
@@ -301,9 +340,6 @@ self_distillation:
 
   # Strip <think>...</think> from demonstrations before reprompting
   remove_thinking_from_demonstration: true
-
-  # IS-clipping coefficient for distillation loss (null = disabled)
-  is_clip: 2
 
   # Template combining prompt, solution, and feedback
   reprompt_template: "{prompt}{solution}{feedback}\n\nCorrectly solve the original question.\n"

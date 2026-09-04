@@ -27,7 +27,27 @@ def _get_attention_functions() -> tuple[Callable, Callable, Callable, Callable]:
     if is_torch_npu_available(check_device=False):
         from verl.utils.npu_flash_attn_utils import index_first_axis, pad_input, rearrange, unpad_input
     else:
-        from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+        try:
+            from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+        except ImportError:
+            # No flash-attn wheel for this (arch, torch) pair -- e.g. aarch64 + stock
+            # torch 2.10 on GH200. These are pack/unpack helpers, not attention kernels:
+            # transformers vendors _pad_input/_unpad_input as exact pure-torch drop-ins
+            # (same signature and 5-tuple return), so packing keeps working under sdpa.
+            from einops import rearrange
+            from transformers.modeling_flash_attention_utils import (
+                _pad_input as pad_input,
+                _unpad_input as unpad_input,
+            )
+
+            def index_first_axis(tensor, indices):
+                """flash_attn.bert_padding.index_first_axis, sans the custom autograd.
+
+                NOT transformers' _index_first_axis: that one flattens the leading two
+                dims (it takes (batch, seqlen, ...)), while callers here hand in an
+                already-flattened (total_tokens, ...) tensor.
+                """
+                return tensor[indices]
 
     _index_first_axis, _pad_input, _rearrange, _unpad_input = index_first_axis, pad_input, rearrange, unpad_input
 

@@ -18,6 +18,7 @@ The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 import gc
 import logging
 import os
+import time
 import warnings
 from contextlib import nullcontext
 from typing import Callable, ContextManager, Optional
@@ -34,6 +35,7 @@ import verl.utils.torch_functional as verl_F
 from verl.models.transformers.monkey_patch import apply_monkey_patch
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
+from verl.utils import trace_file
 from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.dataset.dataset_utils import DatasetPadMode
@@ -59,6 +61,7 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_optimizer,
     replace_lora_wrapper,
 )
+from verl.utils.memory_utils import take_peak
 from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.torch_functional import logprobs_from_logits
@@ -70,16 +73,56 @@ from verl.utils.ulysses import (
     ulysses_pad_and_slice_inputs,
 )
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
-from verl.workers.utils.padding import build_attention_mask_from_nested
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
 from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
 from .utils import create_device_mesh, get_sharding_strategy
 
 logger = logging.getLogger(__file__)
+
+_SPAN_DIAG = 0
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+_VISION_TOWER_ATTRS = ("visual", "vision_tower", "vision_model")
+
+
+def _find_vision_tower(module: torch.nn.Module) -> Optional[torch.nn.Module]:
+    """First submodule registered under a vision-tower attribute name, or None."""
+    for name, submodule in module.named_modules():
+        if name.rsplit(".", 1)[-1] in _VISION_TOWER_ATTRS:
+            return submodule
+    return None
+
+
+def _freeze_vision_tower(module: torch.nn.Module) -> None:
+    tower = _find_vision_tower(module)
+    assert tower is not None, "freeze_vision_tower is set but the model has no vision tower"
+    tower.requires_grad_(False)
+
+
+def _compile_transformer_layers(module: torch.nn.Module) -> int:
+    """torch.compile every transformer block, in place, leaving any vision tower eager.
+
+    Regional on purpose. Compiling the whole model is not an option here: the wrapped module
+    would break at every FSDP hook, and a VLM's tower carries data-dependent shapes that
+    graph-break unconditionally. Blocks are the unit FSDP wraps, so compiling them before
+    `fully_shard` leaves the unshard/reshard hooks outside the compiled region, and HF's
+    gradient checkpointing (which wraps `__call__`) outside it as well.
+    """
+    layer_cls_names = set(getattr(module, "_no_split_modules", None) or [])
+    if not layer_cls_names:
+        return 0
+    tower = _find_vision_tower(module)
+    skip = {id(m) for m in tower.modules()} if tower is not None else set()
+
+    compiled = 0
+    for submodule in module.modules():
+        if type(submodule).__name__ in layer_cls_names and id(submodule) not in skip:
+            submodule.forward = torch.compile(submodule.forward, dynamic=True)
+            compiled += 1
+    return compiled
 
 
 class FSDPEngine(BaseEngine):
@@ -293,12 +336,14 @@ class FSDPEngine(BaseEngine):
             )
 
             use_fused_kernels = self.model_config.use_fused_kernels
+            use_chunked_lm_head = self.model_config.get("use_chunked_lm_head", False)
             apply_monkey_patch(
                 model=module,
                 use_remove_padding=self.use_remove_padding,
                 ulysses_sp_size=self.ulysses_sequence_parallel_size,
                 use_fused_kernels=use_fused_kernels,
-                fused_kernels_backend=fused_kernels_backend,
+                fused_kernels_backend=fused_kernels_backend or ("torch" if use_chunked_lm_head else None),
+                use_chunked_lm_head=use_chunked_lm_head,
             )
 
             # some parameters may not in torch_dtype
@@ -306,6 +351,23 @@ class FSDPEngine(BaseEngine):
 
             if self.model_config.enable_gradient_checkpointing:
                 module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
+            # Both must land before FSDP wraps: the wrap policy reads requires_grad, and a
+            # block has to be compiled while it is still a plain nn.Module.
+            if self.model_config.freeze_vision_tower:
+                assert not self._is_lora, "freeze_vision_tower and LoRA both freeze; pick one"
+                # the tower's non-block parameters share the root unit with the trained ones,
+                # which FSDP1 can only flatten under use_orig_params
+                assert self.engine_config.strategy == "fsdp2" or self.engine_config.use_orig_params, (
+                    "freeze_vision_tower on FSDP1 requires engine.use_orig_params=True"
+                )
+                _freeze_vision_tower(module)
+
+            if self.engine_config.compile_transformer_layers:
+                n_compiled = _compile_transformer_layers(module)
+                assert n_compiled > 0, "compile_transformer_layers matched no block: _no_split_modules is empty"
+                if self.rank == 0:
+                    print(f"torch.compile applied to {n_compiled} transformer blocks")
         return module
 
     def _build_lora_module(self, module):
@@ -455,7 +517,13 @@ class FSDPEngine(BaseEngine):
     def _build_optimizer(self, module):
         from verl.workers.config.optimizer import build_optimizer
 
-        optimizer = build_optimizer(module.parameters(), self.optimizer_config)
+        parameters = module.parameters()
+        if self.model_config.freeze_vision_tower:
+            # Adam allocates its state lazily, per parameter that shows up with a gradient,
+            # so a frozen parameter left in a param group costs nothing -- but it would still
+            # be carried through state_dict and clip. Keep the groups to what is trained.
+            parameters = [p for p in parameters if p.requires_grad]
+        optimizer = build_optimizer(parameters, self.optimizer_config)
 
         return optimizer
 
@@ -642,16 +710,39 @@ class FSDPEngine(BaseEngine):
         # and _build_fsdp_module, so self.scaler may not be set.
         scaler = getattr(self, "scaler", None)
 
-        for micro_batch in micro_batches:
+        traced = trace_file.enabled()
+        for micro_idx, micro_batch in enumerate(micro_batches):
+            # Peaks, not before/after differences: the transient that ends a run is raised
+            # inside backward() (2990356 died on an 11.59 GiB allocation there), so a
+            # boundary sample straddles it. take_peak() folds the outgoing peak into the
+            # run-level maxima before resetting, leaving perf/max_memory_allocated_gb intact.
+            mb_start = time.time()
+            if traced:
+                take_peak()
+            fwd_peak = bwd_peak = (0, 0)
             with ctx:
-                loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
+                loss, meta_info = self.forward_step(
+                    micro_batch, loss_function=loss_function, forward_only=forward_only
+                )
+                if traced:
+                    fwd_peak = take_peak()
 
                 if not forward_only:
+                    bwd_start = time.time()
                     if scaler is not None:
                         scaler.scale(loss).backward()
                     else:
                         loss.backward()
+                    if traced:
+                        bwd_peak = take_peak()
+                        trace_file.emit("update/bwd", bwd_start, time.time(), **_gb_args("peak", bwd_peak))
 
+            if traced:
+                trace_file.emit(
+                    "update/micro_batch", mb_start, time.time(),
+                    **_micro_batch_args(micro_idx, micro_batch),
+                    **_gb_args("fwd_peak", fwd_peak), **_gb_args("bwd_peak", bwd_peak),
+                )
             output_lst.append(meta_info)
 
         # postprocess and return
@@ -922,6 +1013,77 @@ class EngineTrainModeCtx(BaseEngineCtx):
         super().__exit__(exc_type, exc_value, traceback)
 
 
+
+_MICRO_BATCH_ARGS_WARNED = False
+
+
+def _scalar(value):
+    """First element of a per-row field, which reaches here as a nested or plain tensor,
+    or as a list once TensorDict has unwrapped a NonTensorStack."""
+    if isinstance(value, torch.Tensor):
+        flat = value.values() if value.is_nested else value.reshape(-1)
+        return int(flat[0]) if flat.numel() else None
+    if isinstance(value, (list, tuple)) and value:
+        return _scalar(value[0]) if isinstance(value[0], (list, tuple, torch.Tensor)) else int(value[0])
+    return None
+
+
+def _micro_batch_args(micro_idx, micro_batch) -> dict:
+    """Identity of a micro-batch, so a slow or fat step can be traced back to its trajectory.
+
+    Diagnostics must never take a run down, so a field that cannot be read is dropped and
+    reported once rather than raised."""
+    global _MICRO_BATCH_ARGS_WARNED
+    args = {"micro": micro_idx, "rows": int(len(micro_batch))}
+    keys = set(micro_batch.keys())
+    try:
+        if "input_ids" in keys:
+            ids = micro_batch.get("input_ids")
+            if ids.is_nested:
+                args["total_nnz"] = int(ids.offsets()[-1])
+        if "traj_id" in keys:
+            args["traj_id"] = _scalar(tu.get(micro_batch, "traj_id"))
+        if "loss_mask" in keys:
+            mask = micro_batch.get("loss_mask")
+            args["supervised_tok"] = int(mask.values().sum() if mask.is_nested else mask.sum())
+    except Exception as exc:  # noqa: BLE001
+        if not _MICRO_BATCH_ARGS_WARNED:
+            _MICRO_BATCH_ARGS_WARNED = True
+            print(f"trace: micro-batch args partially unavailable: {type(exc).__name__}: {exc}", flush=True)
+    return args
+
+
+def _gb_args(prefix: str, peak: tuple) -> dict:
+    allocated, reserved = peak
+    return {f"{prefix}_alloc_gb": round(allocated / 2**30, 3), f"{prefix}_resv_gb": round(reserved / 2**30, 3)}
+
+
+def _trace_lm_head(logits_rmpad, keep_idx, output_args, input_ids) -> None:
+    """Record how wide the lm_head went: span-only keeps hinted positions, a fallback keeps
+    the whole packed sequence and pays vocab-width memory on every token."""
+    if not trace_file.enabled():
+        return
+    now = time.time()
+    n_rows = int(logits_rmpad.shape[0])
+    total_nnz = int(output_args.get("total_nnz") or 0)
+    if not total_nnz:
+        try:
+            total_nnz = int(input_ids.offsets()[-1])
+        except (AttributeError, IndexError, RuntimeError):
+            total_nnz = n_rows
+    trace_file.emit(
+        "lm_head",
+        now,
+        now,
+        role="student" if torch.is_grad_enabled() else "teacher",
+        span_only=keep_idx is not None,
+        n_rows=n_rows,
+        total_nnz=total_nnz,
+        vocab=int(logits_rmpad.shape[-1]),
+        logits_gib=round(logits_rmpad.numel() * logits_rmpad.element_size() / 2**30, 4),
+    )
+
+
 @EngineRegistry.register(model_type="language_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
 class FSDPEngineWithLMHead(FSDPEngine):
     def prepare_model_inputs(self, micro_batch: TensorDict):
@@ -1010,6 +1172,20 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 "position_ids": position_ids_rmpad,
             }
 
+            # Row-relative positions to keep at the lm_head; HF's tensor `logits_to_keep`
+            # indexes the packed sequence dim.
+            keep_positions = micro_batch.get("logits_keep_positions", None)
+            if keep_positions is not None:
+                assert not self.use_ulysses_sp, "logits_keep_positions does not support ulysses sp"
+                assert not use_fused_kernels, "logits_keep_positions does not support fused kernels"
+                offsets = input_ids.offsets()
+                keep_idx = keep_positions.values() + offsets[:-1].repeat_interleave(
+                    keep_positions.offsets().diff()
+                )
+                model_inputs["logits_to_keep"] = keep_idx
+                output_args["logits_keep_idx"] = keep_idx
+                output_args["total_nnz"] = int(offsets[-1])
+
         else:
             if pad_mode == DatasetPadMode.NO_PADDING:
                 input_ids = micro_batch["input_ids"]
@@ -1036,16 +1212,82 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     position_ids = torch.nested.to_padded_tensor(
                         position_ids, padding=0, output_size=(batch_size, max_seq_len)
                     )
+                    # Pads continue each row's positions rather than resetting to 0. A
+                    # reset reads to transformers as a packed-sequence boundary
+                    # (masking_utils.find_packed_sequence_indices), which it only ever
+                    # looks for when the 2D mask is None and no cache is live -- exactly
+                    # this call, since forward_step passes use_cache=False. It then builds
+                    # a document mask and forbids the is_causal skip, so SDPA takes the
+                    # math kernel and materialises (bsz x heads x L x L) anyway: 21.20 GiB
+                    # on two teacher sub-rows of 18.9k, job 3203003. Dropping the mask and
+                    # keeping the positions monotonic are one fix, not two -- either alone
+                    # leaves the mask materialised. Only pad slots change value; every real
+                    # position keeps its own, so nothing the loss reads moves.
+                    ramp = torch.arange(max_seq_len, device=position_ids.device)
+                    pad_slots = ramp.unsqueeze(0) >= seq_len_effective.unsqueeze(1)
+                    last_real = position_ids.gather(1, (seq_len_effective - 1).unsqueeze(1))
+                    position_ids = torch.where(
+                        pad_slots,
+                        last_real + 1 + (ramp.unsqueeze(0) - seq_len_effective.unsqueeze(1)),
+                        position_ids,
+                    )
 
-                attention_mask = build_attention_mask_from_nested(
-                    input_ids=micro_batch["input_ids"], max_seq_len=max_seq_len
-                )
+                # No mask at all. `to_padded_tensor` pads every row on the RIGHT, and a
+                # causal LM cannot let a trailing pad reach an earlier position, so each
+                # real position attends to exactly the keys it would attend to unpadded;
+                # only real positions are ever read back out (the keep_idx gather, or the
+                # narrow over cu_seqlens below), so what the pad positions compute is
+                # discarded. Passing the mask instead disqualifies SDPA's flash backend and
+                # the math kernel materialises the whole (bsz x heads x L x L) score matrix:
+                # one row of 31.7k over 16 heads cost 29.93 GiB (job 3183777), and two
+                # teacher sub-rows padded to 17.1k cost 17.44 GiB (job 3196068) -- the
+                # padding, not the sequence, is what makes bsz > 1 quadratic here.
+                attention_mask = None
 
                 model_inputs = {
                     "input_ids": input_ids,
                     "attention_mask": attention_mask,
                     "position_ids": position_ids,
                 }
+
+                # Span-only lm_head, padded counterpart of the use_remove_padding=True
+                # branch above. HF applies a tensor `logits_to_keep` as
+                # hidden_states[:, idx, :] -- the SAME sequence positions for every row --
+                # so rows with different spans (the SDPO teacher's spliced sub-rows) go in
+                # as the union of their positions, and each row's own slice is gathered
+                # back out in prepare_model_outputs. Still bounded by the kept spans
+                # instead of the full sequence, which is what makes a 248k-vocab lm_head
+                # affordable here.
+                keep_positions = micro_batch.get("logits_keep_positions", None)
+                # one-off diagnostic: span-only is what keeps a 248k-vocab lm_head affordable,
+                # and its absence is silent -- it just materialises the whole sequence.
+                global _SPAN_DIAG
+                if _SPAN_DIAG < 4:
+                    _SPAN_DIAG += 1
+                    _tot = int(micro_batch["input_ids"].offsets()[-1])
+                    if keep_positions is None:
+                        logger.warning(
+                            "[span-only] INACTIVE: no logits_keep_positions in micro_batch "
+                            "(keys=%s); lm_head will run over all %d tokens",
+                            sorted(micro_batch.keys()), _tot)
+                    else:
+                        logger.warning("[span-only] active: %d kept of %d tokens",
+                                       int(keep_positions.values().shape[0]), _tot)
+                if keep_positions is not None:
+                    assert not use_fused_kernels, "logits_keep_positions does not support fused kernels"
+                    nested_ids = micro_batch["input_ids"]
+                    nested_offsets = nested_ids.offsets()
+                    keep_rows = list(keep_positions.unbind())
+                    # sorted+deduped, so searchsorted maps each row's positions into it
+                    keep_union = torch.unique(torch.cat(keep_rows))
+                    model_inputs["logits_to_keep"] = keep_union
+                    # packed indices, row-major -- same layout and meaning as the rmpad branch
+                    output_args["logits_keep_idx"] = keep_positions.values() + nested_offsets[
+                        :-1
+                    ].repeat_interleave(keep_positions.offsets().diff())
+                    output_args["keep_union"] = keep_union
+                    output_args["keep_rows"] = keep_rows
+                    output_args["total_nnz"] = int(nested_offsets[-1])
 
             else:
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
@@ -1065,6 +1307,22 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
         model_inputs.update(multi_modal_inputs)
         model_inputs.update(extra_args)
+        # the patched forward is class-level and defaults to the fused path, so every call
+        # must state its mode once either flag has installed it
+        if self.model_config.use_fused_kernels or self.model_config.get("use_chunked_lm_head", False):
+            model_inputs["use_fused_kernels"] = use_fused_kernels
+        distill_topk = tu.get_non_tensor_data(data=micro_batch, key="chunked_distill_topk", default=None)
+        if distill_topk is not None:
+            if "keep_union" in output_args:
+                raise NotImplementedError(
+                    "the chunked head returns reductions instead of logits, and the padded "
+                    "span-only branch has no logits to gather each row's span out of; "
+                    "span-only already bounds the head on this path, so leave "
+                    "use_chunked_lm_head off when logits_keep_positions is set"
+                )
+            model_inputs["distill_topk"] = distill_topk
+            model_inputs["distill_chunk_size"] = self.model_config.get("chunked_lm_head_size", 512)
+            output_args["chunked_distill"] = True
 
         return model_inputs, output_args
 
@@ -1103,6 +1361,12 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # same model_output keys as the eager logit-processor path.
                 if distillation_use_topk:
                     aux_outputs = getattr(output, "fused_linear_aux", None)
+                    if aux_outputs is None or aux_outputs.distillation_losses is None:
+                        raise ValueError(
+                            "Top-k distillation asked for logits from a fused forward that does not "
+                            "produce them. Pass use_fused_kernels=False on this call (update_actor "
+                            "and the SDPO teacher already do)."
+                        )
                     if aux_outputs is not None and aux_outputs.distillation_losses is not None:
                         cu_seqlens = input_ids.offsets()
                         for field_name in ("distillation_losses", "student_mass", "teacher_mass"):
@@ -1111,8 +1375,39 @@ class FSDPEngineWithLMHead(FSDPEngine):
                                 pad_size = output_args["pad_size"]
                                 v = gather_outputs_and_unpad(v, gather_dim=0, unpad_dim=0, padding_size=pad_size)
                             model_output[field_name] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
+            elif output_args.get("chunked_distill"):
+                # the head already reduced each chunk, so there are no logits to read;
+                # scatter the reductions back onto the packed sequence like the eager path
+                if calculate_entropy or calculate_sum_pi_squared:
+                    raise NotImplementedError(
+                        "the chunked head returns reductions, not logits, so entropy and "
+                        "sum_pi_squared cannot be derived from it"
+                    )
+                keep_idx = output_args.get("logits_keep_idx")
+                total_nnz = output_args.get("total_nnz")
+                log_probs = output.log_probs.squeeze(0)
+                reductions = {
+                    "topk_logps": output.topk_logps.squeeze(0),
+                    "topk_indices": output.topk_indices.squeeze(0),
+                }
+                if keep_idx is not None:
+                    log_probs = log_probs.new_zeros(total_nnz).index_copy_(0, keep_idx, log_probs)
+                cu_seqlens = input_ids.offsets()
+                for name, value in reductions.items():
+                    if keep_idx is not None:
+                        value = value.new_zeros((total_nnz, *value.shape[1:])).index_copy_(0, keep_idx, value)
+                    model_output[name] = torch.nested.nested_tensor_from_jagged(value, cu_seqlens)
+
             else:
-                logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                keep_idx = output_args.get("logits_keep_idx")
+                labels_rmpad = input_ids_rmpad_rolled
+                if keep_idx is not None:
+                    assert not calculate_sum_pi_squared, "logits_keep_positions does not support sum_pi_squared"
+                    temperature_rmpad = temperature_rmpad[keep_idx]
+                    labels_rmpad = labels_rmpad[keep_idx]
+
+                logits_rmpad = output.logits.squeeze(0)  # (total_nnz or n_keep, vocab_size)
+                _trace_lm_head(logits_rmpad, keep_idx, output_args, input_ids)
                 logits_rmpad.div_(temperature_rmpad.clamp(min=1e-8).unsqueeze(-1).to(logits_rmpad.dtype))
 
                 # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
@@ -1121,9 +1416,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     inplace_backward = False
                 log_probs = logprobs_from_logits(
                     logits=logits_rmpad,
-                    labels=input_ids_rmpad_rolled,
+                    labels=labels_rmpad,
                     inplace_backward=inplace_backward,
                 )
+                if keep_idx is not None:
+                    log_probs = log_probs.new_zeros(output_args["total_nnz"]).index_copy_(0, keep_idx, log_probs)
 
                 # compute entropy
                 if calculate_entropy:
@@ -1133,6 +1430,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         entropy_rmpad = torch.utils.checkpoint.checkpoint(
                             self.compute_entropy_from_logits, logits_rmpad
                         )
+                    if keep_idx is not None:
+                        entropy_rmpad = entropy_rmpad.new_zeros(output_args["total_nnz"]).index_copy_(
+                            0, keep_idx, entropy_rmpad
+                        )
 
                 # compute sum_pi_squared (Σπ²) for optimal-baseline advantage estimators
                 if calculate_sum_pi_squared:
@@ -1140,10 +1441,16 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
                 # logits_processor_func return tensors with shape (1, total_nnz/sp_size)
                 if distillation_use_topk:
-                    outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
+                    processor_kwargs = {} if keep_idx is None else {"logits_keep_idx": keep_idx}
+                    with trace_file.span("update/topk", rows=int(logits_rmpad.shape[0])):
+                        outputs = logits_processor_func(
+                            student_logits=logits_rmpad.unsqueeze(0), data=micro_batch, **processor_kwargs
+                        )
                     cu_seqlens = input_ids.offsets()
                     for k, v in outputs.items():
                         v = v.squeeze(0)
+                        if keep_idx is not None:
+                            v = v.new_zeros((output_args["total_nnz"], *v.shape[1:])).index_copy_(0, keep_idx, v)
                         assert v.shape[0] == log_probs.shape[0], (
                             f"log_probs shape: {log_probs.shape}, {k} shape: {v.shape}"
                         )
@@ -1189,23 +1496,115 @@ class FSDPEngineWithLMHead(FSDPEngine):
             else:
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
+        elif output_args.get("logits_keep_idx") is not None:
+            # Span-only, padded path: the lm_head ran on the union of kept positions, so
+            # `output.logits` is (bsz, |union|, vocab) rather than the full sequence.
+            # Below mirrors the use_remove_padding=True keep_idx branch verbatim -- gather
+            # each row's own positions, work in the packed layout, scatter the reductions
+            # back over total_nnz -- so both paths produce identical fields.
+            assert pad_mode == DatasetPadMode.NO_PADDING, f"pad_mode {pad_mode} not implemented"
+            assert not calculate_sum_pi_squared, "logits_keep_positions does not support sum_pi_squared"
+            keep_idx = output_args["logits_keep_idx"]
+            keep_union = output_args["keep_union"]
+            keep_rows = output_args["keep_rows"]
+            total_nnz = output_args["total_nnz"]
+            cu_seqlens = input_ids.offsets()
+
+            logits_union = output.logits  # (bsz, |union|, vocab)
+            # row-major concat, matching how keep_idx was built from keep_positions.values()
+            logits_rmpad = torch.cat(
+                [
+                    logits_union[i].index_select(0, torch.searchsorted(keep_union, row))
+                    for i, row in enumerate(keep_rows)
+                ],
+                dim=0,
+            )  # (n_keep_total, vocab)
+
+            # per-position temperature, restricted to the kept positions
+            temperature_keep = (
+                output_args["temperature"].repeat_interleave(cu_seqlens.diff())[keep_idx]
+            )
+            logits_rmpad = logits_rmpad / temperature_keep.clamp(min=1e-8).unsqueeze(-1).to(logits_rmpad.dtype)
+
+            labels_keep = output_args["input_ids_rmpad_rolled"][keep_idx]
+            log_probs = logprobs_from_logits(
+                logits=logits_rmpad,
+                labels=labels_keep,
+                inplace_backward=not calculate_entropy,
+            )
+            log_probs = log_probs.new_zeros(total_nnz).index_copy_(0, keep_idx, log_probs)
+
+            if calculate_entropy:
+                if not self.engine_config.entropy_checkpointing:
+                    entropy_keep = self.compute_entropy_from_logits(logits_rmpad)
+                else:
+                    entropy_keep = torch.utils.checkpoint.checkpoint(self.compute_entropy_from_logits, logits_rmpad)
+                entropy = entropy_keep.new_zeros(total_nnz).index_copy_(0, keep_idx, entropy_keep)
+
+            if distillation_use_topk:
+                outputs = logits_processor_func(
+                    student_logits=logits_rmpad.unsqueeze(0), data=micro_batch, logits_keep_idx=keep_idx
+                )
+                for k, v in outputs.items():
+                    v = v.squeeze(0)
+                    v = v.new_zeros((total_nnz, *v.shape[1:])).index_copy_(0, keep_idx, v)
+                    assert v.shape[0] == log_probs.shape[0], (
+                        f"log_probs shape: {log_probs.shape}, {k} shape: {v.shape}"
+                    )
+                    model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
+
+            log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
+            if calculate_entropy:
+                entropy = torch.nested.nested_tensor_from_jagged(entropy, cu_seqlens)
+
         else:  # not using rmpad and no ulysses sp
             response_length = tu.get_non_tensor_data(data=micro_batch, key="max_response_length", default=1024)
             if use_fused_kernels:
-                log_probs = output.log_probs[:, -response_length - 1 : -1]
-                entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
+                if pad_mode == DatasetPadMode.NO_PADDING:
+                    # The fused kernel scored every position of the right-padded rows, so
+                    # hand back each row's real prefix as nested over cu_seqlens -- the
+                    # same contract the logits branch below produces. The legacy slice
+                    # under this fixed-width layout returns a (bsz, response_length)
+                    # padded tensor whose rows response_from_nested/no_padding_2_padding
+                    # then mis-slice into empty ones: job 3206010's vanilla update saw
+                    # old_log_probs of width 0 against a 44758-token log_prob. The label
+                    # at each row's last real position is the pad token (per-row roll),
+                    # matching the packed roll's row-crossing label there: both are
+                    # garbage, and every consumer drops that position via its -1 shift.
+                    cu_seqlens = input_ids.offsets()
+                    seq_lengths = cu_seqlens.diff()
+                    starts = torch.zeros_like(seq_lengths)
+
+                    def _rows_to_nested(padded: torch.Tensor) -> torch.Tensor:
+                        rows = torch.nested.narrow(padded, 1, starts, seq_lengths, layout=torch.jagged)
+                        return torch.nested.nested_tensor_from_jagged(
+                            torch.cat([t for t in rows.unbind()]), cu_seqlens
+                        )
+
+                    log_probs = _rows_to_nested(output.log_probs)
+                    if calculate_entropy:
+                        entropy = _rows_to_nested(output.entropy)
+                else:
+                    log_probs = output.log_probs[:, -response_length - 1 : -1]
+                    entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
 
             else:
                 logits = output.logits  # (bsz, response_length, vocab_size)
                 temperature = output_args["temperature"]  # (bsz,)
                 temperature = temperature.unsqueeze(-1).unsqueeze(-1)
-                logits.div_(temperature.clamp(min=1e-8).to(logits.dtype))
+                scale = temperature.clamp(min=1e-8).to(logits.dtype)
+                # SFT runs at temperature 1: dividing would rewrite the whole
+                # (tokens x 248k vocab) tensor to no effect
+                if not bool((scale == 1).all()):
+                    logits.div_(scale)
 
                 if calculate_entropy:
+                    # same flag-aware entropy as the rmpad path: the raw call materializes
+                    # fp32 full-vocab logits (37k tokens x 248k vocab = 37 GiB on Qwen3.5)
                     if not self.engine_config.entropy_checkpointing:
-                        entropy = verl_F.entropy_from_logits(logits)
+                        entropy = self.compute_entropy_from_logits(logits)
                     else:
-                        entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
+                        entropy = torch.utils.checkpoint.checkpoint(self.compute_entropy_from_logits, logits)
 
                 if calculate_sum_pi_squared:
                     sum_pi_squared = verl_F.calculate_sum_pi_squared_from_logits(logits)
@@ -1213,9 +1612,15 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 if pad_mode == DatasetPadMode.NO_PADDING:
                     cu_seqlens = input_ids.offsets()
                     seq_lengths = cu_seqlens.diff()
+                    # also consumed by the entropy narrow further down
                     starts = torch.zeros_like(seq_lengths, dtype=torch.int64)
-                    logits = torch.nested.narrow(logits, 1, starts, seq_lengths, layout=torch.jagged)
-                    logits_rmpad = torch.cat([t for t in logits.unbind()])
+                    if int(seq_lengths.sum()) == logits.shape[0] * logits.shape[1]:
+                        # nothing was padded (always so at micro_batch_size_per_gpu=1):
+                        # narrow+cat would copy the whole full-vocab tensor for nothing
+                        logits_rmpad = logits.reshape(-1, logits.shape[-1])
+                    else:
+                        logits = torch.nested.narrow(logits, 1, starts, seq_lengths, layout=torch.jagged)
+                        logits_rmpad = torch.cat([t for t in logits.unbind()])
                     input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
                     log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
 
@@ -1257,6 +1662,12 @@ class FSDPEngineWithLMHead(FSDPEngine):
         return model_output
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
+        # factual, not interpreted: old_log_prob and the SDPO teacher are both forward-only,
+        # and only the enclosing trainer phase tells them apart
+        with trace_file.span("update/fwd", role="inference" if forward_only else "student"):
+            return self._forward_step_inner(micro_batch, loss_function, forward_only)
+
+    def _forward_step_inner(self, micro_batch: TensorDict, loss_function, forward_only):
         device_name = get_device_name()
         # actually, we should avoid assigning like this...
         micro_batch = micro_batch.to(get_device_id())
@@ -1286,9 +1697,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
             )
 
             if loss_function is not None:
-                loss, metrics = loss_function(
-                    model_output=model_output, data=micro_batch, dp_group=self.get_data_parallel_group()
-                )
+                with trace_file.span("update/loss"):
+                    loss, metrics = loss_function(
+                        model_output=model_output, data=micro_batch, dp_group=self.get_data_parallel_group()
+                    )
             else:
                 assert forward_only, "forward_only must be True when loss_function is None"
                 loss = torch.tensor(1.0, device=device_name)

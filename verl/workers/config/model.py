@@ -117,6 +117,11 @@ class HFModelConfig(BaseConfig):
     enable_gradient_checkpointing: bool = True
     enable_activation_offload: bool = False
 
+    # Drop the vision tower out of the autograd graph on a text-only workload. The dummy
+    # image forward stays -- it is what keeps the module reachable -- but a frozen tower
+    # costs no backward, no grad reduce and no optimizer state.
+    freeze_vision_tower: bool = False
+
     use_remove_padding: bool = True
 
     # TODO: unify fsdp and megatron lora config
@@ -137,6 +142,11 @@ class HFModelConfig(BaseConfig):
 
     use_fused_kernels: bool = False
     fused_kernel_options: dict = field(default_factory=dict)
+
+    # Project the output head in chunks of positions instead of all at once. Independent of
+    # fused kernels, but shares their patched forward, so either one installs it.
+    use_chunked_lm_head: bool = False
+    chunked_lm_head_size: int = 512
 
     # TiledMLP configuration for memory-efficient MLP computation
     tiled_mlp: dict = field(default_factory=lambda: {"enabled": False, "num_shards": 4})
