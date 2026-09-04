@@ -34,6 +34,7 @@ try:
 except ImportError:
     from verl.utils.transferqueue_utils import KVBatchMeta, tq
 
+from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 
@@ -123,8 +124,7 @@ def construct_minimal_padding_template(
     if "teacher_input_ids" in template_sample:
         template_sample["teacher_input_ids"] = input_ids.clone()
     if "teacher_seq_meta" in template_sample:
-        # one sub-row: (total_len, body_len, body_start, start, end) over the 2-token stub
-        template_sample["teacher_seq_meta"] = torch.tensor([1, 2, 1, 0, 0, 1], dtype=torch.int64)
+        template_sample["teacher_seq_meta"] = torch.tensor(DEGENERATE_META, dtype=torch.int64)
     if "trace_weight" in template_sample:
         template_sample["trace_weight"] = torch.zeros_like(template_sample["trace_weight"])
     if "traj_id" in template_sample:

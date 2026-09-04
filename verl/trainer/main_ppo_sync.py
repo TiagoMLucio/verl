@@ -82,6 +82,7 @@ from verl.trainer.ppo.metric_utils import (
 from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
 from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_advantage, compute_spec_decode_metrics
 from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_teacher_policy
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils import tensordict_utils as tu
@@ -1391,7 +1392,7 @@ class PPOTrainer:
         from verl.utils.debug_breakpoints import should_break
         if should_break("teacher_build"): breakpoint()
 
-        turn_mode = bool(self_distillation_cfg.get("use_turn_feedback", False))
+        turn_mode = bool(self_distillation_cfg.use_turn_feedback)
         select_fields = ["responses", "rm_scores", "raw_prompt", "uid", "extra_fields", "response_mask"]
         if turn_mode:
             select_fields.append("prompts")
@@ -1444,7 +1445,7 @@ class PPOTrainer:
                     uids,
                     response_texts,
                     self_distillation_cfg.dont_reprompt_on_self_success,
-                    self_distillation_cfg.get("remove_thinking_from_demonstration", False),
+                    self_distillation_cfg.remove_thinking_from_demonstration,
                 ),
                 feedback=feedback_list[i],
                 extra_fields=extra_fields_list[i] if isinstance(extra_fields_list[i], dict) else {},
@@ -1458,7 +1459,7 @@ class PPOTrainer:
         response_mask_list = list(data["response_mask"].unbind())
         hinted_per_row = [
             sdpo_teacher.select_hinted_turns(
-                ctx.extra_fields, response_list[i].shape[0], self_distillation_cfg.get("max_hinted_turns")
+                ctx.extra_fields, response_list[i].shape[0], self_distillation_cfg.max_hinted_turns
             )
             if turn_mode
             else []
@@ -1512,16 +1513,14 @@ class PPOTrainer:
         # sequence per sample (the teacher prompt, stripped of its left padding, followed by the real
         # response tokens); the actor worker re-pads it and recomputes the mask / position ids.
         if turn_mode:
-            # meta [n_sub, (total_len, body_len, body_start, start, end) per sub-row] maps spliced positions back to the response grid
+            # teacher_seq_meta maps spliced positions back to the response grid (verl.trainer.ppo.sdpo.teacher_meta)
             prompt_list = data["prompts"].unbind()
-            hint_template = self_distillation_cfg.turn_feedback_template
-            call_template = self_distillation_cfg.call_feedback_template
-            template_kwargs = dict(getattr(self_distillation_cfg, "chat_template_kwargs", None) or {})
+            template_kwargs = dict(self_distillation_cfg.chat_template_kwargs)
             header_ids = torch.tensor(
                 sdpo_teacher.assistant_header_ids(self.tokenizer, template_kwargs=template_kwargs), dtype=torch.int64
             )
-            # mid-turn (at == "call") splices close the assistant turn and reopen it after the
-            # hint; the call span starts at the template's tool-call opening token
+            # call-placed splices close the assistant turn and reopen it after the hint; the
+            # call span starts at the template's tool-call opening token
             close_ids = torch.tensor(
                 self.tokenizer.encode(self.tokenizer.eos_token + "\n", add_special_tokens=False), dtype=torch.int64
             )
@@ -1537,15 +1536,8 @@ class PPOTrainer:
                 if hinted_per_row[i]:
                     if should_break("teacher_build"): breakpoint()
                     hint_ids = [
-                        torch.tensor(
-                            sdpo_teacher.hint_user_turn_ids(
-                                self.tokenizer,
-                                (call_template if at == "call" else hint_template).format(diagnosis=text),
-                                template_kwargs=template_kwargs,
-                            ),
-                            dtype=response_ids.dtype,
-                        )
-                        for *_, text, at, _target in hinted_per_row[i]
+                        sdpo_teacher.hint_token_ids(self.tokenizer, hint, self_distillation_cfg, template_kwargs)
+                        for hint in hinted_per_row[i]
                     ]
                     seq, meta, fallbacks, spans = sdpo_teacher.build_spliced_teacher_row(
                         prompt_list[i],
@@ -1565,7 +1557,7 @@ class PPOTrainer:
                     # hints-only: degenerate 1-token teacher row (padding-template pattern), zero mask.
                     # The teacher must still score every row so dp-group collectives stay in lockstep.
                     seq = torch.cat([prompt_list[i][-1:], response_ids[:1]])
-                    meta = [1, 2, 1, 0, 0, 1]  # one sub-row over the 2-token stub
+                    meta = DEGENERATE_META
                     mask_row = torch.zeros(response_ids.shape[0], dtype=torch.float32)
                 teacher_seqs.append(seq)
                 seq_meta.append(torch.tensor(meta, dtype=torch.int64))
@@ -1614,7 +1606,7 @@ class PPOTrainer:
         n_traces = len(set(traj_of_row))
         # call-hinted rows carry ~10x the per-token divergence of turn-hinted ones, so they
         # dominate the update at equal row weight; call_loss_weight rebalances the two channels
-        call_row = [any(hint[4] == "call" for hint in hinted_per_row[i]) for i in range(batch_size)]
+        call_row = [any(hint.is_call for hint in hinted_per_row[i]) for i in range(batch_size)]
         # Renormalized to the supervised-row count: raw shares sum to the number of supervised
         # trajectories, which would otherwise shrink the update by the average segments-per-
         # trajectory (~0.6x at our condensation rate) and confound comparisons across runs.
@@ -1841,7 +1833,7 @@ class PPOTrainer:
             steps = sorted(traj_steps.get(traj) or [0])
             lo, hi = steps[0], steps[-1]
             span_len = max(hi - lo, 1)
-            hinted_steps = sorted(int(step) for step, *_ in hinted)
+            hinted_steps = sorted(hint.step for hint in hinted)
             rel.extend((step - lo) / span_len for step in hinted_steps)
             gaps.extend(b - a for a, b in zip(hinted_steps, hinted_steps[1:]))
             last_two += sum(1 for step in hinted_steps if step >= hi - 1)
@@ -2137,7 +2129,7 @@ class PPOTrainer:
         self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
         sdpo_enabled = self_distillation_cfg is not None and loss_mode == "sdpo"
-        sdpo_needs_logits_processor = sdpo_enabled and self_distillation_cfg.get("full_logit_distillation", False)
+        sdpo_needs_logits_processor = sdpo_enabled and self_distillation_cfg.full_logit_distillation
         distillation_use_topk = sdpo_needs_logits_processor or (
             self.distillation_config.distillation_loss.loss_settings.use_topk
             if is_distillation_enabled(self.config.get("distillation"))

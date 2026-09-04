@@ -81,10 +81,13 @@ class SelfDistillationConfig(BaseConfig):
             when no solution is available (ignore feedback when solution exists).
         use_turn_feedback (bool): Build one spliced teacher sequence per sample from
             reflection hints (``extra_fields["turn_spans"]``/``["turn_feedback"]``), each hint
-            inserted right before its turn; samples without hints keep the whole-response
-            reprompt teacher.
-        turn_feedback_template (str): Template for one injected hint, spliced immediately
+            inserted right before its turn; samples without hints ship a degenerate teacher
+            row with a zero mask (scored only to keep dp-group collectives in lockstep) and
+            contribute nothing to the loss.
+        turn_feedback_template (str): Template for one turn-placed hint, spliced immediately
             before the hinted turn's tokens. Uses the {diagnosis} placeholder.
+        call_feedback_template (str): Template for one call-placed hint, spliced between the
+            turn's reasoning and its tool call. Uses the {diagnosis} placeholder.
         max_hinted_turns (Optional[int]): Cap on hinted turns per sample (keeps the first
             ones, earliest before the trajectory loses coherence); None hints every diagnosed turn.
     """
@@ -111,7 +114,12 @@ class SelfDistillationConfig(BaseConfig):
     # must mirror the rollout's apply_chat_template kwargs (e.g. {"enable_thinking": False}):
     # header/hint fragments are derived under these kwargs to match rollout tokens
     chat_template_kwargs: dict = field(default_factory=dict)
-    turn_feedback_template: str = "[Hindsight from a previous failed attempt that reached this exact state: {diagnosis}]\n"
+    turn_feedback_template: str = (
+        "[Guidance for your next action: {diagnosis}\n"
+        "Work out in your own words what this implies for the current state before you act, then take "
+        "the action it points to. Do not acknowledge it, thank anyone for it, quote it, or refer to it: "
+        "it is not part of the conversation, and the turn you write must read as if it were never sent.]\n"
+    )
     # wraps hints the rollout marks `at: call` (spliced between a turn's reasoning and its
     # tool call): the next token after it must be the call itself, so unlike the turn
     # template it must never invite further deliberation

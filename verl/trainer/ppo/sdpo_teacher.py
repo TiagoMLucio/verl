@@ -17,17 +17,24 @@ Per-sample selection of the privileged context (successful-sibling demo, environ
 feedback) and assembly of the teacher's reprompt messages. Pure functions over an explicit
 :class:`TeacherSampleContext`; the trainers own the batch plumbing (fetching rollout data,
 tokenization, tensor assembly).
+
+The turn-hint path pairs reflection hints with their turns (:class:`HintedTurn`) and builds
+the spliced teacher row: one sub-row per hint, its meta packed by
+:mod:`verl.trainer.ppo.sdpo.teacher_meta`.
 """
 
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import numpy as np
 import torch
 
+from verl.trainer.ppo.sdpo.teacher_meta import SubRow, pack
+
 __all__ = [
+    "HintedTurn",
     "TeacherSampleContext",
     "build_teacher_messages",
     "build_spliced_teacher_row",
@@ -35,6 +42,7 @@ __all__ = [
     "collect_solutions_by_uid",
     "extract_prompt_text",
     "feedback_used",
+    "hint_token_ids",
     "remove_thinking_trace",
     "select_hinted_turns",
     "select_solution",
@@ -118,26 +126,40 @@ def extract_prompt_text(raw_prompt: list[dict]) -> str:
     return content
 
 
+class HintedTurn(NamedTuple):
+    """One reflection hint paired with the turn it lands on: ``[start, end)`` on the response
+    grid, spliced before the whole turn (``placement == "turn"``, the default) or between the
+    turn's reasoning and its tool call (``"call"``)."""
+
+    step: int
+    start: int
+    end: int
+    text: str
+    placement: str = "turn"
+
+    @property
+    def is_call(self) -> bool:
+        return self.placement == "call"
+
+
 def select_hinted_turns(
     extra_fields: dict, response_len: int, max_hinted_turns: Optional[int] = None
-) -> list[tuple[int, int, int, str, str, "Optional[str]"]]:
-    """Pair a sample's turn spans with its reflection diagnoses as
-    (step, start, end, text, at, target), where ``at`` is ``turn`` (hint before the whole turn,
-    the default) or ``call`` (hint between the turn's reasoning and its tool call; the
-    rollout ships it as a third element of the ``turn_feedback`` entry).
+) -> list[HintedTurn]:
+    """Pair a sample's turn spans with its reflection diagnoses. The rollout ships the
+    placement as an optional third element of the ``turn_feedback`` entry; a fourth element
+    (the ``target`` field older rollout dumps still carry) is ignored.
 
     Spans are clamped to the (possibly truncated) response; with a cap, the first
     ``max_hinted_turns`` turns are kept (earliest, before the trajectory loses coherence).
     """
-    diagnoses = {int(entry[0]): (entry[1], entry[2] if len(entry) > 2 else "turn",
-                                 entry[3] if len(entry) > 3 else None)
+    diagnoses = {int(entry[0]): (entry[1], entry[2] if len(entry) > 2 else "turn")
                  for entry in (extra_fields.get("turn_feedback") or [])}
     hinted = []
     for step, start, end in extra_fields.get("turn_spans") or []:
         step, start, end = int(step), int(start), min(int(end), response_len)
         if step in diagnoses and start < end:
-            text, at, target = diagnoses[step]
-            hinted.append((step, start, end, text, at, target))
+            text, placement = diagnoses[step]
+            hinted.append(HintedTurn(step, start, end, text, placement))
     if max_hinted_turns is not None and len(hinted) > max_hinted_turns:
         hinted = hinted[:max_hinted_turns]
     return hinted
@@ -186,20 +208,40 @@ def hint_user_turn_ids(tokenizer, hint_text: str, template_kwargs=None) -> list[
     return tokenizer.encode(suffix, add_special_tokens=False)
 
 
-def _find_subseq(haystack: torch.Tensor, needle: torch.Tensor, lo: int, hi: int) -> Optional[int]:
-    """Index of the first occurrence of ``needle`` inside ``haystack[lo:hi]``, or None."""
+def hint_token_ids(tokenizer, hint: HintedTurn, cfg, template_kwargs=None) -> torch.Tensor:
+    """Token ids of ``hint`` wrapped in the template its placement calls for
+    (``cfg.call_feedback_template`` or ``cfg.turn_feedback_template``), rendered as a user turn."""
+    template = cfg.call_feedback_template if hint.is_call else cfg.turn_feedback_template
+    return torch.tensor(
+        hint_user_turn_ids(tokenizer, template.format(diagnosis=hint.text), template_kwargs=template_kwargs),
+        dtype=torch.int64,
+    )
+
+
+def _find_subseq(haystack: torch.Tensor, needle: torch.Tensor, start: int, end: int) -> Optional[int]:
+    """Index of the first occurrence of ``needle`` inside ``haystack[start:end]``, or None."""
     n = needle.shape[0]
-    if n == 0 or hi - lo < n:
+    if n == 0 or end - start < n:
         return None
-    window = haystack[lo:hi]
+    window = haystack[start:end]
     hits = (window.unfold(0, n, 1) == needle).all(dim=1).nonzero()
-    return lo + hits[0].item() if len(hits) else None
+    return start + hits[0].item() if len(hits) else None
+
+
+def _sub_row(
+    prefix: torch.Tensor, body: list[torch.Tensor], scored: int, span: tuple[int, int]
+) -> tuple[torch.Tensor, SubRow]:
+    """Concatenate one sub-row from its prefix and ordered body pieces; ``body[scored]`` is
+    the span the teacher scores."""
+    body_len = sum(part.shape[0] for part in body)
+    body_start = sum(part.shape[0] for part in body[:scored])
+    return torch.cat([prefix, *body]), SubRow(prefix.shape[0] + body_len, body_len, body_start, *span)
 
 
 def build_spliced_teacher_row(
     prompt_ids: torch.Tensor,
     response_ids: torch.Tensor,
-    hinted_turns: list[tuple[int, int, int, str, str, "Optional[str]"]],
+    hinted_turns: list[HintedTurn],
     hint_ids_list: list[torch.Tensor],
     max_prefix_len: int,
     header_ids: torch.Tensor,
@@ -209,8 +251,8 @@ def build_spliced_teacher_row(
     """One teacher sub-row per hinted turn, concatenated into a single row.
 
     Each sub-row is the trajectory up to its own turn with only its own hint spliced in,
-    and truncated after the scored span. ``at == "turn"`` hints go immediately before the
-    turn's assistant header and score the whole turn. ``at == "call"`` hints go between
+    and truncated after the scored span. Turn-placed hints go immediately before the
+    turn's assistant header and score the whole turn. Call-placed hints go between
     the turn's reasoning and its tool call: the assistant turn is closed (``close_ids``),
     the hint's user turn inserted, the assistant header reopened, and only the call span
     (from ``call_open_ids``, e.g. the ``<tool_call>`` token, to the turn's end) is scored.
@@ -220,23 +262,22 @@ def build_spliced_teacher_row(
     state it could not reach: it would see its own earlier advice followed by the student
     ignoring it.
 
-    The prompt is left-truncated to ``max_prefix_len``. Returns the concatenation, a flat
-    meta ``[n_sub, (total_len, body_len, body_start, start, end) per sub-row]``, the
-    number of fallback placements and the (start, end) spans for the distillation mask
-    (== the meta spans).
+    The prompt is left-truncated to ``max_prefix_len``. Returns the concatenation, the packed
+    meta (see :mod:`verl.trainer.ppo.sdpo.teacher_meta`), the number of fallback placements
+    and the (start, end) spans for the distillation mask (== the meta spans).
     """
     base_prefix = prompt_ids if prompt_ids.shape[0] <= max_prefix_len else prompt_ids[-max_prefix_len:]
     header = header_ids.shape[0]
     pieces: list[torch.Tensor] = []
-    meta: list[int] = []
-    spans: list[tuple[int, int]] = []
+    sub_rows: list[SubRow] = []
     fallbacks = 0
 
-    for (_, start, end, _, at, *_), hint_ids in zip(hinted_turns, hint_ids_list, strict=True):
+    for hint, hint_ids in zip(hinted_turns, hint_ids_list, strict=True):
+        start, end = hint.start, hint.end
         hint_ids = hint_ids.to(response_ids.dtype)
         prefix = base_prefix
         call_at = None
-        if at == "call" and close_ids is not None and call_open_ids is not None:
+        if hint.is_call and close_ids is not None and call_open_ids is not None:
             call_at = _find_subseq(response_ids, call_open_ids.to(response_ids.dtype), start, end)
 
         if call_at is not None:
@@ -247,11 +288,10 @@ def build_spliced_teacher_row(
                 header_ids.to(response_ids.dtype),
                 response_ids[call_at:end],  # the call, the only span the teacher scores
             ]
-            body_start = call_at + close_ids.shape[0] + hint_ids.shape[0] + header
-            span = (call_at, end)
+            row, sub_row = _sub_row(prefix, body, scored=4, span=(call_at, end))
         else:
             # one count per hint, whether the call opening was missing, the header was, or both
-            degraded = at == "call"
+            degraded = hint.is_call
             if start >= header and torch.equal(response_ids[start - header : start], header_ids):
                 insert_at = start - header
             elif start == 0 and prefix.shape[0] >= header and torch.equal(prefix[-header:], header_ids):
@@ -265,7 +305,7 @@ def build_spliced_teacher_row(
 
             if insert_at is None:
                 body = [response_ids[:start], response_ids[start:end]]
-                body_start = start
+                row, sub_row = _sub_row(prefix, body, scored=1, span=(start, end))
             else:
                 body = [
                     response_ids[:insert_at],  # untouched history, no other hints
@@ -273,15 +313,12 @@ def build_spliced_teacher_row(
                     response_ids[insert_at:start],  # the turn's assistant header
                     response_ids[start:end],  # the span the teacher scores
                 ]
-                body_start = start + hint_ids.shape[0]
-            span = (start, end)
+                row, sub_row = _sub_row(prefix, body, scored=3, span=(start, end))
 
-        body_len = sum(part.shape[0] for part in body)
-        pieces.append(torch.cat([prefix, *body]))
-        meta.extend([prefix.shape[0] + body_len, body_len, body_start, *span])
-        spans.append(span)
+        pieces.append(row)
+        sub_rows.append(sub_row)
 
-    return torch.cat(pieces), [len(hinted_turns), *meta], fallbacks, spans
+    return torch.cat(pieces), pack(sub_rows), fallbacks, [(sub_row.start, sub_row.end) for sub_row in sub_rows]
 
 
 def trace_weights(
@@ -324,8 +361,7 @@ def turn_token_mask(response_len: int, spans: list[tuple[int, int]]) -> torch.Te
 
 def feedback_used(ctx: TeacherSampleContext, cfg) -> bool:
     """Whether this sample's feedback enters the teacher context (mirrors the mask)."""
-    feedback_only_without_solution = cfg.get("environment_feedback_only_without_solution", False)
-    return ctx.feedback is not None and (not feedback_only_without_solution or ctx.solution is None)
+    return ctx.feedback is not None and (not cfg.environment_feedback_only_without_solution or ctx.solution is None)
 
 
 def build_teacher_messages(ctx: TeacherSampleContext, cfg) -> list[dict]:

@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import torch
 
+from verl.trainer.ppo.sdpo.teacher_meta import SubRowSpan, body_slices, unpack
 from verl.utils import tensordict_utils as tu
 from verl.utils.model import compute_position_id_with_mask
 
@@ -85,58 +86,49 @@ def explode_turn_teacher_rows(
     teacher_seq_meta: torch.Tensor,
     responses: torch.Tensor,
     response_mask: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int], list[list[tuple[int, int, int]]]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[SubRowSpan]]:
     """Unpack per-sample spliced teacher rows into the sub-batch the teacher forward scores.
 
-    ``teacher_seq_meta`` is flat per sample: [n_sub, then (total_len, body_len, body_start,
-    start, end) per sub-row]. Each sub-row's body is its verbatim tail, so the padded
-    reconstruction contract holds.
+    ``teacher_seq_meta`` is flat per sample (see :mod:`verl.trainer.ppo.sdpo.teacher_meta`).
+    Each sub-row's body is its verbatim tail, so the padded reconstruction contract holds.
     One sub-row per hinted turn, each carrying only its own hint, so the teacher never scores
     a turn from a state where its earlier advice was visibly ignored. Un-hinted rows ship a
     degenerate 2-token sub-row: the teacher forward must run on every rank every micro-batch
     so its dp-group collectives stay in lockstep. Returns nested sequences / bodies / body
-    masks plus, per sub-row, the parent sample index and its span triple.
+    masks plus one :class:`SubRowSpan` per sub-row.
     """
     seq_list = teacher_input_ids.unbind()
     meta_list = teacher_seq_meta.unbind()
     mask_list = response_mask.unbind()
 
-    sub_seqs, sub_resps, sub_masks, parents, spans = [], [], [], [], []
+    sub_seqs, sub_resps, sub_masks, sub_spans = [], [], [], []
     resp_list = responses.unbind()
     assert len(seq_list) == len(resp_list), (
         f"teacher rows ({len(seq_list)}) and responses ({len(resp_list)}) disagree on batch size"
     )
     for i, (seq, meta) in enumerate(zip(seq_list, meta_list, strict=True)):
-        flat = meta.tolist()
-        n_sub, entries = flat[0], flat[1:]
-        assert len(entries) == 5 * n_sub, (
-            f"teacher_seq_meta malformed for sample {i}: {n_sub} sub-rows, {len(entries)} ints"
-        )
         offset = 0
-        for j in range(n_sub):
-            total_len, body_len, body_start, start, end = entries[5 * j : 5 * j + 5]
-            assert 0 < body_len <= total_len and offset + total_len <= seq.shape[0], (
-                f"teacher_seq_meta malformed for sample {i} sub-row {j}: total {total_len}, "
-                f"body {body_len}, offset {offset}, seq len {seq.shape[0]}"
+        for j, sub_row in enumerate(unpack(meta.tolist(), sample=i)):
+            assert 0 < sub_row.body_len <= sub_row.total_len and offset + sub_row.total_len <= seq.shape[0], (
+                f"teacher_seq_meta malformed for sample {i} sub-row {j}: total {sub_row.total_len}, "
+                f"body {sub_row.body_len}, offset {offset}, seq len {seq.shape[0]}"
             )
-            assert end <= resp_list[i].shape[0], (
+            assert sub_row.end <= resp_list[i].shape[0], (
                 f"teacher_seq_meta span exceeds the response row for sample {i}: "
-                f"end {end} > response len {resp_list[i].shape[0]}"
+                f"end {sub_row.end} > response len {resp_list[i].shape[0]}"
             )
-            sub = seq[offset : offset + total_len]
+            sub = seq[offset : offset + sub_row.total_len]
             sub_seqs.append(sub)
-            sub_resps.append(sub[-body_len:])
-            sub_masks.append(mask_list[i].new_ones(body_len))
-            parents.append(i)
-            spans.append([(body_start, start, end)])
-            offset += total_len
+            sub_resps.append(sub[-sub_row.body_len :])
+            sub_masks.append(mask_list[i].new_ones(sub_row.body_len))
+            sub_spans.append(SubRowSpan(i, sub_row.body_start, sub_row.start, sub_row.end))
+            offset += sub_row.total_len
 
     return (
         torch.nested.nested_tensor(sub_seqs, layout=torch.jagged),
         torch.nested.nested_tensor(sub_resps, layout=torch.jagged),
         torch.nested.nested_tensor(sub_masks, layout=torch.jagged),
-        parents,
-        spans,
+        sub_spans,
     )
 
 
@@ -158,12 +150,11 @@ def _keep_positions(prefix_lens: torch.Tensor, spans_per_row: list[list[tuple[in
     return torch.nested.nested_tensor(rows, layout=torch.jagged)
 
 
-def turn_keep_positions(
-    sub_seqs: torch.Tensor, sub_resps: torch.Tensor, spans: list[list[tuple[int, int, int]]]
-) -> torch.Tensor:
+def turn_keep_positions(sub_seqs: torch.Tensor, sub_resps: torch.Tensor, sub_spans: list[SubRowSpan]) -> torch.Tensor:
     """Logits positions scoring the hinted spans on the spliced teacher rows."""
     prefix_lens = sub_seqs.offsets().diff() - sub_resps.offsets().diff()
-    return _keep_positions(prefix_lens, [[(bs, e - s) for bs, s, e in triples] for triples in spans])
+    spans = [[(body.start, body.stop - body.start)] for _, _, body, _ in body_slices(sub_spans)]
+    return _keep_positions(prefix_lens, spans)
 
 
 def response_keep_positions(
@@ -171,13 +162,11 @@ def response_keep_positions(
 ) -> torch.Tensor:
     """Logits positions scoring the hinted spans on the student's own prompt+response rows."""
     prefix_lens = input_ids.offsets().diff() - responses.offsets().diff()
-    spans = []
-    for meta in teacher_seq_meta.unbind():
-        flat = meta.tolist()
-        entries = flat[1:]
-        # (total_len, body_len, body_start, start, end) per sub-row; the student scores
-        # every hinted span in one pass, so it keeps their union
-        spans.append([(entries[5 * j + 3], entries[5 * j + 4] - entries[5 * j + 3]) for j in range(flat[0])])
+    # the student scores every hinted span in one pass, so it keeps their union
+    spans = [
+        [(sub_row.start, sub_row.end - sub_row.start) for sub_row in unpack(meta.tolist())]
+        for meta in teacher_seq_meta.unbind()
+    ]
     return _keep_positions(prefix_lens, spans)
 
 
@@ -190,8 +179,7 @@ def attach_response_keep_positions(data) -> None:
 
 def scatter_turn_teacher_outputs(
     sub_outputs: torch.Tensor,
-    parents: list[int],
-    spans: list[list[tuple[int, int, int]]],
+    sub_spans: list[SubRowSpan],
     batch_size: int,
     response_length: int,
 ) -> torch.Tensor:
@@ -200,16 +188,15 @@ def scatter_turn_teacher_outputs(
     Positions outside the scored spans stay zero; the per-token distillation mask excludes them.
     """
     full = sub_outputs.new_zeros((batch_size, response_length, *sub_outputs.shape[2:]))
-    for j, (parent, triples) in enumerate(zip(parents, spans, strict=True)):
-        for body_start, start, end in triples:
-            if parent >= batch_size or end > response_length or sub_outputs.dim() < 2:
-                raise RuntimeError(
-                    "scatter_turn_teacher_outputs misalignment: "
-                    f"row j={j} parent={parent} span=({body_start},{start},{end}) vs "
-                    f"grid=({batch_size},{response_length}) sub_outputs={tuple(sub_outputs.shape)} "
-                    f"n_parents={len(parents)} all_spans={spans}"
-                )
-            full[parent, start:end] = sub_outputs[j, body_start : body_start + (end - start)]
+    for j, parent, body_slice, response_slice in body_slices(sub_spans):
+        if parent >= batch_size or response_slice.stop > response_length or sub_outputs.dim() < 2:
+            raise RuntimeError(
+                "scatter_turn_teacher_outputs misalignment: "
+                f"row j={j} span={sub_spans[j]} vs "
+                f"grid=({batch_size},{response_length}) sub_outputs={tuple(sub_outputs.shape)} "
+                f"n_sub={len(sub_spans)} all_spans={sub_spans}"
+            )
+        full[parent, response_slice] = sub_outputs[j, body_slice]
     return full
 
 

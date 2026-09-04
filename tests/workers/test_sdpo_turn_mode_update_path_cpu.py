@@ -32,6 +32,8 @@ import verl.workers.engine.fsdp.transformer_impl as transformer_impl
 import verl.workers.utils.losses as sdpo_losses
 import verl.workers.utils.padding as padding_mod
 from verl.trainer.ppo import sdpo_teacher
+from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META
+from verl.trainer.ppo.sdpo_teacher import HintedTurn
 from verl.utils import tensordict_utils as tu
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
 from verl.workers.engine_workers import ActorRolloutRefWorker
@@ -125,7 +127,7 @@ def make_batch(include_hinted=True, include_unhinted=True):
         # hinted sample: prompt 4, response 12, one hinted turn covering response [2, 7)
         prompt = torch.arange(4, dtype=torch.long) + 1
         resp = torch.arange(12, dtype=torch.long) + 5
-        hinted = [(1, 2, 7, "h1", "turn")]
+        hinted = [HintedTurn(1, 2, 7, "h1", "turn")]
         hint_ids = [torch.tensor([50, 51, 52], dtype=torch.long)]
         header = torch.tensor([60, 61], dtype=torch.long)
         seq, meta, _, spans = sdpo_teacher.build_spliced_teacher_row(prompt, resp, hinted, hint_ids, 4096, header)
@@ -140,7 +142,7 @@ def make_batch(include_hinted=True, include_unhinted=True):
                 prompt=prompt,
                 resp=resp,
                 teacher_seq=torch.cat([prompt[-1:], resp[:1]]),
-                meta=torch.tensor([1, 2, 1, 0, 0, 1], dtype=torch.int64),
+                meta=torch.tensor(DEGENERATE_META, dtype=torch.int64),
                 sd_mask=torch.zeros(9),
             )
         )

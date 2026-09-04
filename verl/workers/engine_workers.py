@@ -33,6 +33,7 @@ from verl.checkpoint_engine import CheckpointEngineRegistry
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
+from verl.trainer.ppo.sdpo.teacher_meta import body_slices
 from verl.utils import tensordict_utils as tu
 from verl.utils import trace_file
 from verl.utils.config import omega_conf_to_dataclass
@@ -840,12 +841,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # the legacy path already carries the padded teacher tensors (and precomputed mask/pos).
         teacher_input_ids = data["teacher_input_ids"]
         turn_meta = tu.get(data, "teacher_seq_meta", default=None)
-        parents = spans = None
+        sub_spans = None
         if teacher_input_ids.is_nested and turn_meta is not None:
             # Turn mode: score each spliced sequence's body, then scatter the span outputs back to the response grid.
             batch_size = data["responses"].size(0)
             full_response_length = max(r.shape[0] for r in data["responses"].unbind())
-            sub_seqs, sub_resps, sub_masks, parents, spans = explode_turn_teacher_rows(
+            sub_seqs, sub_resps, sub_masks, sub_spans = explode_turn_teacher_rows(
                 teacher_input_ids=teacher_input_ids,
                 teacher_seq_meta=turn_meta,
                 responses=data["responses"],
@@ -865,13 +866,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
             if student_topk_indices is not None:
                 sub_indices = student_topk_indices.new_zeros(
-                    (len(parents), responses.shape[1], student_topk_indices.shape[-1])
+                    (len(sub_spans), responses.shape[1], student_topk_indices.shape[-1])
                 )
-                for j, (parent, triples) in enumerate(zip(parents, spans, strict=True)):
-                    for body_start, start, end in triples:
-                        sub_indices[j, body_start : body_start + (end - start)] = student_topk_indices[
-                            parent, start:end
-                        ]
+                for j, parent, body_slice, response_slice in body_slices(sub_spans):
+                    sub_indices[j, body_slice] = student_topk_indices[parent, response_slice]
                 student_topk_indices = sub_indices
         elif teacher_input_ids.is_nested:
             (
@@ -934,8 +932,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         tu.assign_non_tensor(teacher_td, **default_keys)
 
         # Span-only lm_head: only hinted-span positions are ever consumed in turn mode.
-        if parents is not None:
-            teacher_td["logits_keep_positions"] = turn_keep_positions(sub_seqs, sub_resps, spans)
+        if sub_spans is not None:
+            teacher_td["logits_keep_positions"] = turn_keep_positions(sub_seqs, sub_resps, sub_spans)
 
         # When full-logit distillation is on (top-k or all-vocab), run the teacher
         # extractor as the engine's logits processor; otherwise only plain log_probs
@@ -948,9 +946,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         def to_response_grid(values: torch.Tensor) -> torch.Tensor:
             padded = no_padding_2_padding(values, teacher_td).float()
-            if parents is None:
+            if sub_spans is None:
                 return padded
-            return scatter_turn_teacher_outputs(padded, parents, spans, batch_size, full_response_length)
+            return scatter_turn_teacher_outputs(padded, sub_spans, batch_size, full_response_length)
 
         result = {"teacher_log_probs": to_response_grid(model_output["log_probs"])}
         if return_all_logps:
