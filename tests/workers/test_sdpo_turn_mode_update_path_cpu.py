@@ -139,7 +139,7 @@ def make_batch(include_hinted=True, include_unhinted=True):
                 prompt=prompt,
                 resp=resp,
                 teacher_seq=torch.cat([prompt[-1:], resp[:1]]),
-                meta=torch.tensor([1, 0, 0, 1], dtype=torch.int64),
+                meta=torch.tensor([1, 2, 1, 0, 0, 1], dtype=torch.int64),
                 sd_mask=torch.zeros(9),
             )
         )

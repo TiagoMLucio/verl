@@ -1619,9 +1619,14 @@ class PPOTrainer:
                         # the swapped call already IS the target: re-narrowing would diff
                         # identical sequences and keep the full span. Its supervised spans
                         # (diffed against the original call, on the corrected grid)
-                        # substitute; the row's other hints have no targets to narrow.
+                        # substitute; the row's other call hints are narrowed as usual.
                         fr = forced_rows[i]
-                        spans = [s for j, s in enumerate(spans) if j != fr["hint_idx"]]
+                        keep = [j for j in range(len(spans)) if j != fr["hint_idx"]]
+                        spans = sdpo_teacher.narrowed_call_spans(
+                            [spans[j] for j in keep], [call_placed[j] for j in keep],
+                            [hinted_per_row[i][j] for j in keep], response_ids, encode,
+                            self_distillation_cfg.call_mask,
+                            decode_fn=self.tokenizer.decode)
                         spans += fr["mask_spans"]
                     else:
                         spans = sdpo_teacher.narrowed_call_spans(
@@ -1916,10 +1921,13 @@ class PPOTrainer:
         for key in parts + ("loop_wall", "env_setup", "reward_eval", "reflect"):
             out[f"traj_time/slowest_{key}"] = float(slowest.get(key, 0.0))
         out["traj_time/unattributed_share"] = sum(residual) / max(sum(totals), 1e-6)
-        for key in ("eval_completed", "patch_apply_failed"):
+        for key in ("eval_completed", "patch_apply_failed", "empty_patch", "reflect_failed", "reflect_empty"):
             vals = [float(t[key]) for t in rows if key in t]  # absent means never measured, not OK
             if vals:
                 out[f"reward_health/{key}_fraction"] = sum(vals) / len(vals)
+        capped = [float(t.get("capped_turns", 0.0)) for t in rows]
+        out["reward_health/capped_turns_mean"] = sum(capped) / len(capped)
+        out["reward_health/capped_rollouts_fraction"] = sum(1.0 for c in capped if c > 0) / len(capped)
         return out
 
     @staticmethod

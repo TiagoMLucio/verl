@@ -110,7 +110,7 @@ def test_padding_template_rebuilds_teacher_fields():
     )
     template, tag = construct_minimal_padding_template(source, {"seq_len": 9050}, eos_token_id=2)
 
-    assert template["teacher_seq_meta"].tolist() == [1, 0, 0, 1]
+    assert template["teacher_seq_meta"].tolist() == [1, 2, 1, 0, 0, 1]
     assert template["teacher_input_ids"].shape[0] == 2
     assert template["self_distillation_mask"].tolist() == [0.0]
     assert tag["is_padding"]

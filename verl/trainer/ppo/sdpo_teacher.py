@@ -253,8 +253,8 @@ def build_spliced_teacher_row(
             body_start = call_at + close_ids.shape[0] + hint_ids.shape[0] + header
             span = (call_at, end)
         else:
-            if at == "call":
-                fallbacks += 1
+            # one count per hint, whether the call opening was missing, the header was, or both
+            degraded = at == "call"
             if start >= header and torch.equal(response_ids[start - header : start], header_ids):
                 insert_at = start - header
             elif start == 0 and prefix.shape[0] >= header and torch.equal(prefix[-header:], header_ids):
@@ -263,7 +263,8 @@ def build_spliced_teacher_row(
                 insert_at = None
             else:
                 insert_at = start
-                fallbacks += 1
+                degraded = True
+            fallbacks += int(degraded)
 
             if insert_at is None:
                 body = [response_ids[:start], response_ids[start:end]]

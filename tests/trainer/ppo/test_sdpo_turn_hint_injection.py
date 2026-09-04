@@ -102,9 +102,9 @@ def test_cumulative_hints_and_truncation_after_last_span():
 
     assert fallbacks == 0
     expected = torch.cat(
-        [prompt, response[:2], hints[0], response[2:10], hints[1], response[10:15]]
+        [prompt, response[:2], hints[0], response[2:8], prompt, response[:10], hints[1], response[10:15]]
     )
-    assert torch.equal(seq, expected), "both hints before their headers; sequence cut after last span"
+    assert torch.equal(seq, expected), "one sub-row per hint, each cut after its own span"
     _spans_map_back(seq, meta, response, hinted)
 
 
