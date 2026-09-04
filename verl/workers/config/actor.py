@@ -59,14 +59,12 @@ class SelfDistillationConfig(BaseConfig):
         success_reward_threshold (float): Minimum sequence reward to be considered successful.
         teacher_regularization (str): Teacher regularization mode.
             Options: "ema", "trust_region" / "trust-region", "none".
-        teacher_update_rate (Optional[float]): Teacher update/mixing rate in [0,1].
-            If null, falls back to ema_update_rate.
-        ema_update_rate (float): Deprecated alias for teacher_update_rate.
+        teacher_update_rate (float): Teacher update/mixing rate in [0,1]: the EMA step
+            toward the student ("ema") or the trust-region mixing coefficient.
         distillation_topk (Optional[int]): If set, use top-k logits for distillation.
         distillation_add_tail (bool): Whether to add a tail bucket for top-k distillation.
         max_reprompt_len (int): Maximum length of the reprompted prompt.
-        reprompt_truncation (str): Truncation method for the reprompted prompt
-            (recommended to use "right" or "error").
+        reprompt_truncation (str): Truncation side for the reprompted prompt: "right" or "left".
         dont_reprompt_on_self_success (bool): Whether to not reprompt on self-success.
         remove_thinking_from_demonstration (bool): Whether to remove <think>...</think>
             tags from successful demonstrations before reprompting.
@@ -96,8 +94,7 @@ class SelfDistillationConfig(BaseConfig):
     alpha: float = 0.0
     success_reward_threshold: float = 1.0
     teacher_regularization: str = "ema"
-    teacher_update_rate: Optional[float] = None
-    ema_update_rate: float = 0.05
+    teacher_update_rate: float = 0.05
     distillation_topk: Optional[int] = None
     distillation_add_tail: bool = True
     max_reprompt_len: int = 10240
@@ -135,25 +132,10 @@ class SelfDistillationConfig(BaseConfig):
     #: a small minority of rows; a trajectory carries one kind of hint or the other, so this
     #: is a row weight (a within-row scale would cancel in the token-mean).
     call_loss_weight: float = 1.0
-    #: which supervised tokens actually train: none (all of them), gap_topk (largest
-    #: |logp_teacher - logp_student|), q3 (low-entropy AND high-gap "confidently wrong",
-    #: topped up / trimmed by gap rank), entropy_topk (highest student entropy), random
-    #: (content-seeded hash). Every mode keeps exactly ceil(token_gate_rho * n) supervised
-    #: tokens per row, ranked within the row; q3 and entropy_topk require calculate_entropy.
-    token_gate: str = "none"
-    #: fraction of each row's supervised tokens a token gate keeps
-    token_gate_rho: float = 0.2
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
             raise ValueError(f"self_distillation.alpha must be in [0,1], got {self.alpha}")
-        if self.token_gate not in ("none", "gap_topk", "q3", "entropy_topk", "random"):
-            raise ValueError(
-                "self_distillation.token_gate must be none|gap_topk|q3|entropy_topk|random, "
-                f"got {self.token_gate!r}"
-            )
-        if not 0.0 < self.token_gate_rho <= 1.0:
-            raise ValueError(f"self_distillation.token_gate_rho must be in (0,1], got {self.token_gate_rho}")
         canonical_regularization_modes = {
             "ema": "ema",
             "trust_region": "trust_region",
@@ -168,10 +150,12 @@ class SelfDistillationConfig(BaseConfig):
                 f"{sorted(canonical_regularization_modes)}, got {self.teacher_regularization}"
             )
         object.__setattr__(self, "teacher_regularization", regularization_mode)
-        if not 0.0 <= self.ema_update_rate <= 1.0:
-            raise ValueError(f"self_distillation.ema_update_rate must be in [0,1], got {self.ema_update_rate}")
-        if self.teacher_update_rate is not None and not 0.0 <= self.teacher_update_rate <= 1.0:
+        if self.teacher_update_rate is None or not 0.0 <= self.teacher_update_rate <= 1.0:
             raise ValueError(f"self_distillation.teacher_update_rate must be in [0,1], got {self.teacher_update_rate}")
+        if self.reprompt_truncation not in ("right", "left"):
+            raise ValueError(
+                f"self_distillation.reprompt_truncation must be right|left, got {self.reprompt_truncation!r}"
+            )
         if self.distillation_topk is not None and self.distillation_topk <= 0:
             raise ValueError(
                 f"self_distillation.distillation_topk must be a positive integer, got {self.distillation_topk}"

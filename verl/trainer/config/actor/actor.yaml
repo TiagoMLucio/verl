@@ -287,11 +287,8 @@ self_distillation:
   # Teacher regularization: ema | trust_region | none
   teacher_regularization: ema
 
-  # EMA mixing rate toward student (null falls back to ema_update_rate)
-  teacher_update_rate: null
-
-  # Deprecated alias for teacher_update_rate
-  ema_update_rate: 0.05
+  # Teacher update rate in [0,1]: EMA step toward the student (ema) or trust-region mixing coefficient
+  teacher_update_rate: 0.05
 
   # Maximum token length of the reprompted teacher input
   max_reprompt_len: 10240
@@ -351,14 +348,6 @@ self_distillation:
   # lambda in `L = L_turn + lambda * L_call`: weight of call-hinted rows relative to
   # turn-hinted (pipeline) ones. 1.0 = today, where call rows carry ~85-90% of the update
   call_loss_weight: 1.0
-
-  # Which supervised tokens actually train: none | gap_topk | q3 | entropy_topk | random.
-  # Every mode keeps exactly ceil(token_gate_rho * n) supervised tokens per row, ranked
-  # within the row; q3 and entropy_topk require actor.calculate_entropy=true
-  token_gate: none
-
-  # Fraction of each row's supervised tokens a token gate keeps
-  token_gate_rho: 0.2
 
 # Router replay configuration for MoE models
 router_replay:

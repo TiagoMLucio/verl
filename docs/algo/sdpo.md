@@ -25,7 +25,7 @@ At each training step:
 - `actor_rollout_ref.actor.self_distillation.alpha`
 - `actor_rollout_ref.actor.self_distillation.success_reward_threshold`
 - `actor_rollout_ref.actor.self_distillation.teacher_regularization` (`ema`, `trust_region`, or `none`)
-- `actor_rollout_ref.actor.self_distillation.teacher_update_rate` (or `ema_update_rate` alias)
+- `actor_rollout_ref.actor.self_distillation.teacher_update_rate`
 - `actor_rollout_ref.actor.self_distillation.include_environment_feedback`
 - `actor_rollout_ref.actor.self_distillation.environment_feedback_only_without_solution`
 
@@ -49,5 +49,5 @@ Or override from `ppo_trainer`:
 ```bash
 python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.policy_loss.loss_mode=sdpo \
-  actor_rollout_ref.actor.self_distillation.ema_update_rate=0.05
+  actor_rollout_ref.actor.self_distillation.teacher_update_rate=0.05
 ```

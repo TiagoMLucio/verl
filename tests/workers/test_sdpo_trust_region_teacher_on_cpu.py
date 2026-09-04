@@ -70,7 +70,6 @@ def make_worker(regularization: str, *, use_fused_kernels: bool = False):
     worker.sdpo_config = SelfDistillationConfig(
         teacher_regularization=regularization,
         teacher_update_rate=0.25,
-        ema_update_rate=0.05,
     )
     worker.ref = FakeTrainingWorker(ref_module, use_fused_kernels=use_fused_kernels)
     worker.actor = FakeTrainingWorker(actor_module, use_fused_kernels=use_fused_kernels)

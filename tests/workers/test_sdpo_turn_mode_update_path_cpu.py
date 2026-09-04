@@ -37,7 +37,7 @@ from verl.trainer.ppo.sdpo_teacher import HintedTurn
 from verl.utils import tensordict_utils as tu
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
 from verl.workers.engine_workers import ActorRolloutRefWorker
-from verl.workers.utils.losses import _sdpo_teacher_extractor, sdpo_ppo_loss
+from verl.workers.utils.losses import sdpo_ppo_loss
 from verl.workers.utils.sdpo import attach_response_keep_positions
 
 VOCAB, HIDDEN, TOPK = 64, 8, 5

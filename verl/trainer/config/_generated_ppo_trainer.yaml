@@ -143,8 +143,7 @@ actor_rollout_ref:
       alpha: 0.5
       success_reward_threshold: 0.5
       teacher_regularization: ema
-      teacher_update_rate: null
-      ema_update_rate: 0.05
+      teacher_update_rate: 0.05
       max_reprompt_len: 10240
       reprompt_truncation: right
       dont_reprompt_on_self_success: true
@@ -195,8 +194,6 @@ actor_rollout_ref:
         '
       max_hinted_turns: null
       call_loss_weight: 1.0
-      token_gate: none
-      token_gate_rho: 0.2
     router_replay:
       _target_: verl.workers.config.RouterReplayConfig
       mode: disabled

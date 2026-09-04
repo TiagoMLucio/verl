@@ -37,7 +37,7 @@ from verl.trainer.ppo.sdpo.teacher_meta import body_slices
 from verl.utils import tensordict_utils as tu
 from verl.utils import trace_file
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_device_id, get_device_name, set_expandable_segments
+from verl.utils.device import get_device_name, set_expandable_segments
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
@@ -662,13 +662,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 from verl.workers.config.actor import SelfDistillationConfig
 
                 self.sdpo_config = _to_dc(self.config.actor.self_distillation, SelfDistillationConfig)
-                if self.sdpo_config.token_gate in ("q3", "entropy_topk") and not self.config.actor.get(
-                    "calculate_entropy", False
-                ):
-                    raise ValueError(
-                        f"self_distillation.token_gate={self.sdpo_config.token_gate!r} needs "
-                        "actor_rollout_ref.actor.calculate_entropy=true"
-                    )
                 self.loss_fn = partial(
                     sdpo_ppo_loss,
                     config=actor_config,
@@ -782,25 +775,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     type(_m).__name__ if _m is not None else None,
                     getattr(_m, "is_nested", None),
                     None if _k is None else int(_k.values().shape[0]))
-        # Token gate: the gate keeps exactly ceil(rho * n) supervised tokens per row, so the
-        # global kept count is known before the forward. Sum it from the same loss_mask and
-        # all-reduce it over the same dp group as the engine's batch_num_tokens; the loss
-        # swaps it in as the token-mean denominator so gating does not shrink the step.
-        if self.sdpo_enabled and (getattr(self.sdpo_config, "token_gate", "none") or "none") != "none":
-            from verl.trainer.ppo.core_algos import sdpo_gate_kept_counts
-
-            lm = data["loss_mask"]
-            per_row = (
-                torch.stack([r.sum() for r in lm.unbind()])
-                if lm.is_nested
-                else lm.sum(dim=tuple(range(1, lm.dim())))
-            )
-            kept = sdpo_gate_kept_counts(per_row, self.sdpo_config.token_gate_rho).sum().to(get_device_id())
-            dp_group = self.actor.engine.get_data_parallel_group()
-            if dp_group is not None:
-                torch.distributed.all_reduce(kept, op=torch.distributed.ReduceOp.SUM, group=dp_group)
-            tu.assign_non_tensor(data, gate_batch_num_tokens=int(kept.item()))
-
         # SDPO reads top-k and a logsumexp off the real logits, which the fused kernel
         # never materializes; span-only keeps this pass cheap anyway. Other loss modes
         # never read logits, so they keep the engine's configured fused setting
@@ -964,7 +938,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         teacher_regularization = self.sdpo_config.teacher_regularization
         if teacher_regularization != "ema":
             return
-        update_rate = self._resolve_sdpo_teacher_update_rate()
+        update_rate = float(self.sdpo_config.teacher_update_rate)
         if update_rate == 0.0:
             return
         with torch.no_grad():
@@ -990,18 +964,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         trust_region_teacher = TrustRegionTeacher(
             ref_module=self.ref.engine.module,
             student_module=self.actor.engine.module,
-            mix_coef=self._resolve_sdpo_teacher_update_rate(),
+            mix_coef=float(self.sdpo_config.teacher_update_rate),
         )
 
         set_inference_module = getattr(self.ref.engine, "set_inference_module", None)
         if set_inference_module is None:
             raise RuntimeError("SDPO trust_region teacher requires an engine that supports an inference module.")
         set_inference_module(trust_region_teacher)
-
-    def _resolve_sdpo_teacher_update_rate(self) -> float:
-        rate = getattr(self.sdpo_config, "teacher_update_rate", None)
-        legacy = getattr(self.sdpo_config, "ema_update_rate", 0.05)
-        return float(legacy if rate is None else rate)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):

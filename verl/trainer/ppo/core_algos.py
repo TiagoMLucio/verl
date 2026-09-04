@@ -1314,11 +1314,6 @@ SDPO_RATIO_METRICS = (
         "self_distillation/inert_rows__sum",
         "self_distillation/supervised_rows__sum",
     ),
-    (
-        "self_distillation/gate_kept_fraction",
-        "self_distillation/gate_kept__sum",
-        "self_distillation/gate_candidates__sum",
-    ),
     ("entropy_hinted_span", "entropy_hinted__sum", "entropy_hinted_tokens__sum"),
 )
 
@@ -1340,105 +1335,6 @@ def finalize_ratio_metrics(metrics: dict, prefix: str = "") -> dict:
     return out
 
 
-def sdpo_gate_kept_counts(supervised_counts: torch.Tensor, rho: float) -> torch.Tensor:
-    """Per-row kept-token budget for the token gate: ceil(rho * n), clamped to [0, n].
-
-    Every gate mode keeps exactly this many supervised tokens per row, so the global kept
-    count is a function of the supervised mask alone and the update path can all-reduce it
-    before the forward (shipped as ``gate_batch_num_tokens``). float64 keeps ceil stable
-    when rho * n lands on an integer; the 1e-6 slack absorbs the rounding of rho itself.
-    """
-    n = supervised_counts.to(torch.float64)
-    kept = torch.ceil(n * rho - 1e-6).to(torch.int64).clamp(min=0)
-    return torch.minimum(kept, supervised_counts.to(torch.int64))
-
-
-def sdpo_gate_row_seed(responses: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
-    """Per-row integer seed derived from the row's own response tokens.
-
-    Content-derived (never torch RNG state), so dp ranks, reruns, and different batch
-    compositions agree on a row's random gate; padding is masked out so the seed does not
-    depend on the micro-batch's pad length. int64 arithmetic wraps, which is fine for a hash.
-    """
-    pos = torch.arange(responses.shape[-1], dtype=torch.int64, device=responses.device)
-    contrib = (responses.to(torch.int64) + 1) * (1 + pos * 2654435761) * response_mask.to(torch.int64)
-    return contrib.sum(dim=-1)
-
-
-def _sdpo_gate_random_scores(gate_seed: torch.Tensor, length: int) -> torch.Tensor:
-    """Deterministic per-(row, position) pseudo-random scores: splitmix64 over the row seed.
-
-    Constants are the signed-two's-complement forms of the usual unsigned 64-bit ones.
-    """
-
-    def lshr(x: torch.Tensor, k: int) -> torch.Tensor:
-        return (x >> k) & ((1 << (64 - k)) - 1)
-
-    pos = torch.arange(length, dtype=torch.int64, device=gate_seed.device)
-    x = gate_seed.unsqueeze(-1) + (pos + 1) * -7046029254386353131
-    x = (x ^ lshr(x, 30)) * -4658895280553007687
-    x = (x ^ lshr(x, 27)) * -7723592293110705685
-    return x ^ lshr(x, 31)
-
-
-@torch.no_grad()
-def compute_sdpo_token_gate(
-    loss_mask: torch.Tensor,
-    student_log_probs: torch.Tensor,
-    teacher_log_probs: torch.Tensor,
-    token_gate: str,
-    token_gate_rho: float,
-    student_entropy: Optional[torch.Tensor] = None,
-    gate_seed: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Boolean mask keeping exactly ceil(rho * n_row) supervised tokens per row.
-
-    Ranking is within each row (a trajectory, or its condensation segment): rows are
-    shuffled across mini-batches, so a per-row rule is the shuffle-invariant form of
-    per-trace ranking, and no absolute threshold is involved. Modes:
-
-    - gap_topk: top tokens by |logp_teacher - logp_student|.
-    - q3: "confidently wrong" first (entropy strictly below the row median AND gap strictly
-      above it), topped up or trimmed to the budget by gap rank.
-    - entropy_topk: top tokens by student entropy.
-    - random: top tokens by a content-seeded hash score (see sdpo_gate_row_seed).
-    """
-    supervised = loss_mask > 0
-    kept_budget = sdpo_gate_kept_counts(supervised.sum(dim=-1), token_gate_rho)
-
-    gap = (teacher_log_probs - student_log_probs).detach().abs().to(torch.float64)
-    if token_gate == "gap_topk":
-        score = gap
-    elif token_gate in ("q3", "entropy_topk"):
-        if student_entropy is None:
-            raise ValueError(
-                f"token_gate={token_gate!r} needs the student entropy tensor; "
-                "set actor_rollout_ref.actor.calculate_entropy=true"
-            )
-        ent = student_entropy.detach().to(torch.float64)
-        if token_gate == "entropy_topk":
-            score = ent
-        else:
-            nan = float("nan")
-            ent_med = torch.nanmedian(ent.masked_fill(~supervised, nan), dim=-1, keepdim=True).values
-            gap_med = torch.nanmedian(gap.masked_fill(~supervised, nan), dim=-1, keepdim=True).values
-            confidently_wrong = (ent < ent_med) & (gap > gap_med)
-            # members outrank non-members; within a tier the budget cap/floor goes by gap rank
-            score = gap.clamp(max=1e5) + confidently_wrong.to(gap.dtype) * 1e6
-    elif token_gate == "random":
-        if gate_seed is None:
-            raise ValueError("token_gate='random' needs a per-row gate_seed (see sdpo_gate_row_seed).")
-        score = _sdpo_gate_random_scores(gate_seed, loss_mask.shape[-1]).to(torch.float64)
-    else:
-        raise ValueError(f"unknown token_gate {token_gate!r}")
-
-    score = score.masked_fill(~supervised, -float("inf"))
-    order = torch.argsort(score, dim=-1, descending=True, stable=True)
-    rank = torch.empty_like(order)
-    rank.scatter_(-1, order, torch.arange(loss_mask.shape[-1], device=order.device).expand_as(order))
-    return (rank < kept_budget.unsqueeze(-1)) & supervised
-
-
 def compute_self_distillation_loss(
     student_log_probs: torch.Tensor,
     teacher_log_probs: torch.Tensor,
@@ -1454,8 +1350,6 @@ def compute_self_distillation_loss(
     rollout_is_weights: Optional[torch.Tensor] = None,
     global_batch_info: Optional[dict[str, Any]] = None,
     seq_weights: Optional[torch.Tensor] = None,
-    student_entropy: Optional[torch.Tensor] = None,
-    gate_seed: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Compute the SDPO distillation loss for actor updates.
 
@@ -1473,9 +1367,8 @@ def compute_self_distillation_loss(
             (batch_size, response_length); masked positions are excluded from distillation.
         loss_agg_mode: Loss aggregation mode.
         rollout_is_weights: Optional rollout correction IS weights.
-        student_entropy: Optional per-token student entropy, required by the q3 and
-            entropy_topk token gates.
-        gate_seed: Optional per-row seed for the random token gate (sdpo_gate_row_seed).
+        global_batch_info: Optional dp_size / batch_num_tokens / global_batch_size dict passed through to agg_loss.
+        seq_weights: Optional per-row weight (batch_size,), one row per condensation segment; see agg_loss.
 
     Returns:
         tuple[torch.Tensor, dict[str, Any]]:
@@ -1491,21 +1384,6 @@ def compute_self_distillation_loss(
         if self_distillation_mask.dim() == 1:
             self_distillation_mask = self_distillation_mask.unsqueeze(1)
         loss_mask = loss_mask * self_distillation_mask
-
-    token_gate = getattr(self_distillation_config, "token_gate", "none") or "none"
-    if token_gate != "none":
-        gate_mask = compute_sdpo_token_gate(
-            loss_mask=loss_mask,
-            student_log_probs=student_log_probs,
-            teacher_log_probs=teacher_log_probs,
-            token_gate=token_gate,
-            token_gate_rho=self_distillation_config.token_gate_rho,
-            student_entropy=student_entropy,
-            gate_seed=gate_seed,
-        )
-        metrics["self_distillation/gate_candidates__sum"] = float((loss_mask > 0).sum())
-        metrics["self_distillation/gate_kept__sum"] = float(gate_mask.sum())
-        loss_mask = loss_mask * gate_mask.to(loss_mask.dtype)
 
     distill_variant = "rkl_token"
     if self_distillation_config.full_logit_distillation:
