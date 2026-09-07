@@ -11,25 +11,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The two SDPO teachers on a toy tokenizer: the turn-hint teacher's fields agree with the
-splice called directly and decode nothing; the reprompt teacher builds the paper's messages,
-masks whole rows and decodes only the responses it uses as a solution; and the trainer's
-teacher-build step writes the six fields and the batch metrics a turn_hints run logs."""
+"""The reprompt teacher on a toy tokenizer: it builds the paper's messages, masks whole rows
+and decodes only the responses it uses as a solution; ``self_distillation.teacher`` names it
+by ``_target_`` and owns its options; and the trainer's teacher-build step writes the five
+fields and the batch metrics a reprompt run logs."""
 
+import inspect
 from dataclasses import asdict
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import yaml
+from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from tensordict import TensorDict
 
+import verl
 from verl.trainer import main_ppo_sync
-from verl.trainer.ppo.sdpo import RepromptTeacher, TeacherInputs, TurnHintTeacher, make_teacher
-from verl.trainer.ppo.sdpo.hints import assistant_header_ids, hint_token_ids, select_hinted_turns
-from verl.trainer.ppo.sdpo.splice import build_spliced_teacher_row, turn_token_mask
-from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META
+from verl.trainer.ppo.sdpo import RepromptTeacher, SDPOTeacher, TeacherInputs, make_teacher
+from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config.actor import SelfDistillationConfig
+
+CONFIG_DIR = Path(verl.__file__).parent / "trainer" / "config"
+REPROMPT_TARGET = "verl.trainer.ppo.sdpo.RepromptTeacher"
 
 
 class ToyTokenizer:
@@ -108,66 +114,27 @@ def _inputs(extra_fields, uids, seq_scores, feedback, responses=None):
     )
 
 
-def test_turn_hint_teacher_matches_the_splice_and_decodes_nothing():
-    tok = ToyTokenizer()
-    cfg = SelfDistillationConfig(teacher="turn_hints", max_hinted_turns=None)
-    teacher = make_teacher(cfg, tok, max_prefix_len=4096)
-    assert isinstance(teacher, TurnHintTeacher) and teacher.needs_prompts
-    extra = [
-        {"turn_spans": SPANS, "turn_hints": [[0, "h0"], [1, "h1", "call"]]},
-        {"turn_spans": SPANS, "turn_hints": []},
-        {"turn_spans": SPANS, "turn_hints": [[1, "h2"]], "segment_index": 1, "segment_prompt": SEGMENT_PROMPT},
-    ]
-    inputs = _inputs(extra, ["a", "a", "b"], [0.0, 0.0, 0.0], [None] * 3)
-
-    out = teacher.build(inputs)
-
-    assert tok.decode_calls == 0
-    assert set(out.fields) == {"teacher_input_ids", "teacher_seq_meta", "self_distillation_mask", "loss_mask"}
-    assert out.hinted_per_row == [select_hinted_turns(ef, RESPONSE.shape[0]) for ef in extra]
-    assert [len(h) for h in out.hinted_per_row] == [2, 0, 1]
-    assert [h.is_call for h in out.hinted_per_row[0]] == [False, True]
-
-    header = torch.tensor(assistant_header_ids(tok), dtype=torch.int64)
-    assert torch.equal(header, ids(HEADER))
-    for row in (0, 2):
-        hinted = out.hinted_per_row[row]
-        seq, meta, fallbacks, spans = build_spliced_teacher_row(
-            PROMPT, RESPONSE, hinted, [hint_token_ids(tok, h, cfg) for h in hinted], 4096, header,
-            close_ids=ids("<eos>\n"), call_open_ids=ids("<tool_call>"),
-        )
-        assert fallbacks == 0
-        assert torch.equal(out.fields["teacher_input_ids"][row], seq)
-        assert out.fields["teacher_seq_meta"][row].tolist() == meta
-        mask = turn_token_mask(RESPONSE.shape[0], spans)
-        assert torch.equal(out.fields["self_distillation_mask"][row], mask)
-        assert torch.equal(out.fields["loss_mask"][row], inputs.response_mask[row] * mask.to(torch.int64))
-    assert out.fields["loss_mask"][0][1] == 0, "observation tokens stay out of the loss"
-
-    assert out.fields["teacher_seq_meta"][1].tolist() == DEGENERATE_META
-    assert torch.equal(out.fields["teacher_input_ids"][1], torch.cat([PROMPT[-1:], RESPONSE[:1]]))
-    assert out.fields["self_distillation_mask"][1].sum() == 0 and out.fields["loss_mask"][1].sum() == 0
-
-    assert out.metrics == {
-        "self_distillation/hinted_sample_fraction": 2 / 3,
-        "self_distillation/hinted_turns_per_sample": 1.5,
-        "self_distillation/hint_injection_fallbacks": 0,
-        "self_distillation/call_loss_weight": 1.0,
-    }
+def _sd_config(**teacher_options):
+    return SelfDistillationConfig(teacher={"_target_": REPROMPT_TARGET, **teacher_options})
 
 
 def test_reprompt_teacher_messages_masks_and_lazy_decode():
     tok = ToyTokenizer()
     cfg = SelfDistillationConfig(
-        teacher="reprompt",
         include_environment_feedback=True,
-        dont_reprompt_on_self_success=True,
-        remove_thinking_from_demonstration=True,
-        max_reprompt_len=512,
-        reprompt_truncation="left",
+        teacher=dict(
+            _target_=REPROMPT_TARGET,
+            dont_reprompt_on_self_success=True,
+            remove_thinking_from_demonstration=True,
+            environment_feedback_only_without_solution=False,
+            max_reprompt_len=512,
+            reprompt_truncation="left",
+        ),
     )
     teacher = make_teacher(cfg, tok, max_prefix_len=4096, apply_chat_template_kwargs={})
     assert isinstance(teacher, RepromptTeacher) and not teacher.needs_prompts
+    assert teacher.call_loss_weight == 1.0 and teacher.success_reward_threshold == cfg.success_reward_threshold
+    assert (teacher.max_reprompt_len, teacher.reprompt_truncation) == (512, "left")
     # uid a: row 0 failed with feedback, row 1 solved (its solution serves row 0, not itself);
     # uid b: row 2 failed without feedback, row 3 a condensation segment with feedback
     extra = [{}, {}, {}, {"segment_index": 1, "segment_prompt": SEGMENT_PROMPT}]
@@ -181,11 +148,11 @@ def test_reprompt_teacher_messages_masks_and_lazy_decode():
     assert set(out.fields) == {"teacher_input_ids", "self_distillation_mask", "loss_mask"}
     assert out.hinted_per_row is None and out.metrics == {}
 
-    solution = cfg.solution_template.format(successful_previous_attempt="sol")
-    feedback0 = cfg.feedback_template.format(feedback_raw="fb0")
-    feedback3 = cfg.feedback_template.format(feedback_raw="fb3")
-    reprompt0 = cfg.reprompt_template.format(prompt="task 0", solution=solution, feedback=feedback0)
-    reprompt3 = cfg.reprompt_template.format(prompt="", solution="", feedback=feedback3)
+    solution = teacher.solution_template.format(successful_previous_attempt="sol")
+    feedback0 = teacher.feedback_template.format(feedback_raw="fb0")
+    feedback3 = teacher.feedback_template.format(feedback_raw="fb3")
+    reprompt0 = teacher.reprompt_template.format(prompt="task 0", solution=solution, feedback=feedback0)
+    reprompt3 = teacher.reprompt_template.format(prompt="", solution="", feedback=feedback3)
     expected = [
         [{"role": "system", "content": "sys"}, {"role": "user", "content": reprompt0}],
         inputs.raw_prompts[1],
@@ -204,30 +171,81 @@ def test_reprompt_teacher_messages_masks_and_lazy_decode():
 
 def test_reprompt_truncation_side_scoped_to_the_reprompt():
     tok = ToyTokenizer()
-    cfg = SelfDistillationConfig(teacher="reprompt", max_reprompt_len=8, reprompt_truncation="left")
     inputs = _inputs([{}], ["a"], [1.0], [None])
-    out = RepromptTeacher(tok, cfg).build(inputs)
+    teacher = RepromptTeacher(tok, success_reward_threshold=1.0, max_reprompt_len=8, reprompt_truncation="left")
+    out = teacher.build(inputs)
     prompt = ids(ToyTokenizer.render(inputs.raw_prompts[0], add_generation_prompt=True))
     assert torch.equal(out.fields["teacher_input_ids"][0][:8], prompt[-8:]), "left-truncated to max_reprompt_len"
     assert tok.truncation_side == "right"
 
 
-def test_turn_hint_teacher_counts_one_fallback_per_hint():
+def test_teacher_options_are_validated_at_construction():
     tok = ToyTokenizer()
-    cfg = SelfDistillationConfig(teacher="turn_hints")
-    teacher = make_teacher(cfg, tok, max_prefix_len=4096)
-    mid_turn = [[0, 1, len(TURN0)], SPANS[1]]
-    extra = [
-        # a call hint on a turn without <tool_call> whose span also starts mid-turn: one fallback
-        {"turn_spans": mid_turn, "turn_hints": [[0, "h0", "call"], [1, "h1"]]},
-        # a turn hint whose span start is not preceded by the assistant header
-        {"turn_spans": mid_turn, "turn_hints": [[0, "h2"]]},
-        {"turn_spans": SPANS, "turn_hints": [[0, "h3"], [1, "h4", "call"]]},
-    ]
-    out = teacher.build(_inputs(extra, ["a", "b", "c"], [0.0] * 3, [None] * 3))
-    assert out.metrics["self_distillation/hint_injection_fallbacks"] == 2
-    assert [len(h) for h in out.hinted_per_row] == [2, 1, 2]
-    assert torch.equal(out.fields["self_distillation_mask"][1][1 : len(TURN0)], torch.ones(len(TURN0) - 1))
+    with pytest.raises(TypeError, match="max_hinted_turns"):
+        make_teacher(_sd_config(max_hinted_turns=1), tok, max_prefix_len=4096)
+    with pytest.raises(ValueError, match="reprompt_truncation"):
+        make_teacher(_sd_config(reprompt_truncation="middle"), tok, max_prefix_len=4096)
+    with pytest.raises(ValueError, match="_target_"):
+        SelfDistillationConfig(teacher={"max_reprompt_len": 8})
+    with pytest.raises(ValueError, match="_target_"):
+        make_teacher(SimpleNamespace(teacher={}, success_reward_threshold=1.0), tok, max_prefix_len=4096)
+    with pytest.raises(TypeError, match="SDPOTeacher"):
+        make_teacher(
+            SimpleNamespace(teacher={"_target_": "builtins.dict"}, success_reward_threshold=1.0),
+            tok,
+            max_prefix_len=4096,
+        )
+    assert issubclass(RepromptTeacher, SDPOTeacher) and not SDPOTeacher.needs_prompts
+
+
+def test_reprompt_yaml_is_the_teacher_default_and_hydra_leaves_the_block_alone():
+    """The config group file is the paper's teacher: its keys are the constructor's keyword
+    options at the same values, and the actor-level hydra instantiation (the worker's
+    ``omega_conf_to_dataclass``) hands the block over untouched for ``make_teacher``."""
+    block = yaml.safe_load((CONFIG_DIR / "actor" / "actor.yaml").read_text())["self_distillation"]
+    block["teacher"] = yaml.safe_load((CONFIG_DIR / "sdpo_teacher" / "reprompt.yaml").read_text())
+    assert block["_recursive_"] is False
+
+    cfg = omega_conf_to_dataclass(OmegaConf.create(block))
+    assert isinstance(cfg, SelfDistillationConfig)
+    assert cfg.teacher["_target_"] == REPROMPT_TARGET
+    structured = omega_conf_to_dataclass(OmegaConf.create(block), SelfDistillationConfig)
+    assert structured.teacher == cfg.teacher
+
+    teacher = make_teacher(cfg, ToyTokenizer(), max_prefix_len=4096, apply_chat_template_kwargs={"a": 1})
+    assert isinstance(teacher, RepromptTeacher)
+    assert teacher.apply_chat_template_kwargs == {"a": 1}
+    params = inspect.signature(RepromptTeacher.__init__).parameters
+    options = {k: v for k, v in cfg.teacher.items() if k != "_target_"}
+    assert set(options) == set(params) - {"self", "tokenizer", "max_prefix_len", "apply_chat_template_kwargs",
+                                          "success_reward_threshold"}
+    for name, value in options.items():
+        assert getattr(teacher, name) == value
+        assert params[name].default == value, f"{name}: reprompt.yaml and the constructor default differ"
+
+
+def _compose_teacher_block(overrides):
+    with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
+        cfg = compose(config_name="sdpo", overrides=overrides)
+    return OmegaConf.to_container(cfg.actor_rollout_ref.actor.self_distillation, resolve=True)
+
+
+def test_sdpo_config_composes_each_teacher_with_only_its_own_keys():
+    """``--config-name sdpo`` merges its own body after the ``sdpo_teacher`` group, so a
+    teacher-specific key there would land on whichever teacher is selected."""
+    reprompt = yaml.safe_load((CONFIG_DIR / "sdpo_teacher" / "reprompt.yaml").read_text())
+    turn_hints = yaml.safe_load((CONFIG_DIR / "sdpo_teacher" / "turn_hints.yaml").read_text())
+
+    sd = _compose_teacher_block([])
+    assert sd["teacher"] == reprompt and sd["teacher"]["max_reprompt_len"] == 10240
+    teacher = make_teacher(OmegaConf.create(sd), ToyTokenizer(), max_prefix_len=4096)
+    assert isinstance(teacher, RepromptTeacher) and teacher.max_reprompt_len == 10240
+
+    sd = _compose_teacher_block([
+        "sdpo_teacher@actor_rollout_ref.actor.self_distillation.teacher=turn_hints",
+        "+actor_rollout_ref.actor.self_distillation.teacher.chat_template_kwargs.enable_thinking=False",
+    ])
+    assert sd["teacher"] == dict(turn_hints, chat_template_kwargs={"enable_thinking": False})
 
 
 class TQStub:
@@ -251,22 +269,19 @@ TIMINGS = dict(
 )
 
 
-def test_trainer_turn_hints_batch_fields_and_metrics(monkeypatch):
-    """One trainer build over a batch with a call-hinted row, a condensed trajectory whose only
-    hint sits on its second segment, an unhinted successful sibling, a row with no extra_fields
-    and a row with a first-turn hint."""
+def test_trainer_reprompt_batch_fields_and_metrics(monkeypatch):
+    """One trainer build over a batch with a failed row whose sibling solved the task, that
+    solved sibling, a row with no extra_fields and blank feedback, and a failed row with
+    feedback and no solution."""
     # key, uid, reward, feedback, extra_fields
     rows = [
-        ("u1_0_0", "u1", 0.0, "fb0", dict(turn_spans=SPANS, turn_hints=[[0, "h0"], [1, "h1", "call"]],
-                                          segment_index=0, num_segments=1, traj_exit_reason="finished",
-                                          timings=TIMINGS)),
-        ("u1_1_0", "u1", 1.0, None, dict(turn_spans=SPANS, turn_hints=[], segment_index=0, num_segments=2,
+        ("u1_0_0", "u1", 0.0, "fb0", dict(turn_spans=SPANS, segment_index=0, num_segments=1,
+                                          traj_exit_reason="finished", timings=TIMINGS)),
+        ("u1_1_0", "u1", 1.0, None, dict(turn_spans=SPANS, segment_index=0, num_segments=1,
                                          traj_exit_reason="submitted")),
-        ("u1_1_1", "u1", 1.0, None, dict(turn_spans=SPANS, turn_hints=[[1, "h2"]], segment_index=1,
-                                         num_segments=2, segment_prompt=SEGMENT_PROMPT)),
         ("u2_0_0", "u2", 0.0, "   ", None),
-        ("u2_1_0", "u2", 0.0, "fb4", dict(turn_spans=SPANS, turn_hints=[[0, "h3"]], segment_index=0,
-                                          num_segments=1, traj_exit_reason="finished")),
+        ("u2_1_0", "u2", 0.0, "fb3", dict(turn_spans=SPANS, segment_index=0, num_segments=1,
+                                          traj_exit_reason="finished")),
     ]
     keys = [r[0] for r in rows]
     n = len(rows)
@@ -280,7 +295,6 @@ def test_trainer_turn_hints_batch_fields_and_metrics(monkeypatch):
     data = {
         "responses": torch.nested.nested_tensor(inputs.responses, layout=torch.jagged),
         "response_mask": torch.nested.nested_tensor(inputs.response_mask, layout=torch.jagged),
-        "prompts": torch.nested.nested_tensor(inputs.prompts, layout=torch.jagged),
         "rm_scores": torch.nested.nested_tensor(rm_scores, layout=torch.jagged),
         "uid": inputs.uids,
         "raw_prompt": inputs.raw_prompts,
@@ -290,8 +304,13 @@ def test_trainer_turn_hints_batch_fields_and_metrics(monkeypatch):
     monkeypatch.setattr(main_ppo_sync, "tq", stub)
 
     sd = OmegaConf.create(asdict(SelfDistillationConfig(
-        teacher="turn_hints", call_loss_weight=2.0, success_reward_threshold=0.5,
-        include_environment_feedback=True, environment_feedback_only_without_solution=True,
+        success_reward_threshold=0.5,
+        include_environment_feedback=True,
+        teacher=dict(
+            _target_=REPROMPT_TARGET,
+            dont_reprompt_on_self_success=True,
+            environment_feedback_only_without_solution=True,
+        ),
     )))
     tok = ToyTokenizer()
     trainer = object.__new__(main_ppo_sync.PPOTrainer)
@@ -303,70 +322,56 @@ def test_trainer_turn_hints_batch_fields_and_metrics(monkeypatch):
     metrics = {}
     trainer._maybe_build_self_distillation_batch(SimpleNamespace(keys=keys, partition_id="train"), metrics)
 
-    assert tok.decode_calls == 0
-    assert stub.select_fields == [
-        "responses", "rm_scores", "raw_prompt", "uid", "extra_fields", "response_mask", "prompts"
-    ]
+    assert tok.decode_calls == 1, "only the solved sibling is decoded"
+    assert stub.select_fields == ["responses", "rm_scores", "raw_prompt", "uid", "extra_fields", "response_mask"]
     put_keys, fields = stub.put
     assert put_keys == keys
-    assert set(fields.keys()) == {
-        "teacher_input_ids", "teacher_seq_meta", "self_distillation_mask", "loss_mask", "trace_weight", "traj_id"
-    }
-    # supervised tokens: turn 0 minus the observation token at index 1, plus the call span from <tool_call>
-    call_span = len(TURN1) - TURN1.index("<tool_call>")
-    supervised = [len(TURN0) - 1 + call_span, 0, len(TURN1), 0, len(TURN0) - 1]
-    assert [int(m.sum()) for m in fields["loss_mask"].unbind()] == supervised
-    assert fields["traj_id"].squeeze(-1).tolist() == [0, 1, 1, 2, 3]
-    # raw shares (2.0 for the call row, 1, 1) renormalised to the three supervised rows
-    assert fields["trace_weight"].squeeze(-1).tolist() == pytest.approx([1.5, 0.0, 0.75, 0.0, 0.75])
-    assert fields["teacher_seq_meta"][1].tolist() == DEGENERATE_META
-    assert fields["teacher_seq_meta"][3].tolist() == DEGENERATE_META
-
+    assert set(fields.keys()) == {"teacher_input_ids", "self_distillation_mask", "loss_mask", "trace_weight", "traj_id"}
+    # row 0 learns from its sibling's solution (feedback dropped: only_without_solution),
+    # row 3 from its feedback; the solved sibling and the blank-feedback row are unsupervised
+    teacher = trainer.sdpo_teacher
+    solution = teacher.solution_template.format(successful_previous_attempt=TURN0 + OBS + TURN1)
+    reprompt0 = teacher.reprompt_template.format(prompt="task 0", solution=solution, feedback="")
+    feedback3 = teacher.feedback_template.format(feedback_raw="fb3")
+    reprompt3 = teacher.reprompt_template.format(prompt="task 3", solution="", feedback=feedback3)
+    assert tok.last_batch == [
+        [{"role": "system", "content": "sys"}, {"role": "user", "content": reprompt0}],
+        inputs.raw_prompts[1],
+        inputs.raw_prompts[2],
+        [{"role": "system", "content": "sys"}, {"role": "user", "content": reprompt3}],
+    ]
+    assert fields["self_distillation_mask"].tolist() == [1.0, 0.0, 0.0, 1.0]
     tokens = RESPONSE.shape[0] - 1
-    turns = len(SPANS)
+    assert [int(m.sum()) for m in fields["loss_mask"].unbind()] == [tokens, 0, 0, tokens]
+    assert fields["traj_id"].squeeze(-1).tolist() == [0, 1, 2, 3]
+    assert fields["trace_weight"].squeeze(-1).tolist() == pytest.approx([1.0, 0.0, 0.0, 1.0])
+
+    generated = 3.0 * (len(TURN0) + len(TURN1))
     expected = {
-        "self_distillation/rows_per_step": 5.0,
+        "self_distillation/rows_per_step": 4.0,
         "self_distillation/traces_per_step": 4.0,
-        "self_distillation/segments_per_trace_max": 2.0,
+        "self_distillation/segments_per_trace_max": 1.0,
         "self_distillation/supervised_segments_per_trace_max": 1.0,
-        "self_distillation/unsupervised_row_fraction": 2 / 5,
+        "self_distillation/unsupervised_row_fraction": 2 / 4,
         "self_distillation/unsupervised_row_tokens": 2.0 * tokens,
-        "self_distillation/supervised_row_tokens": 3.0 * tokens,
-        "self_distillation/reprompt_sample_fraction": 3 / 5,
-        "rollout/generated_tokens": 4.0 * (len(TURN0) + len(TURN1)),
-        "rollout/generated_tokens_per_trace": 1.0 * (len(TURN0) + len(TURN1)),
-        # u1 has a success; first-segment rows are u1_0, u1_1, u2_0, u2_1
+        "self_distillation/supervised_row_tokens": 2.0 * tokens,
+        "self_distillation/reprompt_sample_fraction": 2 / 4,
+        "rollout/generated_tokens": generated,
+        "rollout/generated_tokens_per_trace": generated / 4,
+        # u1 has a success; it serves its sibling but not itself
         "self_distillation/success_group_fraction": 1 / 2,
-        "self_distillation/success_sample_fraction": 2 / 4,
+        "self_distillation/success_sample_fraction": 1 / 4,
         "self_distillation/feedback_available_fraction": 2 / 4,
         "self_distillation/feedback_used_fraction": 1 / 4,
-        "self_distillation/hinted_sample_fraction": 3 / 5,
-        "self_distillation/hinted_turns_per_sample": 4 / 3,
-        "self_distillation/hint_injection_fallbacks": 0,
-        "self_distillation/call_loss_weight": 2.0,
-        "rollout/condensed_trace_fraction": 1 / 4,
-        "rollout/segments_per_trace": 5 / 4,
-        "rollout/solve_rate_1seg": 0.0,
-        "rollout/trace_fraction_1seg": 3 / 4,
-        "rollout/solve_rate_2seg": 1.0,
-        "rollout/trace_fraction_2seg": 1 / 4,
+        "rollout/condensed_trace_fraction": 0.0,
+        "rollout/segments_per_trace": 1.0,
+        "rollout/solve_rate_1seg": 1 / 4,
+        "rollout/trace_fraction_1seg": 1.0,
         "rollout/exit_finished_fraction": 2 / 4,
         "rollout/solve_rate_exit_finished": 0.0,
         "rollout/exit_submitted_fraction": 1 / 4,
         "rollout/solve_rate_exit_submitted": 1.0,
-        "rollout/turns_in_segment_0": float(turns),
-        "rollout/turns_in_segment_1": float(turns),
-        "self_distillation/hinted_trace_fraction": 3 / 4,
-        "self_distillation/hinted_turns_per_trace": 4 / 3,
-        "self_distillation/call_row_fraction": 1 / 3,
-        "self_distillation/call_row_weight_share": 1.5 / 3.0,
-        # hints at steps 0 and 1 of u1_0, 1 of u1_1, 0 of u2_1, every trajectory spanning steps 0..1
-        "self_distillation/hint_position_mean": 0.5,
-        "self_distillation/hint_position_median": 1.0,
-        "self_distillation/hint_position_first_half": 0.5,
-        "self_distillation/hint_in_last_two_turns": 1.0,
-        "self_distillation/hint_gap_mean": 1.0,
-        "self_distillation/hint_adjacent_fraction": 1.0,
+        "rollout/turns_in_segment_0": float(len(SPANS)),
     }
     # the one trajectory with timings sets every mean, max and quantile
     total = TIMINGS["loop_wall"] + TIMINGS["env_setup"] + TIMINGS["reward_eval"] + TIMINGS["reflect"]
@@ -391,4 +396,3 @@ def test_trainer_turn_hints_batch_fields_and_metrics(monkeypatch):
         "reward_health/capped_rollouts_fraction": 0.0,
     })
     assert metrics == pytest.approx(expected)
-    assert isinstance(metrics["self_distillation/hint_injection_fallbacks"], int)

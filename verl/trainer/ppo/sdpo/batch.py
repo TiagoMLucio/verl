@@ -16,11 +16,25 @@ the trainer derives from either."""
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import torch
 
-from verl.trainer.ppo.sdpo.hints import HintedTurn
+
+class HintedTurn(NamedTuple):
+    """One reflection hint paired with the turn it lands on: ``[start, end)`` on the response
+    grid, spliced before the whole turn (``placement == "turn"``, the default) or between the
+    turn's reasoning and its tool call (``"call"``)."""
+
+    step: int
+    start: int
+    end: int
+    text: str
+    placement: str = "turn"
+
+    @property
+    def is_call(self) -> bool:
+        return self.placement == "call"
 
 
 @dataclass

@@ -11,23 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""SDPO teacher construction: the two teacher classes the trainer can run, the batch they read
-and the fields they hand back.
+"""SDPO teacher construction: the teacher contract, the batch a teacher reads and the fields
+it hands back, and the paper's reprompt teacher.
 
-``hints``, ``splice`` and ``teacher_meta`` are the turn-hint path (:class:`TurnHintTeacher`);
-``reprompt`` is the paper path (:class:`RepromptTeacher`). ``cfg.teacher`` picks the class.
+``teacher`` is the contract (:class:`SDPOTeacher`, :func:`make_teacher`), ``batch`` what every
+teacher reads and returns, ``teacher_meta`` the wire codec of spliced teacher rows, ``reprompt``
+the paper path (:class:`RepromptTeacher`). ``self_distillation.teacher`` names the class by its
+``_target_``; project teachers (the turn-hint teacher) live outside verl and subclass
+:class:`SDPOTeacher`.
 """
 
-from verl.trainer.ppo.sdpo.batch import TeacherBatch, TeacherInputs
+from verl.trainer.ppo.sdpo.batch import HintedTurn, TeacherBatch, TeacherInputs
 from verl.trainer.ppo.sdpo.reprompt_teacher import RepromptTeacher
-from verl.trainer.ppo.sdpo.turn_hint_teacher import TurnHintTeacher
+from verl.trainer.ppo.sdpo.teacher import SDPOTeacher, make_teacher
 
-__all__ = ["RepromptTeacher", "TeacherBatch", "TeacherInputs", "TurnHintTeacher", "make_teacher"]
-
-
-def make_teacher(cfg, tokenizer, max_prefix_len: int, apply_chat_template_kwargs=None):
-    """The teacher ``cfg.teacher`` names; ``max_prefix_len`` (the student's prompt budget) caps
-    the turn-hint prefix."""
-    if cfg.teacher == "turn_hints":
-        return TurnHintTeacher(tokenizer, cfg, max_prefix_len=max_prefix_len)
-    return RepromptTeacher(tokenizer, cfg, apply_chat_template_kwargs)
+__all__ = ["HintedTurn", "RepromptTeacher", "SDPOTeacher", "TeacherBatch", "TeacherInputs", "make_teacher"]

@@ -49,7 +49,7 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import extract_reward
-from verl.trainer.ppo.sdpo import reprompt
+from verl.trainer.ppo.sdpo import RepromptTeacher, make_teacher, reprompt
 from verl.trainer.ppo.utils import (
     Role,
     WorkerType,
@@ -598,34 +598,37 @@ class RayPPOTrainer:
         uids = list(batch.non_tensor_batch["uid"])
         raw_prompts = batch.non_tensor_batch["raw_prompt"]
 
+        teacher = make_teacher(
+            self_distillation_cfg,
+            self.tokenizer,
+            max_prefix_len=self.config.data.max_prompt_length,
+            apply_chat_template_kwargs=self.config.data.get("apply_chat_template_kwargs", {}),
+        )
+        if not isinstance(teacher, RepromptTeacher):
+            raise ValueError(f"RayPPOTrainer runs SDPO with the reprompt teacher only, got {type(teacher).__name__}")
+
         feedback_list = [None] * batch_size
         if self_distillation_cfg.include_environment_feedback and reward_extra_infos_dict is not None:
             feedback_list = reprompt.collect_feedback(reward_extra_infos_dict.get("feedback", []), batch_size)
         seq_scores = reward_tensor.sum(dim=-1).detach().cpu().tolist()
         success_by_uid = reprompt.success_rows_by_uid(
-            uids, seq_scores, success_reward_threshold=self_distillation_cfg.success_reward_threshold
+            uids, seq_scores, success_reward_threshold=teacher.success_reward_threshold
         )
         solution_row = [
-            reprompt.select_solution_row(
-                i, success_by_uid, uids, self_distillation_cfg.dont_reprompt_on_self_success
-            )
+            reprompt.select_solution_row(i, success_by_uid, uids, teacher.dont_reprompt_on_self_success)
             for i in range(batch_size)
         ]
-        remove_thinking = self_distillation_cfg.get("remove_thinking_from_demonstration", False)
-        solution_text = {}
-        for row in set(solution_row) - {None}:
-            text = self.tokenizer.decode(responses[row], skip_special_tokens=True)
-            solution_text[row] = reprompt.remove_thinking_trace(text) if remove_thinking else text
+        solution_text = {row: teacher.solution_text(responses[row]) for row in set(solution_row) - {None}}
         messages = [
             reprompt.build_reprompt_messages(
                 reprompt.RepromptContext(raw_prompt=raw_prompts[i], feedback=feedback_list[i]),
                 None if solution_row[i] is None else solution_text[solution_row[i]],
-                self_distillation_cfg,
+                teacher,
             )
             for i in range(batch_size)
         ]
         prompts = reprompt.tokenize_reprompt_batch(
-            self.tokenizer, messages, self_distillation_cfg, self.config.data.get("apply_chat_template_kwargs", {})
+            self.tokenizer, messages, teacher, teacher.apply_chat_template_kwargs
         )
 
         prompt_len = max(prompt.shape[0] for prompt in prompts)
@@ -645,7 +648,9 @@ class RayPPOTrainer:
         teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
 
         feedback_used = [
-            reprompt.prompt_feedback_used(feedback_list[i], solution_row[i] is not None, self_distillation_cfg)
+            reprompt.prompt_feedback_used(
+                feedback_list[i], solution_row[i] is not None, teacher.environment_feedback_only_without_solution
+            )
             for i in range(batch_size)
         ]
         self_distillation_mask = torch.tensor(

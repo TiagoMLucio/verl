@@ -22,7 +22,7 @@ from collections import Counter, defaultdict
 import numpy as np
 
 from verl.trainer.ppo.metric_utils import process_validation_metrics
-from verl.trainer.ppo.sdpo.hints import HintedTurn
+from verl.trainer.ppo.sdpo.batch import HintedTurn
 from verl.trainer.ppo.sdpo.reprompt import prompt_feedback_used, select_solution_row, success_rows_by_uid
 
 
@@ -68,15 +68,23 @@ def batch_metrics(
 
 
 def supervision_source_metrics(
-    uids: list, seq_scores: list[float], feedback: list, extra_fields: list[dict], traj_of_row: list, cfg
+    uids: list,
+    seq_scores: list[float],
+    feedback: list,
+    extra_fields: list[dict],
+    traj_of_row: list,
+    success_reward_threshold: float,
+    dont_reprompt_on_self_success: bool = False,
+    environment_feedback_only_without_solution: bool = False,
 ) -> dict:
-    """How many trajectories had a sibling solution or feedback to learn from. Counted on the
-    first-segment rows so a condensed trajectory counts once."""
+    """How many trajectories had a sibling solution or feedback to learn from, selected the
+    way the reprompt teacher's options say. Counted on the first-segment rows so a condensed
+    trajectory counts once."""
     first_seg = _first_segment_rows(extra_fields)
     n_traces = len(set(traj_of_row))
-    success_by_uid = success_rows_by_uid(uids, seq_scores, cfg.success_reward_threshold)
+    success_by_uid = success_rows_by_uid(uids, seq_scores, success_reward_threshold)
     has_solution = [
-        select_solution_row(i, success_by_uid, uids, cfg.dont_reprompt_on_self_success) is not None
+        select_solution_row(i, success_by_uid, uids, dont_reprompt_on_self_success) is not None
         for i in range(len(uids))
     ]
     unique_uids = set(uids)
@@ -89,7 +97,12 @@ def supervision_source_metrics(
             sum(1 for i in first_seg if feedback[i] is not None) / n_traces
         ),
         "self_distillation/feedback_used_fraction": (
-            sum(1 for i in first_seg if prompt_feedback_used(feedback[i], has_solution[i], cfg)) / n_traces
+            sum(
+                1
+                for i in first_seg
+                if prompt_feedback_used(feedback[i], has_solution[i], environment_feedback_only_without_solution)
+            )
+            / n_traces
         ),
     }
 

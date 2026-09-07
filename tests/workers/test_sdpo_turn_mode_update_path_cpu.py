@@ -31,9 +31,7 @@ import torch.nn as nn
 import verl.workers.engine.fsdp.transformer_impl as transformer_impl
 import verl.workers.utils.losses as sdpo_losses
 import verl.workers.utils.padding as padding_mod
-from verl.trainer.ppo.sdpo import splice
-from verl.trainer.ppo.sdpo.hints import HintedTurn
-from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META
+from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META, SubRow, pack
 from verl.utils import tensordict_utils as tu
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
 from verl.workers.engine_workers import ActorRolloutRefWorker
@@ -124,14 +122,16 @@ def make_batch(include_hinted=True, include_unhinted=True):
     """Build the turn-mode mini-batch exactly as _maybe_build_self_distillation_batch ships it."""
     rows = []
     if include_hinted:
-        # hinted sample: prompt 4, response 12, one hinted turn covering response [2, 7)
+        # hinted sample: prompt 4, response 12, one hinted turn covering response [2, 7); its
+        # teacher row is the prompt, the history, the hint and the scored span
         prompt = torch.arange(4, dtype=torch.long) + 1
         resp = torch.arange(12, dtype=torch.long) + 5
-        hinted = [HintedTurn(1, 2, 7, "h1", "turn")]
-        hint_ids = [torch.tensor([50, 51, 52], dtype=torch.long)]
-        header = torch.tensor([60, 61], dtype=torch.long)
-        seq, meta, _, spans = splice.build_spliced_teacher_row(prompt, resp, hinted, hint_ids, 4096, header)
-        sd_mask = splice.turn_token_mask(12, spans)
+        hint_ids = torch.tensor([50, 51, 52], dtype=torch.long)
+        body = torch.cat([resp[:2], hint_ids, resp[2:7]])
+        seq = torch.cat([prompt, body])
+        meta = pack([SubRow(seq.shape[0], body.shape[0], 2 + hint_ids.shape[0], 2, 7)])
+        sd_mask = torch.zeros(12)
+        sd_mask[2:7] = 1.0
         rows.append(dict(prompt=prompt, resp=resp, teacher_seq=seq, meta=torch.tensor(meta), sd_mask=sd_mask))
     if include_unhinted:
         # un-hinted: degenerate 1-token teacher row, zero mask (trainer's else-branch)

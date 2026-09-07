@@ -24,9 +24,7 @@ import torch
 from tensordict import TensorDict
 
 from verl.trainer.ppo.padding_utils import construct_minimal_padding_template
-from verl.trainer.ppo.sdpo import splice
-from verl.trainer.ppo.sdpo.hints import HintedTurn
-from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META
+from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META, SubRow, pack
 from verl.utils import tensordict_utils as tu
 from verl.workers.utils.sdpo import explode_turn_teacher_rows, scatter_turn_teacher_outputs
 
@@ -36,14 +34,18 @@ def njt(rows):
 
 
 def make_hinted_sample(resp_len=9000, prompt_len=50):
+    """A spliced teacher row as the turn-hint teacher ships it: one sub-row per hinted turn
+    (here [100, 2600) and [2600, resp_len)), each the prompt, the history, the hint and the
+    scored span."""
     response_ids = torch.arange(resp_len, dtype=torch.long)
     prompt_ids = torch.full((prompt_len,), 7, dtype=torch.long)
-    hinted = [HintedTurn(3, 100, 2600, "h1", "turn"), HintedTurn(7, 2600, resp_len, "h2", "turn")]
     hint_ids = [torch.full((20,), 5, dtype=torch.long), torch.full((30,), 6, dtype=torch.long)]
-    header_ids = torch.tensor([90, 91, 92], dtype=torch.long)
-    seq, meta, _, _ = splice.build_spliced_teacher_row(
-        prompt_ids, response_ids, hinted, hint_ids, 32768, header_ids
-    )
+    pieces, sub_rows = [], []
+    for (start, end), hint in zip([(100, 2600), (2600, resp_len)], hint_ids, strict=True):
+        body = torch.cat([response_ids[:start], hint, response_ids[start:end]])
+        pieces.append(torch.cat([prompt_ids, body]))
+        sub_rows.append(SubRow(prompt_len + body.shape[0], body.shape[0], start + hint.shape[0], start, end))
+    seq, meta = torch.cat(pieces), pack(sub_rows)
     return {
         "responses": response_ids,
         "response_mask": torch.ones(resp_len),

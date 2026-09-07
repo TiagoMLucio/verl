@@ -1326,8 +1326,8 @@ class PPOTrainer:
         into one no-padding teacher sequence per sample (the actor worker re-pads it and
         recomputes the attention mask and position ids, see
         ``reconstruct_padded_teacher_from_nested``), its distillation mask and its loss mask.
-        The per-trajectory row weights and the batch health metrics are shared by both
-        teachers and computed here, then everything is written back to TransferQueue.
+        The per-trajectory row weights and the batch health metrics are shared by every
+        teacher and computed here, then everything is written back to TransferQueue.
         """
         cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
@@ -1371,7 +1371,7 @@ class PPOTrainer:
         traj_of_row = [_session_key(key) for key in batch.keys]
         hinted_per_row = teacher.hinted_per_row or [[] for _ in batch.keys]
         call_row = [any(hint.is_call for hint in hinted) for hinted in hinted_per_row]
-        weights = trace_weights(supervised_per_row, traj_of_row, call_row, cfg.call_loss_weight)
+        weights = trace_weights(supervised_per_row, traj_of_row, call_row, self.sdpo_teacher.call_loss_weight)
         fields["trace_weight"] = torch.tensor(weights, dtype=torch.float32).unsqueeze(-1)
         # Row -> trajectory, as a plain int the update path can carry: mini-batches are cut
         # from shuffled rows, so a condensed trajectory's supervised segments land in
@@ -1383,9 +1383,7 @@ class PPOTrainer:
         metrics.update(
             health.batch_metrics(supervised_per_row, supervised_rows, inputs.response_mask, traj_of_row, extra_fields)
         )
-        metrics.update(
-            health.supervision_source_metrics(inputs.uids, seq_scores, feedback, extra_fields, traj_of_row, cfg)
-        )
+        metrics.update(self.sdpo_teacher.supervision_source_metrics(inputs, traj_of_row))
         metrics.update(teacher.metrics)
         metrics.update(health.condensation_metrics(extra_fields, seq_scores, cfg.success_reward_threshold))
         metrics.update(health.trajectory_timing_metrics(extra_fields))

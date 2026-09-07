@@ -1,0 +1,36 @@
+# Format checks enforced on CI:
+# 1. Comments must appear above each field.
+# 2. There must be a blank line between each field.
+# 3. Inline comments (after a field on the same line) are not allowed.
+# 4. Indentation level is respected for nested fields.
+
+# The SDPO paper's teacher: a fresh prompt carrying a successful sibling's solution and the
+# environment feedback, followed by the student's own response. Selected through the trainer
+# defaults list (sdpo_teacher@actor_rollout_ref.actor.self_distillation.teacher: reprompt).
+
+# The teacher class; the other keys are its keyword options
+_target_: verl.trainer.ppo.sdpo.RepromptTeacher
+
+# Maximum token length of the reprompted teacher input
+max_reprompt_len: 10240
+
+# Truncation side for reprompt: right | left
+reprompt_truncation: right
+
+# Skip reprompting samples that already succeeded themselves
+dont_reprompt_on_self_success: true
+
+# Strip <think>...</think> from demonstrations before reprompting
+remove_thinking_from_demonstration: true
+
+# Template combining prompt, solution, and feedback
+reprompt_template: "{prompt}{solution}{feedback}\n\nCorrectly solve the original question.\n"
+
+# Template wrapping the successful demonstration
+solution_template: "\nCorrect solution:\n\n{successful_previous_attempt}\n\n"
+
+# Template wrapping environment feedback
+feedback_template: "\nThe following is feedback from your unsuccessful earlier attempt:\n\n{feedback_raw}\n\n"
+
+# Use feedback only when no successful demonstration is available
+environment_feedback_only_without_solution: true

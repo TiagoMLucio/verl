@@ -9,7 +9,6 @@ actor_rollout_ref:
     self_distillation:
       teacher_regularization: ema
       teacher_update_rate: 0.05
-      max_reprompt_len: 10240
       is_clip: 2.0
   rollout:
     n: 8

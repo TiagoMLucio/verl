@@ -13,7 +13,9 @@
 # limitations under the License.
 """The paper's reprompt teacher context: a sibling solution and the environment's feedback
 folded into a fresh single-turn prompt. Pure functions over :class:`RepromptContext`; the
-teachers own the batch plumbing."""
+``options`` they take is the object carrying the reprompt options (the
+:class:`~verl.trainer.ppo.sdpo.reprompt_teacher.RepromptTeacher`), which owns the batch
+plumbing."""
 
 import re
 from collections import defaultdict
@@ -106,23 +108,25 @@ def select_solution_row(
     return solution_idxs[0] if solution_idxs else None
 
 
-def prompt_feedback_used(feedback: Optional[str], has_solution: bool, cfg) -> bool:
+def prompt_feedback_used(
+    feedback: Optional[str], has_solution: bool, environment_feedback_only_without_solution: bool = False
+) -> bool:
     """Whether this sample's feedback enters the teacher prompt (mirrors the mask)."""
-    return feedback is not None and (not cfg.environment_feedback_only_without_solution or not has_solution)
+    return feedback is not None and (not environment_feedback_only_without_solution or not has_solution)
 
 
-def build_reprompt_messages(ctx: RepromptContext, solution: Optional[str], cfg) -> list[dict]:
+def build_reprompt_messages(ctx: RepromptContext, solution: Optional[str], options) -> list[dict]:
     """Assemble the teacher's reprompt messages for one sample."""
     has_solution = solution is not None
-    use_feedback = prompt_feedback_used(ctx.feedback, has_solution, cfg)
+    use_feedback = prompt_feedback_used(ctx.feedback, has_solution, options.environment_feedback_only_without_solution)
 
     solution_section = ""
     if has_solution:
-        solution_section = cfg.solution_template.format(successful_previous_attempt=solution)
+        solution_section = options.solution_template.format(successful_previous_attempt=solution)
 
     feedback_section = ""
     if use_feedback:
-        feedback_section = cfg.feedback_template.format(feedback_raw=ctx.feedback)
+        feedback_section = options.feedback_template.format(feedback_raw=ctx.feedback)
 
     # Per-segment teacher context: a condensation segment (segment_index > 0) was generated
     # from a *condensed history*, not the original task. Build its teacher from that history
@@ -132,12 +136,12 @@ def build_reprompt_messages(ctx: RepromptContext, solution: Optional[str], cfg) 
     if ctx.segment_prompt:
         if not (use_feedback or has_solution):
             return list(ctx.segment_prompt)
-        aug_text = cfg.reprompt_template.format(prompt="", solution=solution_section, feedback=feedback_section)
+        aug_text = options.reprompt_template.format(prompt="", solution=solution_section, feedback=feedback_section)
         return list(ctx.segment_prompt) + [{"role": "user", "content": aug_text}]
 
     system_messages = ctx.raw_prompt[:-1]
     if use_feedback or has_solution:
-        reprompt_text = cfg.reprompt_template.format(
+        reprompt_text = options.reprompt_template.format(
             prompt=ctx.prompt_text, solution=solution_section, feedback=feedback_section
         )
     else:
@@ -147,10 +151,10 @@ def build_reprompt_messages(ctx: RepromptContext, solution: Optional[str], cfg) 
 
 
 def tokenize_reprompt_batch(
-    tokenizer, messages: list[list[dict]], cfg, apply_chat_template_kwargs=None
+    tokenizer, messages: list[list[dict]], options, apply_chat_template_kwargs=None
 ) -> list[torch.Tensor]:
-    """Tokenize the reprompts as one left-padded batch capped at ``cfg.max_reprompt_len``
-    (truncated on ``cfg.reprompt_truncation``) and return each row without its padding."""
+    """Tokenize the reprompts as one left-padded batch capped at ``options.max_reprompt_len``
+    (truncated on ``options.reprompt_truncation``) and return each row without its padding."""
     if not messages:
         return []
     apply_kwargs = dict(
@@ -158,14 +162,14 @@ def tokenize_reprompt_batch(
         return_tensors="pt",
         return_dict=True,
         add_generation_prompt=True,
-        max_length=cfg.max_reprompt_len,
+        max_length=options.max_reprompt_len,
         padding=True,
         truncation=True,
         **dict(apply_chat_template_kwargs or {}),
     )
     sides = tokenizer.padding_side, tokenizer.truncation_side
     tokenizer.padding_side = "left"
-    tokenizer.truncation_side = cfg.reprompt_truncation
+    tokenizer.truncation_side = options.reprompt_truncation
     try:
         try:
             teacher_prompt = tokenizer.apply_chat_template(messages, continue_final_message=False, **apply_kwargs)
