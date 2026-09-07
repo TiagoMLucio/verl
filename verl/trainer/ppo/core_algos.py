@@ -1166,19 +1166,23 @@ def agg_loss(
         seq_weights: optional per-sequence weight (bs,) for the seq-mean modes. A condensed
             trajectory ships one row per segment; weighting each row by its share of that
             trajectory's supervised tokens makes the trajectory count once in total (a token-mean
-            within it, a plain mean across trajectories). The denominator stays the row count, so
-            a batch with more condensation carries slightly less total weight.
+            within it, a plain mean across trajectories). Under "seq-mean-token-mean" the
+            denominator stays the row count, so a batch with more condensation carries slightly
+            less total weight. "traj-mean-token-mean" is the same arithmetic with the caller
+            passing raw shares (summing to one per supervised trajectory) and the number of
+            supervised trajectories as `global_batch_size`: the mean over trajectories of each
+            trajectory's token-mean.
 
     Returns:
         loss: `a scalar torch.Tensor`
             aggregated loss
     """
-    if seq_weights is not None and loss_agg_mode != "seq-mean-token-mean":
+    if seq_weights is not None and loss_agg_mode not in ("seq-mean-token-mean", "traj-mean-token-mean"):
         # token-mean is already segmentation-invariant; the token-sum modes keep a trajectory's
         # segments additive, so a per-row share would corrupt them
         warnings.warn(
             f"seq_weights is ignored for loss_agg_mode={loss_agg_mode!r}; "
-            "per-trajectory weighting only applies to seq-mean-token-mean",
+            "per-trajectory weighting only applies to seq-mean-token-mean and traj-mean-token-mean",
             stacklevel=2,
         )
         seq_weights = None
@@ -1202,7 +1206,7 @@ def agg_loss(
                 horizon = loss_mask.shape[-1]
                 loss_scale_factor = horizon
             loss /= loss_scale_factor
-    elif loss_agg_mode == "seq-mean-token-mean":
+    elif loss_agg_mode in ("seq-mean-token-mean", "traj-mean-token-mean"):
         seq_mask = torch.sum(loss_mask, dim=-1)  # per-sequence token count
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / (seq_mask + 1e-8)  # token-mean
         seq_mask = (seq_mask > 0).float()  # exclude fully masked sequences
@@ -1499,7 +1503,6 @@ def compute_self_distillation_loss(
     )
     metrics.update(
         {
-            "self_distillation/loss": loss.detach().item(),
             "self_distillation/alpha": float(self_distillation_config.alpha),
             "self_distillation/full_logit_distillation": float(self_distillation_config.full_logit_distillation),
             "self_distillation/use_topk": float(self_distillation_config.distillation_topk is not None),

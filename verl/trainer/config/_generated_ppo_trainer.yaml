@@ -41,7 +41,6 @@ actor_rollout_ref:
       ulysses_sequence_parallel_size: 1
       entropy_from_logits_with_chunking: false
       use_torch_compile: true
-      compile_transformer_layers: false
       entropy_checkpointing: false
       forward_only: false
       strategy: fsdp
@@ -259,7 +258,6 @@ actor_rollout_ref:
       ulysses_sequence_parallel_size: 1
       entropy_from_logits_with_chunking: false
       use_torch_compile: true
-      compile_transformer_layers: false
       entropy_checkpointing: false
       forward_only: true
       strategy: fsdp
@@ -549,7 +547,6 @@ critic:
     ulysses_sequence_parallel_size: 1
     entropy_from_logits_with_chunking: false
     use_torch_compile: true
-    compile_transformer_layers: false
     entropy_checkpointing: false
     forward_only: false
     strategy: fsdp

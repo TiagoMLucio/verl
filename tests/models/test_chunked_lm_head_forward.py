@@ -165,7 +165,7 @@ def test_eager_path_is_untouched_when_not_chunking():
 def test_forward_mode_defaults_to_fused():
     """Once the patch is installed every caller must state its mode, because the default
     is the fused path rather than the eager one. The engine forgetting this sent the
-    log-prob pass down the fused branch in run 3001809. Asserted on the signature: taking
+    log-prob pass down the fused branch once. Asserted on the signature: taking
     the fused branch for real needs Triton on a device.
     """
     for fn in (forward_with_torch_backend, forward_with_triton_backend):

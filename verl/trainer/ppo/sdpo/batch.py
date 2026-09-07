@@ -53,14 +53,16 @@ class TeacherBatch:
     metrics: dict[str, float] = field(default_factory=dict)
 
 
-def trace_weights(supervised_per_row: list[float], traj_of_row: list) -> list[float]:
+def trace_weights(supervised_per_row: list[float], traj_of_row: list, rescale: bool = True) -> list[float]:
     """Per-row weight for the seq-mean loss, shared by every teacher: a trajectory counts once
     in total, its segments split that weight by how much supervision each carries (an even
     split would over-weight a segment holding one short supervised span).
 
-    Weights are renormalised to the supervised-row count: raw shares would sum to the number
-    of supervised trajectories and shrink the update by the average segments-per-trajectory
-    (~0.6x at our condensation rate).
+    With ``rescale`` the weights are renormalised to the supervised-row count, which the
+    seq-mean-token-mean denominator expects: raw shares would sum to the number of supervised
+    trajectories and shrink the update by the average segments-per-trajectory. Without it the
+    raw shares come back, summing to one per supervised trajectory, for the traj-mean-token-mean
+    mode that divides by that trajectory count instead.
     """
     traj_supervised: dict = defaultdict(float)
     for traj, n_supervised in zip(traj_of_row, supervised_per_row, strict=True):
@@ -69,6 +71,8 @@ def trace_weights(supervised_per_row: list[float], traj_of_row: list) -> list[fl
         n / traj_supervised[traj] if traj_supervised[traj] > 0 else 0.0
         for traj, n in zip(traj_of_row, supervised_per_row, strict=True)
     ]
+    if not rescale:
+        return weights
     n_supervised_rows = sum(1 for n in supervised_per_row if n > 0)
     total = sum(weights)
     scale = (n_supervised_rows / total) if total > 0 else 1.0

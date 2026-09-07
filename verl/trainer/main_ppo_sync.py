@@ -1369,7 +1369,8 @@ class PPOTrainer:
         fields = dict(teacher.fields)
 
         supervised_per_row = [float(mask.sum()) for mask in fields["loss_mask"].unbind()]
-        weights = trace_weights(supervised_per_row, traj_of_row)
+        traj_mean = self.config.actor_rollout_ref.actor.get("loss_agg_mode") == "traj-mean-token-mean"
+        weights = trace_weights(supervised_per_row, traj_of_row, rescale=not traj_mean)
         fields["trace_weight"] = torch.tensor(weights, dtype=torch.float32).unsqueeze(-1)
         # Row -> trajectory, as a plain int the update path can carry: mini-batches are cut
         # from shuffled rows, so a condensed trajectory's supervised segments land in
@@ -1656,6 +1657,32 @@ class PPOTrainer:
             batch, self._get_required_batch_multiple(dp_size), self.tokenizer.eos_token_id
         )
 
+    def _supervised_trajectory_count(self, batch: KVBatchMeta, mini_batch_rows: int, sdpo_enabled: bool) -> int:
+        """Denominator of traj-mean-token-mean: the trajectories with any supervised token in
+        the update batch. Every mini-batch is divided by this whole-batch count, so the update
+        has to be one mini-batch and one epoch."""
+        if not sdpo_enabled:
+            raise ValueError(
+                "loss_agg_mode=traj-mean-token-mean needs policy_loss.loss_mode=sdpo: the per-row shares "
+                "and trajectory ids it divides by come from the self-distillation batch"
+            )
+        if len(batch.keys) != mini_batch_rows:
+            raise ValueError(
+                "loss_agg_mode=traj-mean-token-mean needs a single mini-batch per step: the update batch "
+                f"has {len(batch.keys)} rows but ppo_mini_batch_size * rollout.n = {mini_batch_rows}"
+            )
+        ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
+        if ppo_epochs != 1:
+            raise ValueError(f"loss_agg_mode=traj-mean-token-mean needs ppo_epochs=1, got {ppo_epochs}")
+        fields = tq.kv_batch_get(
+            keys=batch.keys, partition_id=batch.partition_id, select_fields=["trace_weight", "traj_id"]
+        )
+        weight, traj = fields["trace_weight"], fields["traj_id"]
+        weight = (weight.to_padded_tensor(0.0) if weight.is_nested else weight).reshape(len(batch.keys), -1).sum(-1)
+        traj = (traj.to_padded_tensor(-1) if traj.is_nested else traj).reshape(len(batch.keys), -1)[:, 0]
+        supervised = {int(t) for t, w in zip(traj.tolist(), weight.tolist(), strict=True) if w > 0 and t >= 0}
+        return max(len(supervised), 1)
+
     def _update_actor(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Update the actor network."""
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
@@ -1687,6 +1714,10 @@ class PPOTrainer:
         update_batch = batch
         if self.config.actor_rollout_ref.actor.get("drop_unsupervised_rows", False):
             update_batch = self._drop_unsupervised_rows(batch, metrics)
+        if self.config.actor_rollout_ref.actor.get("loss_agg_mode") == "traj-mean-token-mean":
+            extra_info["global_batch_size"] = self._supervised_trajectory_count(
+                update_batch, ppo_mini_batch_size, sdpo_enabled
+            )
         update_batch.extra_info.update(extra_info)
 
         output: TensorDict = self.actor_rollout_wg.update_actor(update_batch)

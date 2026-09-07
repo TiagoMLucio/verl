@@ -199,7 +199,7 @@ def forward_with_normal_backend(
     # Same slice HF's own Qwen3_5 forward applies. This patch replaces that forward
     # wholesale, so without it `logits_to_keep` reaches the base model as dead **kwargs
     # and the head widens all 248k vocab over the full sequence: at 31k tokens that is
-    # the ~28 GiB fp32 transient whose backward OOM'd 3184998/3185005/3186431.
+    # a ~28 GiB fp32 transient whose backward runs out of memory.
     # int 0 reproduces the unsliced default, since slice(-0, None) is the whole sequence.
     slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
     logits = self.lm_head(hidden_states[:, slice_indices, :])

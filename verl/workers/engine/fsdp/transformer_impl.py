@@ -80,7 +80,6 @@ from .utils import create_device_mesh, get_sharding_strategy
 
 logger = logging.getLogger(__file__)
 
-_SPAN_DIAG = 0
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
@@ -100,29 +99,6 @@ def _freeze_vision_tower(module: torch.nn.Module) -> None:
     tower = _find_vision_tower(module)
     assert tower is not None, "freeze_vision_tower is set but the model has no vision tower"
     tower.requires_grad_(False)
-
-
-def _compile_transformer_layers(module: torch.nn.Module) -> int:
-    """torch.compile every transformer block, in place, leaving any vision tower eager.
-
-    Regional on purpose. Compiling the whole model is not an option here: the wrapped module
-    would break at every FSDP hook, and a VLM's tower carries data-dependent shapes that
-    graph-break unconditionally. Blocks are the unit FSDP wraps, so compiling them before
-    `fully_shard` leaves the unshard/reshard hooks outside the compiled region, and HF's
-    gradient checkpointing (which wraps `__call__`) outside it as well.
-    """
-    layer_cls_names = set(getattr(module, "_no_split_modules", None) or [])
-    if not layer_cls_names:
-        return 0
-    tower = _find_vision_tower(module)
-    skip = {id(m) for m in tower.modules()} if tower is not None else set()
-
-    compiled = 0
-    for submodule in module.modules():
-        if type(submodule).__name__ in layer_cls_names and id(submodule) not in skip:
-            submodule.forward = torch.compile(submodule.forward, dynamic=True)
-            compiled += 1
-    return compiled
 
 
 class FSDPEngine(BaseEngine):
@@ -352,8 +328,7 @@ class FSDPEngine(BaseEngine):
             if self.model_config.enable_gradient_checkpointing:
                 module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-            # Both must land before FSDP wraps: the wrap policy reads requires_grad, and a
-            # block has to be compiled while it is still a plain nn.Module.
+            # Must land before FSDP wraps: the wrap policy reads requires_grad.
             if self.model_config.freeze_vision_tower:
                 assert not self._is_lora, "freeze_vision_tower and LoRA both freeze; pick one"
                 # the tower's non-block parameters share the root unit with the trained ones,
@@ -362,12 +337,6 @@ class FSDPEngine(BaseEngine):
                     "freeze_vision_tower on FSDP1 requires engine.use_orig_params=True"
                 )
                 _freeze_vision_tower(module)
-
-            if self.engine_config.compile_transformer_layers:
-                n_compiled = _compile_transformer_layers(module)
-                assert n_compiled > 0, "compile_transformer_layers matched no block: _no_split_modules is empty"
-                if self.rank == 0:
-                    print(f"torch.compile applied to {n_compiled} transformer blocks")
         return module
 
     def _build_lora_module(self, module):
@@ -713,7 +682,7 @@ class FSDPEngine(BaseEngine):
         traced = trace_file.enabled()
         for micro_idx, micro_batch in enumerate(micro_batches):
             # Peaks, not before/after differences: the transient that ends a run is raised
-            # inside backward() (2990356 died on an 11.59 GiB allocation there), so a
+            # inside backward() (an 11.59 GiB allocation there has ended runs), so a
             # boundary sample straddles it. take_peak() folds the outgoing peak into the
             # run-level maxima before resetting, leaving perf/max_memory_allocated_gb intact.
             mb_start = time.time()
@@ -1219,7 +1188,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     # this call, since forward_step passes use_cache=False. It then builds
                     # a document mask and forbids the is_causal skip, so SDPA takes the
                     # math kernel and materialises (bsz x heads x L x L) anyway: 21.20 GiB
-                    # on two teacher sub-rows of 18.9k, job 3203003. Dropping the mask and
+                    # on two teacher sub-rows of 18.9k. Dropping the mask and
                     # keeping the positions monotonic are one fix, not two -- either alone
                     # leaves the mask materialised. Only pad slots change value; every real
                     # position keeps its own, so nothing the loss reads moves.
@@ -1239,9 +1208,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # narrow over cu_seqlens below), so what the pad positions compute is
                 # discarded. Passing the mask instead disqualifies SDPA's flash backend and
                 # the math kernel materialises the whole (bsz x heads x L x L) score matrix:
-                # one row of 31.7k over 16 heads cost 29.93 GiB (job 3183777), and two
-                # teacher sub-rows padded to 17.1k cost 17.44 GiB (job 3196068) -- the
-                # padding, not the sequence, is what makes bsz > 1 quadratic here.
+                # one row of 31.7k over 16 heads cost 29.93 GiB, and two teacher sub-rows
+                # padded to 17.1k cost 17.44 GiB -- the padding, not the sequence, is
+                # what makes bsz > 1 quadratic here.
                 attention_mask = None
 
                 model_inputs = {
@@ -1259,20 +1228,6 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # instead of the full sequence, which is what makes a 248k-vocab lm_head
                 # affordable here.
                 keep_positions = micro_batch.get("logits_keep_positions", None)
-                # one-off diagnostic: span-only is what keeps a 248k-vocab lm_head affordable,
-                # and its absence is silent -- it just materialises the whole sequence.
-                global _SPAN_DIAG
-                if _SPAN_DIAG < 4:
-                    _SPAN_DIAG += 1
-                    _tot = int(micro_batch["input_ids"].offsets()[-1])
-                    if keep_positions is None:
-                        logger.warning(
-                            "[span-only] INACTIVE: no logits_keep_positions in micro_batch "
-                            "(keys=%s); lm_head will run over all %d tokens",
-                            sorted(micro_batch.keys()), _tot)
-                    else:
-                        logger.warning("[span-only] active: %d kept of %d tokens",
-                                       int(keep_positions.values().shape[0]), _tot)
                 if keep_positions is not None:
                     assert not use_fused_kernels, "logits_keep_positions does not support fused kernels"
                     nested_ids = micro_batch["input_ids"]
@@ -1566,7 +1521,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     # same contract the logits branch below produces. The legacy slice
                     # under this fixed-width layout returns a (bsz, response_length)
                     # padded tensor whose rows response_from_nested/no_padding_2_padding
-                    # then mis-slice into empty ones: job 3206010's vanilla update saw
+                    # then mis-slice into empty ones: a vanilla PPO update has seen
                     # old_log_probs of width 0 against a 44758-token log_prob. The label
                     # at each row's last real position is the pad token (per-row roll),
                     # matching the packed roll's row-crossing label there: both are

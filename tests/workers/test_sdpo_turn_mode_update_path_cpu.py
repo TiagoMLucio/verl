@@ -118,7 +118,7 @@ def make_engine(module):
     return eng
 
 
-def make_batch(include_hinted=True, include_unhinted=True):
+def make_batch(include_hinted=True, include_unhinted=True, loss_agg_mode="token-mean"):
     """Build the turn-mode mini-batch exactly as _maybe_build_self_distillation_batch ships it."""
     rows = []
     if include_hinted:
@@ -178,10 +178,16 @@ def make_batch(include_hinted=True, include_unhinted=True):
         "pad_token_id": 0,
         "global_batch_size": len(rows),
     }
+    if loss_agg_mode == "traj-mean-token-mean":
+        # one row per trajectory here, so the raw shares are 1 for a hinted row and 0 otherwise,
+        # and the trainer's denominator is the number of hinted trajectories, clamped to 1
+        shares = [float(r["sd_mask"].sum() > 0) for r in rows]
+        tensor_dict["trace_weight"] = njt([torch.tensor([w]) for w in shares])
+        non_tensor_dict["global_batch_size"] = max(int(sum(shares)), 1)
     return tu.get_tensordict(tensor_dict=tensor_dict, non_tensor_dict=non_tensor_dict)
 
 
-def run_update(data):
+def run_update(data, loss_agg_mode="token-mean"):
     """Mirror ActorRolloutRefWorker.update_actor minus Ray/FSDP/TQ."""
     student_engine = make_engine(ToyLM(seed=0))
     student_engine.engine_config.forward_only = False
@@ -197,7 +203,7 @@ def run_update(data):
     teacher_fn = partial(ActorRolloutRefWorker._compute_sdpo_teacher_logps_for_loss, worker)
 
     actor_config = SimpleNamespace(
-        global_batch_info={}, loss_scale_factor=None, loss_agg_mode="token-mean", entropy_coeff=0.0
+        global_batch_info={}, loss_scale_factor=None, loss_agg_mode=loss_agg_mode, entropy_coeff=0.0
     )
     sdpo_config = SimpleNamespace(
         full_logit_distillation=True,
@@ -222,13 +228,6 @@ def test_turn_mode_update_path_backprops(single_process_group, cpu_ops):
         val = m.aggregate() if hasattr(m, "aggregate") else m
         val = val if isinstance(val, torch.Tensor) else torch.tensor(float(val))
         assert torch.isfinite(val).all()
-    # the loss diagnostic is the same per-micro-batch share as pg_loss and adds up the same way
-    diag = outputs["metrics"]["self_distillation/loss"]
-    for m, d in zip(
-        metric if isinstance(metric, list) else [metric], diag if isinstance(diag, list) else [diag], strict=True
-    ):
-        assert d.aggregation == m.aggregation
-        assert float(d.aggregate()) == pytest.approx(float(m.aggregate()))
 
     grads = [p.grad for p in student_engine.module.parameters()]
     assert all(g is not None and torch.isfinite(g).all() for g in grads)
@@ -242,6 +241,40 @@ def test_all_unhinted_micro_batch_is_a_finite_noop(single_process_group, cpu_ops
     grads = [p.grad for p in student_engine.module.parameters()]
     assert all(g is not None and torch.isfinite(g).all() for g in grads)
     assert sum(g.abs().sum() for g in grads) == 0, "un-hinted rows must contribute zero gradient"
+
+
+def _pg_loss(outputs):
+    metric = outputs["metrics"]["actor/pg_loss"]
+    return sum(float(m.aggregate()) for m in (metric if isinstance(metric, list) else [metric]))
+
+
+def test_traj_mean_all_unhinted_micro_batch_is_a_finite_noop(single_process_group, cpu_ops):
+    data = make_batch(include_hinted=False, include_unhinted=True, loss_agg_mode="traj-mean-token-mean")
+    assert data["global_batch_size"] == 1
+    student_engine, outputs = run_update(data, loss_agg_mode="traj-mean-token-mean")
+
+    assert _pg_loss(outputs) == 0.0
+    grads = [p.grad for p in student_engine.module.parameters()]
+    assert all(g is not None and torch.isfinite(g).all() for g in grads)
+    assert sum(g.abs().sum() for g in grads) == 0
+
+
+def test_traj_mean_with_one_hinted_trajectory_matches_token_mean(single_process_group, cpu_ops):
+    """One hinted trajectory next to an un-hinted one: the mean over supervised trajectories of
+    the per-trajectory token-mean is that trajectory's token-mean, which is what token-mean
+    over the mini-batch's supervised tokens computes too. Same loss, same gradient."""
+    torch.manual_seed(0)
+    data = make_batch(loss_agg_mode="traj-mean-token-mean")
+    torch.manual_seed(0)
+    reference = make_batch(loss_agg_mode="token-mean")
+
+    traj_engine, traj_out = run_update(data, loss_agg_mode="traj-mean-token-mean")
+    token_engine, token_out = run_update(reference, loss_agg_mode="token-mean")
+
+    assert _pg_loss(traj_out) == pytest.approx(_pg_loss(token_out))
+    for g_traj, g_tok in zip(traj_engine.module.parameters(), token_engine.module.parameters(), strict=True):
+        assert torch.allclose(g_traj.grad, g_tok.grad)
+    assert sum(p.grad.abs().sum() for p in traj_engine.module.parameters()) > 0
 
 
 def test_teacher_scores_only_hinted_rows(single_process_group, cpu_ops):

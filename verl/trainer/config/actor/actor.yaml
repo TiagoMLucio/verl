@@ -78,7 +78,9 @@ policy_loss:
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 
-# Loss aggregation mode: "token-mean", "seq-mean-token-sum", "seq-mean-token-mean", or "seq-mean-token-sum-norm"
+# Loss aggregation mode: "token-mean", "seq-mean-token-sum", "seq-mean-token-mean", "seq-mean-token-sum-norm",
+# or "traj-mean-token-mean" (mean over supervised trajectories of each one's token-mean; the trainer
+# supplies the per-row shares and the trajectory count, and the update must be a single mini-batch)
 loss_agg_mode: token-mean
 
 # Scale factor for "seq-mean-token-sum-norm" loss aggregation mode.

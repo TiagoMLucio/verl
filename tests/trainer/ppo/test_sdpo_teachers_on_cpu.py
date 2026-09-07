@@ -390,3 +390,122 @@ def test_trainer_reprompt_batch_fields_and_metrics(monkeypatch):
         "reward_health/capped_rollouts_fraction": 0.0,
     })
     assert metrics == pytest.approx(expected)
+
+
+class TQRoundTrip(TQStub):
+    """The put fields are readable again, the way the update step reads the teacher's."""
+
+    def kv_batch_put(self, keys, partition_id, fields):
+        super().kv_batch_put(keys, partition_id, fields)
+        self.data.update({k: fields[k] for k in fields.keys()})
+
+
+def _traj_mean_trainer(monkeypatch, ppo_mini_batch_size=4, ppo_epochs=1):
+    """A two-segment failed trajectory, a solved one and a single-segment failed one, built the
+    way the trainer does under loss_agg_mode=traj-mean-token-mean."""
+    short = RESPONSE[: len(TURN0)].clone()
+    rows = [
+        ("u1_0_0", "u1", 0.0, "fb", RESPONSE.clone(), dict(turn_spans=SPANS, segment_index=0, num_segments=2)),
+        ("u1_0_1", "u1", 0.0, "fb", short,
+         dict(turn_spans=[[0, 0, len(TURN0)]], segment_index=1, num_segments=2, segment_prompt=SEGMENT_PROMPT)),
+        ("u2_0_0", "u2", 1.0, None, RESPONSE.clone(), dict(turn_spans=SPANS, segment_index=0, num_segments=1)),
+        ("u3_0_0", "u3", 0.0, "fb3", RESPONSE.clone(), dict(turn_spans=SPANS, segment_index=0, num_segments=1)),
+    ]
+    keys = [r[0] for r in rows]
+    inputs = _inputs([r[5] for r in rows], [r[1] for r in rows], [r[2] for r in rows], [None] * len(rows),
+                     responses=[r[4] for r in rows])
+    rm_scores = []
+    for r in rows:
+        score = torch.zeros(r[4].shape[0], dtype=torch.float32)
+        score[-1] = r[2]
+        rm_scores.append(score)
+    data = {
+        "responses": torch.nested.nested_tensor(inputs.responses, layout=torch.jagged),
+        "response_mask": torch.nested.nested_tensor(inputs.response_mask, layout=torch.jagged),
+        "rm_scores": torch.nested.nested_tensor(rm_scores, layout=torch.jagged),
+        "uid": inputs.uids,
+        "raw_prompt": inputs.raw_prompts,
+        "extra_fields": [dict(ef, reward_extra_info={"feedback": fb}) for _, _, _, fb, _, ef in rows],
+    }
+    stub = TQRoundTrip(data)
+    monkeypatch.setattr(main_ppo_sync, "tq", stub)
+
+    sd = OmegaConf.create(asdict(SelfDistillationConfig(
+        success_reward_threshold=0.5,
+        include_environment_feedback=True,
+        teacher=dict(_target_=REPROMPT_TARGET, dont_reprompt_on_self_success=True),
+    )))
+    tok = ToyTokenizer()
+    trainer = object.__new__(main_ppo_sync.PPOTrainer)
+    trainer.config = OmegaConf.create({
+        "actor_rollout_ref": {
+            "actor": {
+                "policy_loss": {"loss_mode": "sdpo"},
+                "self_distillation": sd,
+                "loss_agg_mode": "traj-mean-token-mean",
+                "ppo_mini_batch_size": ppo_mini_batch_size,
+                "ppo_epochs": ppo_epochs,
+                "calculate_entropy": False,
+                "entropy_coeff": 0.0,
+                "data_loader_seed": 1,
+                "shuffle": True,
+            },
+            "rollout": {"n": 1, "temperature": 1.0},
+        }
+    })
+    trainer.tokenizer = tok
+    trainer.sdpo_teacher = make_teacher(sd, tok, max_prefix_len=4096)
+    sent = []
+    trainer.actor_rollout_wg = SimpleNamespace(update_actor=lambda b: sent.append(b) or {"metrics": {"mfu": 0.0}})
+    batch = SimpleNamespace(keys=keys, partition_id="train", extra_info={})
+    trainer._maybe_build_self_distillation_batch(batch, {})
+    return trainer, stub, batch, sent
+
+
+def test_trainer_traj_mean_shares_and_trajectory_count(monkeypatch):
+    trainer, stub, batch, sent = _traj_mean_trainer(monkeypatch)
+    _, fields = stub.put
+    long_tokens, short_tokens = RESPONSE.shape[0] - 1, len(TURN0) - 1
+    # raw shares: the failed trajectory's two segments split one unit by supervised tokens,
+    # the solved trajectory has none, the single-segment failed one keeps the whole unit
+    assert fields["trace_weight"].squeeze(-1).tolist() == pytest.approx(
+        [long_tokens / (long_tokens + short_tokens), short_tokens / (long_tokens + short_tokens), 0.0, 1.0]
+    )
+    assert fields["traj_id"].squeeze(-1).tolist() == [0, 0, 1, 2]
+
+    trainer._update_actor(batch, {})
+    (update_batch,) = sent
+    assert update_batch.extra_info["global_batch_size"] == 2, "two trajectories carry supervision"
+    assert update_batch.extra_info["mini_batch_size"] == 4
+
+
+def test_trainer_traj_mean_rejects_more_than_one_mini_batch(monkeypatch):
+    trainer, _, batch, sent = _traj_mean_trainer(monkeypatch, ppo_mini_batch_size=2)
+    with pytest.raises(ValueError, match=r"traj-mean-token-mean.*4 rows but ppo_mini_batch_size \* rollout\.n = 2"):
+        trainer._update_actor(batch, {})
+    assert sent == []
+
+    trainer, _, batch, sent = _traj_mean_trainer(monkeypatch, ppo_epochs=2)
+    with pytest.raises(ValueError, match=r"traj-mean-token-mean needs ppo_epochs=1, got 2"):
+        trainer._update_actor(batch, {})
+    assert sent == []
+
+
+def test_trainer_traj_mean_all_unsupervised_count_clamps_to_one(monkeypatch):
+    trainer, stub, batch, sent = _traj_mean_trainer(monkeypatch)
+    stub.data["trace_weight"] = torch.zeros_like(stub.data["trace_weight"])
+    trainer._update_actor(batch, {})
+    (update_batch,) = sent
+    assert update_batch.extra_info["global_batch_size"] == 1
+
+
+def test_trainer_seq_mean_keeps_the_rescaled_weights_and_row_denominator(monkeypatch):
+    trainer, stub, batch, sent = _traj_mean_trainer(monkeypatch)
+    trainer.config.actor_rollout_ref.actor.loss_agg_mode = "seq-mean-token-mean"
+    trainer._maybe_build_self_distillation_batch(batch, {})
+    _, fields = stub.put
+    # three supervised rows over two supervised trajectories: the raw shares scaled by 3/2
+    assert sum(fields["trace_weight"].squeeze(-1).tolist()) == pytest.approx(3.0)
+    trainer._update_actor(batch, {})
+    (update_batch,) = sent
+    assert update_batch.extra_info["global_batch_size"] == 4

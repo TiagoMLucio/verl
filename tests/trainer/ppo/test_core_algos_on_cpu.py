@@ -22,6 +22,7 @@ import torch
 
 import verl.trainer.ppo.core_algos
 from verl.trainer.ppo.core_algos import (
+    agg_loss,
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
@@ -425,7 +426,7 @@ def test_compute_self_distillation_loss_full_logit_alpha_endpoints():
     assert torch.isfinite(loss_fwd)
     assert torch.isfinite(loss_rev)
     assert not torch.allclose(loss_fwd, loss_rev)
-    assert "self_distillation/loss" in metrics_fwd
+    assert "self_distillation/alpha" in metrics_fwd
     assert "self_distillation/kl_type_code" in metrics_rev
 
 
@@ -515,6 +516,45 @@ def test_compute_self_distillation_loss_optional_is_clip():
     assert torch.isfinite(loss_clip)
     assert loss_clip < loss_no_clip
     assert metrics_clip["self_distillation/is_clip"] == 2.0
+
+
+def test_agg_loss_traj_mean_token_mean_is_the_mean_of_trajectory_token_means():
+    """Two trajectories of two segments each plus one unsupervised row, weighted the way the
+    trainer does for this mode: raw shares (a segment's supervised tokens over its trajectory's)
+    and the supervised-trajectory count as the denominator."""
+    torch.manual_seed(0)
+    loss_mat = torch.randn(5, 6)
+    loss_mask = torch.tensor(
+        [
+            [1, 1, 1, 0, 0, 0],  # traj A, segment 0: 3 tokens
+            [1, 0, 0, 0, 0, 0],  # traj A, segment 1: 1 token
+            [1, 1, 0, 0, 0, 0],  # traj B, segment 0: 2 tokens
+            [1, 1, 0, 0, 0, 0],  # traj B, segment 1: 2 tokens
+            [0, 0, 0, 0, 0, 0],  # unsupervised
+        ],
+        dtype=torch.float32,
+    )
+    shares = torch.tensor([3 / 4, 1 / 4, 1 / 2, 1 / 2, 0.0])
+    got = agg_loss(loss_mat, loss_mask, "traj-mean-token-mean", seq_weights=shares, global_batch_size=2)
+
+    traj_a = loss_mat[0:2][loss_mask[0:2].bool()].mean()
+    traj_b = loss_mat[2:4][loss_mask[2:4].bool()].mean()
+    assert torch.allclose(got, (traj_a + traj_b) / 2)
+    # a micro-batch holding one of the trajectories returns that trajectory's share of the mean
+    half = agg_loss(loss_mat[:2], loss_mask[:2], "traj-mean-token-mean", seq_weights=shares[:2], global_batch_size=2)
+    assert torch.allclose(half, traj_a / 2)
+    # the row-count denominator of seq-mean-token-mean is what the new mode replaces
+    rows = agg_loss(loss_mat, loss_mask, "seq-mean-token-mean", seq_weights=shares, global_batch_size=5)
+    assert torch.allclose(rows, (traj_a + traj_b) / 5)
+
+
+def test_agg_loss_traj_mean_token_mean_all_masked_is_finite():
+    loss_mat = torch.randn(3, 4)
+    loss_mask = torch.zeros(3, 4)
+    got = agg_loss(loss_mat, loss_mask, "traj-mean-token-mean", seq_weights=torch.zeros(3))
+    assert got == 0.0 and torch.isfinite(got)
+    got = agg_loss(loss_mat, loss_mask, "traj-mean-token-mean", seq_weights=torch.zeros(3), global_batch_size=1)
+    assert got == 0.0 and torch.isfinite(got)
 
 
 if __name__ == "__main__":

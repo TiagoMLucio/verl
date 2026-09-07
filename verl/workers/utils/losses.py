@@ -350,8 +350,6 @@ def sdpo_ppo_loss(
     )
     metrics.update(Metric.from_dict(summed, aggregation=AggregationType.SUM))
     metrics["actor/pg_loss"] = Metric(value=loss, aggregation=metric_aggregation)
-    # the loss is a per-micro-batch share of the global mean, so the diagnostic adds up like pg_loss
-    metrics["self_distillation/loss"] = Metric(value=loss, aggregation=metric_aggregation)
     policy_loss = loss
 
     entropy = model_output.get("entropy", None)

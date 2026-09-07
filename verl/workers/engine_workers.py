@@ -768,7 +768,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # never read logits, so they keep the engine's configured fused setting
         # (train_batch injects it when the key is absent): forcing it off on vanilla
         # PPO materializes full-vocab logits over the whole sequence with nothing to
-        # bound them -- 43.8k tokens x 248320 x bf16 = the 20.26 GiB OOM of job 3206010.
+        # bound them -- 43.8k tokens x 248320 x bf16 is a 20.26 GiB allocation.
         if self.sdpo_enabled:
             tu.assign_non_tensor(data, use_fused_kernels=False)
         if self._chunked_distill_topk() is not None:
