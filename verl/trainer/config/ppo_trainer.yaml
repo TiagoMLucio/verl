@@ -13,7 +13,8 @@ defaults:
   # actor_rollout_ref.actor: trainer/config/actor/dp_actor.yaml
   - actor@actor_rollout_ref.actor: ${model_engine}_actor
 
-  # SDPO teacher block: trainer/config/sdpo_teacher/reprompt.yaml (the paper's) or turn_hints
+  # SDPO teacher block: trainer/config/sdpo_teacher/reprompt.yaml (the paper's); a project
+  # supplies other teacher blocks for this group through hydra.searchpath
   - sdpo_teacher@actor_rollout_ref.actor.self_distillation.teacher: reprompt
 
   # data: trainer/config/data/legacy_data.yaml

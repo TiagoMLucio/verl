@@ -27,6 +27,7 @@ from verl.trainer.ppo.sdpo.reprompt import (
     segment_prompt_of,
     select_solution_row,
     success_rows_by_uid,
+    supervision_source_metrics,
     tokenize_reprompt_batch,
 )
 from verl.trainer.ppo.sdpo.teacher import SDPOTeacher
@@ -117,12 +118,9 @@ class RepromptTeacher(SDPOTeacher):
         }
         return TeacherBatch(fields=fields)
 
-    def supervision_source_metrics(self, inputs: TeacherInputs, traj_of_row: list) -> dict:
-        from verl.trainer.ppo.sdpo_health_metrics import supervision_source_metrics
-
+    def trajectory_metrics(
+        self, batch: TeacherBatch, inputs: TeacherInputs, supervised_per_row: list[float], weights: list[float]
+    ) -> dict:
         return supervision_source_metrics(
-            inputs.uids, inputs.seq_scores, inputs.feedback, inputs.extra_fields, traj_of_row,
-            self.success_reward_threshold,
-            dont_reprompt_on_self_success=self.dont_reprompt_on_self_success,
-            environment_feedback_only_without_solution=self.environment_feedback_only_without_solution,
+            inputs.uids, inputs.seq_scores, inputs.feedback, inputs.extra_fields, inputs.traj_of_row, self
         )

@@ -35,6 +35,7 @@ __all__ = [
     "segment_prompt_of",
     "select_solution_row",
     "success_rows_by_uid",
+    "supervision_source_metrics",
     "tokenize_reprompt_batch",
 ]
 
@@ -113,6 +114,46 @@ def prompt_feedback_used(
 ) -> bool:
     """Whether this sample's feedback enters the teacher prompt (mirrors the mask)."""
     return feedback is not None and (not environment_feedback_only_without_solution or not has_solution)
+
+
+def supervision_source_metrics(
+    uids: list[Any],
+    seq_scores: list[float],
+    feedback: list[Optional[str]],
+    extra_fields: list[dict],
+    traj_of_row: list,
+    options,
+) -> dict:
+    """How many trajectories had a sibling solution or feedback to learn from, selected the
+    way ``options`` says. Counted on the first-segment rows so a condensed trajectory counts
+    once."""
+    first_seg = [i for i, ef in enumerate(extra_fields) if int(ef.get("segment_index", 0) or 0) == 0]
+    n_traces = len(set(traj_of_row))
+    success_by_uid = success_rows_by_uid(uids, seq_scores, options.success_reward_threshold)
+    has_solution = [
+        select_solution_row(i, success_by_uid, uids, options.dont_reprompt_on_self_success) is not None
+        for i in range(len(uids))
+    ]
+    unique_uids = set(uids)
+    return {
+        "self_distillation/success_group_fraction": (
+            len([uid for uid in unique_uids if len(success_by_uid[uid]) > 0]) / len(unique_uids)
+        ),
+        "self_distillation/success_sample_fraction": sum(1 for i in first_seg if has_solution[i]) / n_traces,
+        "self_distillation/feedback_available_fraction": (
+            sum(1 for i in first_seg if feedback[i] is not None) / n_traces
+        ),
+        "self_distillation/feedback_used_fraction": (
+            sum(
+                1
+                for i in first_seg
+                if prompt_feedback_used(
+                    feedback[i], has_solution[i], options.environment_feedback_only_without_solution
+                )
+            )
+            / n_traces
+        ),
+    }
 
 
 def build_reprompt_messages(ctx: RepromptContext, solution: Optional[str], options) -> list[dict]:

@@ -58,20 +58,6 @@ class SDPOTeacher(ABC):
         and the final row weights; the trainer calls it after weighting the batch it built."""
         return {}
 
-    def supervision_source_metrics(self, inputs: TeacherInputs, traj_of_row: list) -> dict:
-        """How many trajectories had a sibling solution or feedback to learn from. A teacher
-        without a solution path counts them the paper's way (a successful sibling other than
-        the row itself; feedback only where no solution exists) so the two series read the
-        same across teachers; the reprompt teacher counts by its own options."""
-        from verl.trainer.ppo.sdpo_health_metrics import supervision_source_metrics
-
-        return supervision_source_metrics(
-            inputs.uids, inputs.seq_scores, inputs.feedback, inputs.extra_fields, traj_of_row,
-            self.success_reward_threshold,
-            dont_reprompt_on_self_success=True,
-            environment_feedback_only_without_solution=True,
-        )
-
 
 def make_teacher(cfg, tokenizer, max_prefix_len: int, apply_chat_template_kwargs=None) -> SDPOTeacher:
     """Instantiate the teacher ``cfg.teacher`` names by its ``_target_`` (a config file under

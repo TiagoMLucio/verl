@@ -22,11 +22,6 @@ from collections import Counter, defaultdict
 import numpy as np
 
 from verl.trainer.ppo.metric_utils import process_validation_metrics
-from verl.trainer.ppo.sdpo.reprompt import prompt_feedback_used, select_solution_row, success_rows_by_uid
-
-
-def _first_segment_rows(extra_fields: list[dict]) -> list[int]:
-    return [i for i, ef in enumerate(extra_fields) if int(ef.get("segment_index", 0) or 0) == 0]
 
 
 def batch_metrics(
@@ -63,46 +58,6 @@ def batch_metrics(
         "self_distillation/reprompt_sample_fraction": sum(supervised_rows) / batch_size,
         "rollout/generated_tokens": float(generated),
         "rollout/generated_tokens_per_trace": generated / n_traces if n_traces else 0.0,
-    }
-
-
-def supervision_source_metrics(
-    uids: list,
-    seq_scores: list[float],
-    feedback: list,
-    extra_fields: list[dict],
-    traj_of_row: list,
-    success_reward_threshold: float,
-    dont_reprompt_on_self_success: bool = False,
-    environment_feedback_only_without_solution: bool = False,
-) -> dict:
-    """How many trajectories had a sibling solution or feedback to learn from, selected the
-    way the reprompt teacher's options say. Counted on the first-segment rows so a condensed
-    trajectory counts once."""
-    first_seg = _first_segment_rows(extra_fields)
-    n_traces = len(set(traj_of_row))
-    success_by_uid = success_rows_by_uid(uids, seq_scores, success_reward_threshold)
-    has_solution = [
-        select_solution_row(i, success_by_uid, uids, dont_reprompt_on_self_success) is not None
-        for i in range(len(uids))
-    ]
-    unique_uids = set(uids)
-    return {
-        "self_distillation/success_group_fraction": (
-            len([uid for uid in unique_uids if len(success_by_uid[uid]) > 0]) / len(unique_uids)
-        ),
-        "self_distillation/success_sample_fraction": sum(1 for i in first_seg if has_solution[i]) / n_traces,
-        "self_distillation/feedback_available_fraction": (
-            sum(1 for i in first_seg if feedback[i] is not None) / n_traces
-        ),
-        "self_distillation/feedback_used_fraction": (
-            sum(
-                1
-                for i in first_seg
-                if prompt_feedback_used(feedback[i], has_solution[i], environment_feedback_only_without_solution)
-            )
-            / n_traces
-        ),
     }
 
 

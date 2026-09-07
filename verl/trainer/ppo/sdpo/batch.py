@@ -47,39 +47,27 @@ class TeacherInputs:
 @dataclass
 class TeacherBatch:
     """The teacher fields to write back per row (``teacher_input_ids``, ``self_distillation_mask``,
-    ``loss_mask`` and, for spliced rows, ``teacher_seq_meta``), the teacher's own metrics, and
-    ``weight_scale``, the per-row multiplier the teacher wants on the row's share of its
-    trajectory weight (None means 1.0 everywhere)."""
+    ``loss_mask`` and, for spliced rows, ``teacher_seq_meta``) and the teacher's own metrics."""
 
     fields: dict[str, torch.Tensor]
     metrics: dict[str, float] = field(default_factory=dict)
-    weight_scale: Optional[list[float]] = None
 
 
-def trace_weights(
-    supervised_per_row: list[float],
-    traj_of_row: list,
-    weight_scale: Optional[list[float]] = None,
-) -> list[float]:
+def trace_weights(supervised_per_row: list[float], traj_of_row: list) -> list[float]:
     """Per-row weight for the seq-mean loss, shared by every teacher: a trajectory counts once
     in total, its segments split that weight by how much supervision each carries (an even
     split would over-weight a segment holding one short supervised span).
 
-    ``weight_scale`` lets a teacher up- or down-weight rows relative to each other. It belongs
-    here rather than on the token mask because the per-row loss is a token-mean, in which a
-    uniform within-row scale cancels. Weights are renormalised to the supervised-row count,
-    so a scale re-allocates influence between rows without changing the update's overall
-    scale; raw shares would sum to the number of supervised trajectories and shrink the
-    update by the average segments-per-trajectory (~0.6x at our condensation rate).
+    Weights are renormalised to the supervised-row count: raw shares would sum to the number
+    of supervised trajectories and shrink the update by the average segments-per-trajectory
+    (~0.6x at our condensation rate).
     """
     traj_supervised: dict = defaultdict(float)
     for traj, n_supervised in zip(traj_of_row, supervised_per_row, strict=True):
         traj_supervised[traj] += n_supervised
-    if weight_scale is None:
-        weight_scale = [1.0] * len(supervised_per_row)
     weights = [
-        (n / traj_supervised[traj] if traj_supervised[traj] > 0 else 0.0) * mult
-        for traj, n, mult in zip(traj_of_row, supervised_per_row, weight_scale, strict=True)
+        n / traj_supervised[traj] if traj_supervised[traj] > 0 else 0.0
+        for traj, n in zip(traj_of_row, supervised_per_row, strict=True)
     ]
     n_supervised_rows = sum(1 for n in supervised_per_row if n > 0)
     total = sum(weights)

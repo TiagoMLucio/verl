@@ -1369,7 +1369,7 @@ class PPOTrainer:
         fields = dict(teacher.fields)
 
         supervised_per_row = [float(mask.sum()) for mask in fields["loss_mask"].unbind()]
-        weights = trace_weights(supervised_per_row, traj_of_row, teacher.weight_scale)
+        weights = trace_weights(supervised_per_row, traj_of_row)
         fields["trace_weight"] = torch.tensor(weights, dtype=torch.float32).unsqueeze(-1)
         # Row -> trajectory, as a plain int the update path can carry: mini-batches are cut
         # from shuffled rows, so a condensed trajectory's supervised segments land in
@@ -1381,7 +1381,6 @@ class PPOTrainer:
         metrics.update(
             health.batch_metrics(supervised_per_row, supervised_rows, inputs.response_mask, traj_of_row, extra_fields)
         )
-        metrics.update(self.sdpo_teacher.supervision_source_metrics(inputs, traj_of_row))
         metrics.update(teacher.metrics)
         metrics.update(health.condensation_metrics(extra_fields, seq_scores, cfg.success_reward_threshold))
         metrics.update(health.trajectory_timing_metrics(extra_fields))

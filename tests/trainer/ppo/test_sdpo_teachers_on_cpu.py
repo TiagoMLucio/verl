@@ -147,7 +147,7 @@ def test_reprompt_teacher_messages_masks_and_lazy_decode():
     assert tok.decode_calls == 1, "only the response used as a solution is decoded"
     assert (tok.padding_side, tok.truncation_side) == ("right", "right"), "tokenizer sides are restored"
     assert set(out.fields) == {"teacher_input_ids", "self_distillation_mask", "loss_mask"}
-    assert out.weight_scale is None and out.metrics == {}
+    assert out.metrics == {}
 
     solution = teacher.solution_template.format(successful_previous_attempt="sol")
     feedback0 = teacher.feedback_template.format(feedback_raw="fb0")
@@ -231,22 +231,15 @@ def _compose_teacher_block(overrides):
     return OmegaConf.to_container(cfg.actor_rollout_ref.actor.self_distillation, resolve=True)
 
 
-def test_sdpo_config_composes_each_teacher_with_only_its_own_keys():
+def test_sdpo_config_composes_the_reprompt_teacher_with_only_its_own_keys():
     """``--config-name sdpo`` merges its own body after the ``sdpo_teacher`` group, so a
     teacher-specific key there would land on whichever teacher is selected."""
     reprompt = yaml.safe_load((CONFIG_DIR / "sdpo_teacher" / "reprompt.yaml").read_text())
-    turn_hints = yaml.safe_load((CONFIG_DIR / "sdpo_teacher" / "turn_hints.yaml").read_text())
 
     sd = _compose_teacher_block([])
     assert sd["teacher"] == reprompt and sd["teacher"]["max_reprompt_len"] == 10240
     teacher = make_teacher(OmegaConf.create(sd), ToyTokenizer(), max_prefix_len=4096)
     assert isinstance(teacher, RepromptTeacher) and teacher.max_reprompt_len == 10240
-
-    sd = _compose_teacher_block([
-        "sdpo_teacher@actor_rollout_ref.actor.self_distillation.teacher=turn_hints",
-        "+actor_rollout_ref.actor.self_distillation.teacher.chat_template_kwargs.enable_thinking=False",
-    ])
-    assert sd["teacher"] == dict(turn_hints, chat_template_kwargs={"enable_thinking": False})
 
 
 class TQStub:
