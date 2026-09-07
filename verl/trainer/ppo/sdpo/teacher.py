@@ -30,12 +30,10 @@ class SDPOTeacher(ABC):
     the dataset's ``apply_chat_template_kwargs`` and ``success_reward_threshold``; a teacher's
     own options are keyword-only parameters of its subclass, so an unknown yaml key fails at
     construction with a TypeError naming it. The trainer reads ``needs_prompts`` (whether
-    :class:`TeacherInputs` must carry the student's prompt tokens) and ``call_loss_weight``
-    (the weight of rows supervised by a call-placed hint, 1.0 for a teacher without hints).
+    :class:`TeacherInputs` must carry the student's prompt tokens).
     """
 
     needs_prompts = False
-    call_loss_weight = 1.0
 
     def __init__(
         self,
@@ -52,6 +50,13 @@ class SDPOTeacher(ABC):
     @abstractmethod
     def build(self, inputs: TeacherInputs) -> TeacherBatch:
         """The teacher fields and metrics for one batch."""
+
+    def trajectory_metrics(
+        self, batch: TeacherBatch, inputs: TeacherInputs, supervised_per_row: list[float], weights: list[float]
+    ) -> dict:
+        """The teacher's own metrics that need the trajectory grouping (``inputs.traj_of_row``)
+        and the final row weights; the trainer calls it after weighting the batch it built."""
+        return {}
 
     def supervision_source_metrics(self, inputs: TeacherInputs, traj_of_row: list) -> dict:
         """How many trajectories had a sibling solution or feedback to learn from. A teacher

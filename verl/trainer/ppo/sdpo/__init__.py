@@ -21,8 +21,8 @@ the paper path (:class:`RepromptTeacher`). ``self_distillation.teacher`` names t
 :class:`SDPOTeacher`.
 """
 
-from verl.trainer.ppo.sdpo.batch import HintedTurn, TeacherBatch, TeacherInputs
+from verl.trainer.ppo.sdpo.batch import TeacherBatch, TeacherInputs
 from verl.trainer.ppo.sdpo.reprompt_teacher import RepromptTeacher
 from verl.trainer.ppo.sdpo.teacher import SDPOTeacher, make_teacher
 
-__all__ = ["HintedTurn", "RepromptTeacher", "SDPOTeacher", "TeacherBatch", "TeacherInputs", "make_teacher"]
+__all__ = ["RepromptTeacher", "SDPOTeacher", "TeacherBatch", "TeacherInputs", "make_teacher"]

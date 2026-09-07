@@ -805,7 +805,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         turn_meta = tu.get(data, "teacher_seq_meta", default=None)
         sub_spans = None
         if teacher_input_ids.is_nested and turn_meta is not None:
-            # turn_hints teacher: score each spliced sub-row's body, then scatter the span outputs
+            # spliced teacher rows: score each sub-row's body, then scatter the span outputs
             # back to the response grid.
             batch_size = data["responses"].size(0)
             full_response_length = max(r.shape[0] for r in data["responses"].unbind())
@@ -894,7 +894,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         }
         tu.assign_non_tensor(teacher_td, **default_keys)
 
-        # Span-only lm_head: only hinted-span positions are ever consumed from spliced teacher rows.
+        # Span-only lm_head: only the supervised-span positions are ever consumed from spliced teacher rows.
         if sub_spans is not None:
             teacher_td["logits_keep_positions"] = turn_keep_positions(sub_seqs, sub_resps, sub_spans)
 

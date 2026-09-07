@@ -1232,11 +1232,11 @@ def _distillation_signal_metrics(
     teacher_topk_log_probs: Optional[torch.Tensor] = None,
     inert_threshold: float = 0.01,
 ) -> dict[str, float]:
-    """How much signal the hints carry, as summable numerator/denominator pairs.
+    """How much signal the teacher carries, as summable numerator/denominator pairs.
 
-    Sums with a stable key set: a mean would be diluted by the un-hinted micro-batches (the
-    majority under the turn_hints teacher) and a conditional key set breaks dp aggregation. Ratios are taken
-    once, after summing over micro-batches and ranks.
+    Sums with a stable key set: a mean would be diluted by the micro-batches without supervised
+    spans (the majority under a spliced-row teacher) and a conditional key set breaks dp
+    aggregation. Ratios are taken once, after summing over micro-batches and ranks.
     """
     out = dict.fromkeys(
         (

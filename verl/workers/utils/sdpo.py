@@ -94,8 +94,8 @@ def explode_turn_teacher_rows(
 
     ``teacher_seq_meta`` is flat per sample (see :mod:`verl.trainer.ppo.sdpo.teacher_meta`).
     Each sub-row's body is its verbatim tail, so the padded reconstruction contract holds.
-    One sub-row per hinted turn, each carrying only its own hint, so the teacher never scores
-    a turn from a state where its earlier advice was visibly ignored. Un-hinted rows ship a
+    One sub-row per supervised span, each carrying only its own prefix, so the teacher scores
+    every span from the context built for it. Rows without supervised spans ship a
     degenerate 2-token sub-row: the teacher forward must run on every rank every micro-batch
     so its dp-group collectives stay in lockstep. Returns nested sequences / bodies / all-ones
     body presence masks (``mask_dtype``) plus one :class:`SubRowSpan` per sub-row.
@@ -137,7 +137,7 @@ def explode_turn_teacher_rows(
 def _keep_positions(prefix_lens: torch.Tensor, spans_per_row: list[list[tuple[int, int]]]) -> torch.Tensor:
     """Row-relative logits positions for (offset, length) spans past each row's prefix,
     shifted -1 because position k predicts token k+1 (matches no_padding_2_padding).
-    Span-less rows keep one dummy position so an all-unhinted micro-batch still yields
+    Span-less rows keep one dummy position so a micro-batch without supervised spans still yields
     a graph-connected (zero-contribution) loss."""
     rows = []
     for prefix_len, row_spans in zip(prefix_lens.tolist(), spans_per_row, strict=True):
@@ -153,7 +153,7 @@ def _keep_positions(prefix_lens: torch.Tensor, spans_per_row: list[list[tuple[in
 
 
 def turn_keep_positions(sub_seqs: torch.Tensor, sub_resps: torch.Tensor, sub_spans: list[SubRowSpan]) -> torch.Tensor:
-    """Logits positions scoring the hinted spans on the spliced teacher rows."""
+    """Logits positions scoring the supervised spans on the spliced teacher rows."""
     prefix_lens = sub_seqs.offsets().diff() - sub_resps.offsets().diff()
     spans = [[(body.start, body.stop - body.start)] for _, _, body, _ in body_slices(sub_spans)]
     return _keep_positions(prefix_lens, spans)
@@ -162,9 +162,9 @@ def turn_keep_positions(sub_seqs: torch.Tensor, sub_resps: torch.Tensor, sub_spa
 def response_keep_positions(
     input_ids: torch.Tensor, responses: torch.Tensor, teacher_seq_meta: torch.Tensor
 ) -> torch.Tensor:
-    """Logits positions scoring the hinted spans on the student's own prompt+response rows."""
+    """Logits positions scoring the supervised spans on the student's own prompt+response rows."""
     prefix_lens = input_ids.offsets().diff() - responses.offsets().diff()
-    # the student scores every hinted span in one pass, so it keeps their union
+    # the student scores every supervised span in one pass, so it keeps their union
     spans = [
         [(sub_row.start, sub_row.end - sub_row.start) for sub_row in unpack(meta.tolist())]
         for meta in teacher_seq_meta.unbind()

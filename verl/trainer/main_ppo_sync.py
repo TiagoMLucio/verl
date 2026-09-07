@@ -1353,6 +1353,7 @@ class PPOTrainer:
             feedback = collect_feedback(
                 [ef.get("reward_extra_info", {}).get("feedback") for ef in extra_fields], batch_size
             )
+        traj_of_row = [_session_key(key) for key in batch.keys]
         inputs = TeacherInputs(
             prompts=list(data["prompts"].unbind()) if self.sdpo_teacher.needs_prompts else None,
             responses=list(data["responses"].unbind()),
@@ -1362,16 +1363,13 @@ class PPOTrainer:
             seq_scores=seq_scores,
             feedback=feedback,
             extra_fields=extra_fields,
+            traj_of_row=traj_of_row,
         )
         teacher = self.sdpo_teacher.build(inputs)
         fields = dict(teacher.fields)
 
-        # call-hinted rows carry ~10x the per-token divergence of turn-hinted ones
         supervised_per_row = [float(mask.sum()) for mask in fields["loss_mask"].unbind()]
-        traj_of_row = [_session_key(key) for key in batch.keys]
-        hinted_per_row = teacher.hinted_per_row or [[] for _ in batch.keys]
-        call_row = [any(hint.is_call for hint in hinted) for hinted in hinted_per_row]
-        weights = trace_weights(supervised_per_row, traj_of_row, call_row, self.sdpo_teacher.call_loss_weight)
+        weights = trace_weights(supervised_per_row, traj_of_row, teacher.weight_scale)
         fields["trace_weight"] = torch.tensor(weights, dtype=torch.float32).unsqueeze(-1)
         # Row -> trajectory, as a plain int the update path can carry: mini-batches are cut
         # from shuffled rows, so a condensed trajectory's supervised segments land in
@@ -1387,12 +1385,7 @@ class PPOTrainer:
         metrics.update(teacher.metrics)
         metrics.update(health.condensation_metrics(extra_fields, seq_scores, cfg.success_reward_threshold))
         metrics.update(health.trajectory_timing_metrics(extra_fields))
-        if teacher.hinted_per_row is not None:
-            metrics.update(
-                health.hint_metrics(
-                    teacher.hinted_per_row, extra_fields, traj_of_row, supervised_per_row, weights, call_row
-                )
-            )
+        metrics.update(self.sdpo_teacher.trajectory_metrics(teacher, inputs, supervised_per_row, weights))
 
         tq.kv_batch_put(
             keys=batch.keys,

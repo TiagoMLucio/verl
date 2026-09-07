@@ -111,6 +111,7 @@ def _inputs(extra_fields, uids, seq_scores, feedback, responses=None):
         seq_scores=list(seq_scores),
         feedback=list(feedback),
         extra_fields=extra_fields,
+        traj_of_row=[f"{uid}_{i}" for i, uid in enumerate(uids)],
     )
 
 
@@ -133,7 +134,7 @@ def test_reprompt_teacher_messages_masks_and_lazy_decode():
     )
     teacher = make_teacher(cfg, tok, max_prefix_len=4096, apply_chat_template_kwargs={})
     assert isinstance(teacher, RepromptTeacher) and not teacher.needs_prompts
-    assert teacher.call_loss_weight == 1.0 and teacher.success_reward_threshold == cfg.success_reward_threshold
+    assert teacher.success_reward_threshold == cfg.success_reward_threshold
     assert (teacher.max_reprompt_len, teacher.reprompt_truncation) == (512, "left")
     # uid a: row 0 failed with feedback, row 1 solved (its solution serves row 0, not itself);
     # uid b: row 2 failed without feedback, row 3 a condensation segment with feedback
@@ -146,7 +147,7 @@ def test_reprompt_teacher_messages_masks_and_lazy_decode():
     assert tok.decode_calls == 1, "only the response used as a solution is decoded"
     assert (tok.padding_side, tok.truncation_side) == ("right", "right"), "tokenizer sides are restored"
     assert set(out.fields) == {"teacher_input_ids", "self_distillation_mask", "loss_mask"}
-    assert out.hinted_per_row is None and out.metrics == {}
+    assert out.weight_scale is None and out.metrics == {}
 
     solution = teacher.solution_template.format(successful_previous_attempt="sol")
     feedback0 = teacher.feedback_template.format(feedback_raw="fb0")
