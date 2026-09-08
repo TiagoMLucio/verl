@@ -65,6 +65,7 @@ from verl.workers.utils.sdpo import (
     has_non_empty_multi_modal_inputs,
     reconstruct_padded_teacher_from_nested,
     scatter_turn_teacher_outputs,
+    truncate_rows_after_last_supervised_token,
     turn_keep_positions,
 )
 
@@ -761,7 +762,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         from verl.utils.debug_breakpoints import should_break
         if should_break("update_actor"): breakpoint()
 
+        kept_token_fraction = None
         if self.sdpo_enabled:
+            # the update pass only: compute_log_prob writes old_log_probs and entropy back on the
+            # full response grid, which the reward, the advantage and the IS metrics index
+            kept_token_fraction = truncate_rows_after_last_supervised_token(data)
             attach_response_keep_positions(data)
         # SDPO reads top-k and a logsumexp off the real logits, which the fused kernel
         # never materializes; span-only keeps this pass cheap anyway. Other loss modes
@@ -775,6 +780,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             tu.assign_non_tensor(data, chunked_distill_topk=self._chunked_distill_topk())
 
         output = self.actor.train_mini_batch(data=data)
+        if kept_token_fraction is not None:
+            metrics = tu.get_non_tensor_data(output, "metrics", default={})
+            metrics["self_distillation/kept_token_fraction"] = kept_token_fraction
         if self.sdpo_enabled and tu.get_non_tensor_data(output, "did_update", default=True):
             self._update_teacher_ema()
         return output.cpu() if output is not None else None

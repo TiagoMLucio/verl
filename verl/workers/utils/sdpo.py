@@ -197,6 +197,67 @@ def attach_response_keep_positions(data) -> None:
         data["logits_keep_positions"] = response_keep_positions(data["input_ids"], data["responses"], turn_meta)
 
 
+# Fields off the response grid that a student-row cut must leave whole: the prompt, the spliced
+# teacher rows (every sub-row already ends at its own scored span) and the per-row supervised-token
+# count the trajectory mean divides by.
+_TRUNCATION_EXEMPT = frozenset({"prompts", "teacher_input_ids", "teacher_seq_meta", "trace_weight"})
+
+
+def truncate_rows_after_last_supervised_token(data) -> float:
+    """Cut every student row after its last supervised token; returns the kept token fraction.
+
+    Attention is causal and only the hinted spans carry loss, so a position past a row's last
+    supervised token reaches no position that does: the logits, the loss and the gradient at every
+    scored position are what the whole row would have given. Rows with no supervised token, and
+    rows already ending on one, come out untouched.
+    """
+    mask, meta = data.get("self_distillation_mask", None), data.get("teacher_seq_meta", None)
+    if mask is None or meta is None or not mask.is_nested or not meta.is_nested:
+        return 1.0
+
+    resp_lens = data["responses"].offsets().diff().tolist()
+    seq_lens = data["input_ids"].offsets().diff().tolist()
+    keep_lens = []
+    for i, (row, resp_len, meta_row) in enumerate(zip(mask.unbind(), resp_lens, meta.unbind(), strict=True)):
+        supervised = torch.nonzero(row).flatten()
+        if supervised.numel() == 0:
+            keep_lens.append(resp_len)
+            continue
+        keep = int(supervised[-1]) + 1
+        span_end = max(sub_row.end for sub_row in unpack(meta_row.tolist(), sample=i))
+        # scatter_turn_teacher_outputs writes each sub-row onto [start, end) of the kept grid
+        assert span_end == keep, (
+            f"row {i}: the supervised mask ends at {keep} but the teacher spans end at {span_end}; "
+            "truncating here would drop scored positions"
+        )
+        keep_lens.append(min(keep, resp_len))
+
+    if keep_lens == resp_lens:
+        return 1.0
+    prefix_lens = [seq_len - resp_len for seq_len, resp_len in zip(seq_lens, resp_lens, strict=True)]
+    seq_keep_lens = [prefix + keep for prefix, keep in zip(prefix_lens, keep_lens, strict=True)]
+
+    for key in list(data.keys()):
+        if key in _TRUNCATION_EXEMPT:
+            continue
+        value = data.get(key)
+        if not torch.is_tensor(value) or not value.is_nested:
+            continue
+        lens = value.offsets().diff().tolist()
+        if lens == resp_lens:
+            new_lens = keep_lens
+        elif lens == seq_lens:
+            new_lens = seq_keep_lens
+        else:
+            continue
+        if value.dim() > 2:
+            raise RuntimeError(f"SDPO row truncation does not support the {value.dim()}d field {key!r}")
+        data[key] = torch.nested.nested_tensor(
+            [row[:n] for row, n in zip(value.unbind(), new_lens, strict=True)], layout=torch.jagged
+        )
+    return sum(keep_lens) / max(sum(resp_lens), 1)
+
+
 def scatter_turn_teacher_outputs(
     sub_outputs: torch.Tensor,
     sub_spans: list[SubRowSpan],
