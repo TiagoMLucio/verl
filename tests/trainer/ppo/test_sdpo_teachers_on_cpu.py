@@ -404,6 +404,7 @@ def test_trainer_reprompt_batch_fields_and_metrics(monkeypatch):
         "self_distillation/feedback_used_fraction": 1 / 4,
         "rollout/condensed_trace_fraction": 0.0,
         "rollout/segments_per_trace": 1.0,
+        "rollout/harness_abort_fraction": 0.0,
         "rollout/solve_rate_1seg": 1 / 4,
         "rollout/trace_fraction_1seg": 1.0,
         "rollout/exit_finished_fraction": 2 / 4,

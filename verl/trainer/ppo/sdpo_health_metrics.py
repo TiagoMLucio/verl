@@ -27,6 +27,13 @@ from verl.trainer.ppo.metric_utils import process_validation_metrics
 #: step. What they measure is the loop's business, so a new one costs no change here.
 AGENT_METRIC_PREFIX = "agent/"
 
+#: Exits the agent did not choose. Reported as one always-emitted fraction: the per-reason keys
+#: below only exist once that reason has fired, so a healthy run has nothing to chart or alert
+#: on. ``unknown_error`` stays out of it, being what the loop could not classify at all.
+HARNESS_ABORT_REASONS = frozenset(
+    {"setup_timeout", "agent_loop_failed", "terminal_dead", "timeout_budget_exhausted"}
+)
+
 
 def batch_metrics(
     supervised_per_row: list[float],
@@ -87,6 +94,7 @@ def condensation_metrics(extra_fields: list[dict], seq_scores: list[float], succ
     out = {
         "rollout/condensed_trace_fraction": sum(1 for s, _, _ in traces if s > 1) / n,
         "rollout/segments_per_trace": sum(s for s, _, _ in traces) / n,
+        "rollout/harness_abort_fraction": sum(1 for _, _, r in traces if r in HARNESS_ABORT_REASONS) / n,
     }
     for bucket in (1, 2, 3):
         sel = [sc for s, sc, _ in traces if (s == bucket if bucket < 3 else s >= 3)]
@@ -150,7 +158,9 @@ def trajectory_timing_metrics(extra_fields: list[dict]) -> dict:
     for key in parts + ("loop_wall", "env_setup", "reward_eval", "reflect"):
         out[f"traj_time/slowest_{key}"] = float(slowest.get(key, 0.0))
     out["traj_time/unattributed_share"] = sum(residual) / max(sum(totals), 1e-6)
-    for key in ("eval_completed", "patch_apply_failed", "empty_patch", "reflect_failed", "reflect_empty"):
+    for key in (
+        "eval_completed", "patch_apply_failed", "empty_patch", "work_lost", "reflect_failed", "reflect_empty"
+    ):
         vals = [float(t[key]) for t in rows if key in t]  # absent means never measured, not OK
         if vals:
             out[f"reward_health/{key}_fraction"] = sum(vals) / len(vals)
