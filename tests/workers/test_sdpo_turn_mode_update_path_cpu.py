@@ -36,7 +36,7 @@ from verl.utils import tensordict_utils as tu
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
 from verl.workers.engine_workers import ActorRolloutRefWorker
 from verl.workers.utils.losses import sdpo_ppo_loss
-from verl.workers.utils.sdpo import attach_response_keep_positions
+from verl.workers.utils.sdpo import attach_response_keep_positions, truncate_rows_after_last_supervised_token
 
 VOCAB, HIDDEN, TOPK = 64, 8, 5
 
@@ -118,20 +118,21 @@ def make_engine(module):
     return eng
 
 
-def make_batch(include_hinted=True, include_unhinted=True, loss_agg_mode="token-mean"):
+def make_batch(include_hinted=True, include_unhinted=True, loss_agg_mode="token-mean", hinted_span=(2, 7)):
     """Build the turn-mode mini-batch exactly as _maybe_build_self_distillation_batch ships it."""
     rows = []
     if include_hinted:
         # hinted sample: prompt 4, response 12, one hinted turn covering response [2, 7); its
         # teacher row is the prompt, the history, the hint and the scored span
+        start, end = hinted_span
         prompt = torch.arange(4, dtype=torch.long) + 1
         resp = torch.arange(12, dtype=torch.long) + 5
         hint_ids = torch.tensor([50, 51, 52], dtype=torch.long)
-        body = torch.cat([resp[:2], hint_ids, resp[2:7]])
+        body = torch.cat([resp[:start], hint_ids, resp[start:end]])
         seq = torch.cat([prompt, body])
-        meta = pack([SubRow(seq.shape[0], body.shape[0], 2 + hint_ids.shape[0], 2, 7)])
+        meta = pack([SubRow(seq.shape[0], body.shape[0], start + hint_ids.shape[0], start, end)])
         sd_mask = torch.zeros(12)
-        sd_mask[2:7] = 1.0
+        sd_mask[start:end] = 1.0
         rows.append(dict(prompt=prompt, resp=resp, teacher_seq=seq, meta=torch.tensor(meta), sd_mask=sd_mask))
     if include_unhinted:
         # un-hinted: degenerate 1-token teacher row, zero mask (trainer's else-branch)
@@ -322,3 +323,91 @@ def test_all_unhinted_micro_still_runs_teacher(single_process_group, cpu_ops):
     assert teacher_lp[0, 0].abs() > 0, "teacher must score the degenerate token (lockstep)"
     assert teacher_lp[0, 1:].abs().sum() == 0
     assert result["teacher_topk_log_probs"].shape == (1, 9, TOPK)
+
+
+def _grads(engine):
+    return [p.grad for p in engine.module.parameters()]
+
+
+def _lens(data, key):
+    return data[key].offsets().diff().tolist()
+
+
+def test_truncation_after_the_last_supervised_token_changes_nothing(single_process_group, cpu_ops):
+    """The differential the cut has to pass: identical loss, identical gradients, identical
+    trace weight, on a batch whose hinted row carries five unsupervised tokens of tail."""
+    torch.manual_seed(0)
+    whole = make_batch(loss_agg_mode="traj-mean-token-mean")
+    torch.manual_seed(0)
+    cut = make_batch(loss_agg_mode="traj-mean-token-mean")
+
+    kept_fraction = truncate_rows_after_last_supervised_token(cut)
+
+    # hinted row: response 12 -> 7 (span ends at 7), prompt 4 so the sequence goes 16 -> 11;
+    # un-hinted row: untouched. 21 response tokens in, 16 out.
+    assert _lens(whole, "responses") == [12, 9] and _lens(cut, "responses") == [7, 9]
+    assert _lens(whole, "input_ids") == [16, 12] and _lens(cut, "input_ids") == [11, 12]
+    assert kept_fraction == pytest.approx(16 / 21)
+
+    whole_engine, whole_out = run_update(whole, loss_agg_mode="traj-mean-token-mean")
+    cut_engine, cut_out = run_update(cut, loss_agg_mode="traj-mean-token-mean")
+
+    assert _pg_loss(cut_out) == pytest.approx(_pg_loss(whole_out))
+    for g_cut, g_whole in zip(_grads(cut_engine), _grads(whole_engine), strict=True):
+        assert torch.allclose(g_cut, g_whole)
+    assert sum(g.abs().sum() for g in _grads(cut_engine)) > 0
+
+
+def test_truncation_leaves_the_teacher_rows_and_trace_weight_alone(single_process_group, cpu_ops):
+    """Cutting the tail cannot move an earlier offset, so the spliced teacher geometry and the
+    per-row supervised-token count the trajectory mean divides by must come through untouched."""
+    torch.manual_seed(0)
+    whole = make_batch(loss_agg_mode="traj-mean-token-mean")
+    torch.manual_seed(0)
+    cut = make_batch(loss_agg_mode="traj-mean-token-mean")
+    truncate_rows_after_last_supervised_token(cut)
+
+    for key in ("teacher_input_ids", "teacher_seq_meta", "trace_weight", "prompts"):
+        assert _lens(cut, key) == _lens(whole, key)
+        for row_cut, row_whole in zip(cut[key].unbind(), whole[key].unbind(), strict=True):
+            assert torch.equal(row_cut, row_whole)
+    # every supervised position survives the cut
+    cut_masks, whole_masks = cut["self_distillation_mask"].unbind(), whole["self_distillation_mask"].unbind()
+    for row_cut, row_whole in zip(cut_masks, whole_masks, strict=True):
+        assert row_cut.sum() == row_whole.sum()
+
+
+def test_a_row_ending_on_its_last_supervised_token_is_untouched(single_process_group, cpu_ops):
+    data = make_batch(include_unhinted=False, hinted_span=(2, 12))
+    before = _lens(data, "responses")
+    assert truncate_rows_after_last_supervised_token(data) == 1.0
+    assert _lens(data, "responses") == before
+
+
+def test_a_row_with_no_supervised_token_is_untouched(single_process_group, cpu_ops):
+    data = make_batch(include_hinted=False)
+    before_resp, before_seq = _lens(data, "responses"), _lens(data, "input_ids")
+    assert truncate_rows_after_last_supervised_token(data) == 1.0
+    assert _lens(data, "responses") == before_resp and _lens(data, "input_ids") == before_seq
+
+    torch.manual_seed(0)
+    reference = make_batch(include_hinted=False)
+    cut_engine, _ = run_update(data)
+    ref_engine, _ = run_update(reference)
+    for g_cut, g_ref in zip(_grads(cut_engine), _grads(ref_engine), strict=True):
+        assert torch.equal(g_cut, g_ref)
+
+
+def test_a_causal_forward_does_not_see_the_tail_it_is_cut_from():
+    """Why the cut is exact rather than an approximation, on the attention itself: under a causal
+    mask, dropping a suffix leaves every earlier position's output bit-identical, so the student's
+    log-probs on the supervised spans are what the whole row would have produced."""
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(1, 2, 16, 8, dtype=torch.float64) for _ in range(3))
+    keep = 9
+
+    whole = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+    cut = torch.nn.functional.scaled_dot_product_attention(
+        q[:, :, :keep], k[:, :, :keep], v[:, :, :keep], is_causal=True
+    )
+    assert torch.equal(cut, whole[:, :, :keep])
