@@ -23,6 +23,10 @@ import numpy as np
 
 from verl.trainer.ppo.metric_utils import process_validation_metrics
 
+#: The agent loop namespaces under this prefix the per-trajectory metrics it wants reported per
+#: step. What they measure is the loop's business, so a new one costs no change here.
+AGENT_METRIC_PREFIX = "agent/"
+
 
 def batch_metrics(
     supervised_per_row: list[float],
@@ -150,6 +154,12 @@ def trajectory_timing_metrics(extra_fields: list[dict]) -> dict:
         vals = [float(t[key]) for t in rows if key in t]  # absent means never measured, not OK
         if vals:
             out[f"reward_health/{key}_fraction"] = sum(vals) / len(vals)
+    # both readings, since which one a forwarded metric wants is knowledge this side does not have
+    for key in sorted({k for t in rows for k in t if k.startswith(AGENT_METRIC_PREFIX)}):
+        vals = [float(t[key]) for t in rows if key in t]
+        name = key[len(AGENT_METRIC_PREFIX):]
+        out[f"agent_loop/{name}_mean"] = sum(vals) / len(vals)
+        out[f"agent_loop/{name}_max"] = max(vals)
     capped = [float(t.get("capped_turns", 0.0)) for t in rows]
     out["reward_health/capped_turns_mean"] = sum(capped) / len(capped)
     out["reward_health/capped_rollouts_fraction"] = sum(1.0 for c in capped if c > 0) / len(capped)

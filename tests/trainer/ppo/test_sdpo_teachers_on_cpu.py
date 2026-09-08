@@ -30,6 +30,7 @@ from tensordict import TensorDict
 
 import verl
 from verl.trainer import main_ppo_sync
+from verl.trainer.ppo import sdpo_health_metrics as health
 from verl.trainer.ppo.sdpo import RepromptTeacher, SDPOTeacher, TeacherInputs, make_teacher
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config.actor import SelfDistillationConfig
@@ -300,6 +301,8 @@ TIMINGS = dict(
     loop_wall=10.0, generate_sequences=4.0, tool_calls=2.0, env_setup=1.0, reward_eval=0.5, reflect=0.25,
     num_preempted=1, eval_completed=1, capped_turns=0,
 )
+#: the agent loop reports this one by prefix alone, so the trainer names no metric of its own
+TIMINGS[f"{health.AGENT_METRIC_PREFIX}reflect_calls"] = 2.0
 
 
 def test_trainer_reprompt_batch_fields_and_metrics(monkeypatch):
@@ -427,8 +430,23 @@ def test_trainer_reprompt_batch_fields_and_metrics(monkeypatch):
         "reward_health/eval_completed_fraction": 1.0,
         "reward_health/capped_turns_mean": 0.0,
         "reward_health/capped_rollouts_fraction": 0.0,
+        "agent_loop/reflect_calls_mean": 2.0,
+        "agent_loop/reflect_calls_max": 2.0,
     })
     assert metrics == pytest.approx(expected)
+
+
+def test_an_agent_loop_metric_is_forwarded_by_its_prefix_alone():
+    """Any prefixed key reaches the step metrics under both readings, and nothing else does."""
+    rows = [
+        {"timings": {"loop_wall": 1.0, f"{health.AGENT_METRIC_PREFIX}anything": 4.0, "unprefixed": 9.0},
+         "segment_index": 0},
+        {"timings": {"loop_wall": 1.0, f"{health.AGENT_METRIC_PREFIX}anything": 2.0}, "segment_index": 0},
+    ]
+    out = health.trajectory_timing_metrics(rows)
+    assert out["agent_loop/anything_mean"] == 3.0
+    assert out["agent_loop/anything_max"] == 4.0
+    assert not [k for k in out if "unprefixed" in k], "only the prefix is forwarded"
 
 
 class TQRoundTrip(TQStub):
