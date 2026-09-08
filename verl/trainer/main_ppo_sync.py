@@ -77,7 +77,6 @@ from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
-    compute_variance_proxy_metrics,
 )
 from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
 from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_advantage, compute_spec_decode_metrics
@@ -1783,8 +1782,6 @@ class PPOTrainer:
         gen_s = timing_raw.get("gen")
         if gen_tokens and gen_s:
             metrics["perf/gen_tokens_per_s"] = gen_tokens / gen_s / max(n_gpus, 1)
-        gradient_norm = metrics.get("actor/grad_norm", None)
-        metrics.update(compute_variance_proxy_metrics(batch=metrics_batch, gradient_norm=gradient_norm))
 
         # 3. other auxiliary metrics
         if non_padding_mask.any():
