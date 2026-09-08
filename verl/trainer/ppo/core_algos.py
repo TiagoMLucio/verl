@@ -1293,6 +1293,52 @@ def _distillation_signal_metrics(
     return out
 
 
+# per-span records, not a scalar: carried through the metrics dict and popped before reduction
+SDPO_SPAN_ROWS_KEY = "self_distillation/span_rows"
+
+
+@torch.no_grad()
+def _distillation_span_rows(
+    per_token_loss: torch.Tensor,
+    loss_mask: torch.Tensor,
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    spans: list[tuple[int, int, int, int]],
+    student_topk_log_probs: Optional[torch.Tensor] = None,
+    teacher_topk_log_probs: Optional[torch.Tensor] = None,
+) -> list[dict[str, float]]:
+    """The same signal statistics as the batch metrics, one record per supervised span.
+
+    ``spans`` are ``(row_id, row, start, end)`` on the response grid; a span with no supervised
+    token (an un-hinted row's stub, a span the student row no longer reaches) yields no record.
+    """
+    gap = (teacher_log_probs - student_log_probs).detach()
+    differs = None
+    if student_topk_log_probs is not None and teacher_topk_log_probs is not None:
+        differs = student_topk_log_probs.detach().argmax(dim=-1) != teacher_topk_log_probs.detach().argmax(dim=-1)
+
+    records = []
+    for row_id, row, start, end in spans:
+        sel = loss_mask[row, start:end].bool()
+        n_tok = int(sel.sum())
+        if n_tok == 0:
+            continue
+        span_gap = torch.nan_to_num(gap[row, start:end][sel], 0.0, 0.0, 0.0)
+        span_loss = torch.nan_to_num(per_token_loss.detach()[row, start:end][sel].float(), 0.0, 0.0, 0.0)
+        record = {
+            "row_id": int(row_id),
+            "start": int(start),
+            "end": int(end),
+            "supervised_tokens": n_tok,
+            "absgap_mean": float(span_gap.abs().mean()),
+            "loss_p50": float(torch.quantile(span_loss, 0.5)),
+        }
+        if differs is not None:
+            record["teacher_prefers_other_token"] = float(differs[row, start:end][sel].float().mean())
+        records.append(record)
+    return records
+
+
 # (metric, numerator, denominator): finalized after summing over micro-batches and ranks
 SDPO_RATIO_METRICS = (
     ("self_distillation/gap_mean", "self_distillation/gap__sum", "self_distillation/supervised_tokens__sum"),
@@ -1354,6 +1400,7 @@ def compute_self_distillation_loss(
     rollout_is_weights: Optional[torch.Tensor] = None,
     global_batch_info: Optional[dict[str, Any]] = None,
     seq_weights: Optional[torch.Tensor] = None,
+    supervised_spans: Optional[list[tuple[int, int, int, int]]] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Compute the SDPO distillation loss for actor updates.
 
@@ -1373,6 +1420,7 @@ def compute_self_distillation_loss(
         rollout_is_weights: Optional rollout correction IS weights.
         global_batch_info: Optional dp_size / batch_num_tokens / global_batch_size dict passed through to agg_loss.
         seq_weights: Optional per-row weight (batch_size,), one row per condensation segment; see agg_loss.
+        supervised_spans: Optional ``(row_id, row, start, end)`` per scored span, for the per-span export.
 
     Returns:
         tuple[torch.Tensor, dict[str, Any]]:
@@ -1501,6 +1549,18 @@ def compute_self_distillation_loss(
             teacher_topk_log_probs=teacher_topk_log_probs,
         )
     )
+    if supervised_spans:
+        span_rows = _distillation_span_rows(
+            per_token_loss=per_token_loss,
+            loss_mask=loss_mask,
+            student_log_probs=student_log_probs,
+            teacher_log_probs=teacher_log_probs,
+            spans=supervised_spans,
+            student_topk_log_probs=student_topk_log_probs,
+            teacher_topk_log_probs=teacher_topk_log_probs,
+        )
+        if span_rows:
+            metrics[SDPO_SPAN_ROWS_KEY] = span_rows
     metrics.update(
         {
             "self_distillation/alpha": float(self_distillation_config.alpha),

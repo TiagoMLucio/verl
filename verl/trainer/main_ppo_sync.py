@@ -33,7 +33,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pprint import pprint
-from typing import Any
+from typing import Any, Optional
 
 import hydra
 import numpy as np
@@ -210,6 +210,18 @@ def _final_segment_local_indices(keys: list[str]) -> list[int]:
         if session_key not in best or best[session_key][0] < index:
             best[session_key] = (index, row)
     return [row for _, row in best.values()]
+
+
+def _json_encode_default(obj):
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif hasattr(obj, "tolist"):
+        return obj.tolist()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
 class ReplayBuffer:
@@ -564,6 +576,7 @@ class PPOTrainer:
         self.use_reference_policy = need_reference_policy(self.config)
         self.use_teacher_policy = need_teacher_policy(self.config)
         self.replay_buffer = ReplayBuffer()
+        self._sdpo_span_rows = []
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
@@ -1111,21 +1124,10 @@ class PPOTrainer:
             if len(v) == n:
                 base_data[k] = v
 
-        def json_encode_default(obj):
-            if isinstance(obj, np.integer):
-                return int(obj)
-            elif isinstance(obj, np.floating):
-                return float(obj)
-            elif isinstance(obj, np.bool_):
-                return bool(obj)
-            elif hasattr(obj, "tolist"):
-                return obj.tolist()
-            raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
-
         with open(filename, "w") as f:
             for i in range(n):
                 entry = {k: v[i] for k, v in base_data.items()}
-                f.write(json.dumps(entry, ensure_ascii=False, default=json_encode_default) + "\n")
+                f.write(json.dumps(entry, ensure_ascii=False, default=_json_encode_default) + "\n")
 
         print(f"Dumped generations to {filename}")
 
@@ -1180,6 +1182,36 @@ class PPOTrainer:
             logger.warning(f"sample_index unavailable for this dump: {e}")
             return None
 
+    def _supervised_span_column(self, batch: KVBatchMeta, sorted_indices: list[int], sample_indices) -> Optional[list]:
+        """The update's per-span aggregates as one JSON string per row, or None if unavailable.
+
+        What a single span produced is only known inside the update, whose metric channel is
+        scalar-only; the rows come back out of it keyed by ``row_id`` and land here, next to the
+        text of the span they belong to.
+        """
+        if not self._sdpo_span_rows:
+            return None
+        try:
+            got = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=["row_id"])["row_id"]
+        except Exception as e:  # noqa: BLE001 - dumping is best-effort
+            logger.warning(f"row_id unavailable, per-span aggregates are not dumped: {e}")
+            return None
+        row_ids = (got.to_padded_tensor(-1) if got.is_nested else got).reshape(len(batch.keys), -1)[:, 0].tolist()
+
+        spans_by_row = defaultdict(list)
+        for span in self._sdpo_span_rows:
+            span = dict(span)
+            spans_by_row[span.pop("row_id")].append(span)
+        column = []
+        for i in sorted_indices:
+            spans = spans_by_row.get(row_ids[i], [])
+            for span in spans:
+                span["step"] = self.global_steps
+                if sample_indices is not None:
+                    span["sample_index"] = sample_indices[i]
+            column.append(json.dumps(spans, default=_json_encode_default))
+        return column
+
     def _log_rollout_data(self, batch: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
         """Fetch rollout data from TransferQueue and dump sorted by uid."""
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
@@ -1211,8 +1243,14 @@ class PPOTrainer:
             # rollout traces tag every span with sample_index; carrying it here is what
             # lets a dumped trajectory be tied back to its own timings
             sample_indices = self._fetch_sample_indices(batch)
-            if sample_indices is not None and len(sample_indices) == len(batch.keys):
+            if sample_indices is not None and len(sample_indices) != len(batch.keys):
+                sample_indices = None
+            if sample_indices is not None:
                 reward_extra_infos_dict["sample_index"] = [sample_indices[i] for i in sorted_indices]
+            # the signal each hinted span produced, joined to the hint text dumped below
+            span_column = self._supervised_span_column(batch, sorted_indices, sample_indices)
+            if span_column is not None:
+                reward_extra_infos_dict["supervised_spans"] = span_column
             # downstream hint analysis reads turn_hints/turn_spans from the dump, not trace exports
             extra_fields = data.pop("extra_fields", None)
             if extra_fields is not None:
@@ -1376,6 +1414,8 @@ class PPOTrainer:
         # different optimizer steps even though their weights are a single trajectory's share.
         traj_ids = {traj: i for i, traj in enumerate(dict.fromkeys(traj_of_row))}
         fields["traj_id"] = torch.tensor([traj_ids[traj] for traj in traj_of_row], dtype=torch.int64).unsqueeze(-1)
+        # the update knows a row only by its fields, so the per-span export it returns names this
+        fields["row_id"] = torch.arange(batch_size, dtype=torch.int64).unsqueeze(-1)
 
         supervised_rows = [bool(mask.sum() > 0) for mask in fields["self_distillation_mask"].unbind()]
         metrics.update(
@@ -1691,6 +1731,7 @@ class PPOTrainer:
             "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
             "temperature": self.config.actor_rollout_ref.rollout.temperature,
         }
+        self._sdpo_span_rows = []
         # a separate handle: this function's return feeds _compute_metrics, which must still
         # see every row or reward and length statistics would describe the supervised subset
         update_batch = batch
@@ -1709,6 +1750,7 @@ class PPOTrainer:
 
         output: TensorDict = self.actor_rollout_wg.update_actor(update_batch)
         output = rename_dict(output["metrics"], "actor/")
+        self._sdpo_span_rows = output.pop("actor/" + core_algos.SDPO_SPAN_ROWS_KEY, [])
         output["perf/mfu/actor"] = output.pop("actor/mfu")
         # after reduce_metrics: the summed pairs are plain floats here, Metric objects before it
         actor_metrics = finalize_ratio_metrics(reduce_metrics(output), prefix="actor/")

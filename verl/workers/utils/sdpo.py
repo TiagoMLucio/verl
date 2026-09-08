@@ -172,6 +172,24 @@ def response_keep_positions(
     return _keep_positions(prefix_lens, spans)
 
 
+def supervised_spans(data) -> list[tuple[int, int, int, int]]:
+    """``(row_id, row, start, end)`` for every span the spliced teacher rows score.
+
+    Empty unless the batch carries both the spliced meta and the trainer's row ids, which is
+    what ties an exported span back to the trajectory it came from.
+    """
+    turn_meta = tu.get(data, "teacher_seq_meta", default=None)
+    row_ids = tu.get(data, "row_id", default=None)
+    if turn_meta is None or not turn_meta.is_nested or row_ids is None:
+        return []
+    row_ids = (row_ids.to_padded_tensor(-1) if row_ids.is_nested else row_ids).reshape(-1).tolist()
+    return [
+        (row_id, row, sub_row.start, sub_row.end)
+        for row, (row_id, meta) in enumerate(zip(row_ids, turn_meta.unbind(), strict=True))
+        for sub_row in unpack(meta.tolist(), row)
+    ]
+
+
 def attach_response_keep_positions(data) -> None:
     """Mark the SDPO update pass for span-only logits when spliced teacher meta is present."""
     turn_meta = data.get("teacher_seq_meta", None)

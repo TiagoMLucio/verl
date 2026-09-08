@@ -19,6 +19,7 @@ import torch
 from tensordict import TensorDict
 
 from verl.trainer.ppo.core_algos import (
+    SDPO_SPAN_ROWS_KEY,
     agg_loss,
     compute_self_distillation_loss,
     compute_value_loss,
@@ -33,6 +34,7 @@ from verl.utils.metric import AggregationType, Metric
 from verl.utils.torch_functional import masked_mean, masked_sum
 from verl.workers.config import ActorConfig, CriticConfig
 from verl.workers.utils.padding import no_padding_2_padding
+from verl.workers.utils.sdpo import supervised_spans
 
 
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
@@ -337,18 +339,23 @@ def sdpo_ppo_loss(
         rollout_is_weights=rollout_is_weights,
         global_batch_info=config.global_batch_info,
         seq_weights=trace_weight,
+        supervised_spans=supervised_spans(data),
     )
     metrics["self_distillation/empty_target_batch"] = (
         self_distillation_mask.sum().item() == 0 if self_distillation_mask is not None else False
     )
     metric_aggregation = _loss_metric_aggregation(config, data)
 
+    # records, not a scalar: they ride the metrics dict out of the update untouched
+    span_rows = metrics.pop(SDPO_SPAN_ROWS_KEY, None)
     # '__sum' pairs must add across micro-batches; everything else is a per-micro-batch mean
     summed = {k: v for k, v in metrics.items() if k.endswith("__sum")}
     metrics = Metric.from_dict(
         {k: v for k, v in metrics.items() if not k.endswith("__sum")}, aggregation=AggregationType.MEAN
     )
     metrics.update(Metric.from_dict(summed, aggregation=AggregationType.SUM))
+    if span_rows:
+        metrics[SDPO_SPAN_ROWS_KEY] = span_rows
     metrics["actor/pg_loss"] = Metric(value=loss, aggregation=metric_aggregation)
     policy_loss = loss
 

@@ -362,7 +362,9 @@ def test_trainer_reprompt_batch_fields_and_metrics(monkeypatch):
     assert stub.select_fields == ["responses", "rm_scores", "raw_prompt", "uid", "extra_fields", "response_mask"]
     put_keys, fields = stub.put
     assert put_keys == keys
-    assert set(fields.keys()) == {"teacher_input_ids", "self_distillation_mask", "loss_mask", "trace_weight", "traj_id"}
+    assert set(fields.keys()) == {
+        "teacher_input_ids", "self_distillation_mask", "loss_mask", "trace_weight", "traj_id", "row_id",
+    }
     # row 0 learns from its sibling's solution (feedback dropped: only_without_solution),
     # row 3 from its feedback; the solved sibling and the blank-feedback row are unsupervised
     teacher = trainer.sdpo_teacher
@@ -380,6 +382,7 @@ def test_trainer_reprompt_batch_fields_and_metrics(monkeypatch):
     tokens = RESPONSE.shape[0] - 1
     assert [int(m.sum()) for m in fields["loss_mask"].unbind()] == [tokens, 0, 0, tokens]
     assert fields["traj_id"].squeeze(-1).tolist() == [0, 1, 2, 3]
+    assert fields["row_id"].squeeze(-1).tolist() == [0, 1, 2, 3]
     assert fields["trace_weight"].squeeze(-1).tolist() == pytest.approx([1.0, 0.0, 0.0, 1.0])
 
     generated = 3.0 * (len(TURN0) + len(TURN1))

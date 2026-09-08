@@ -21,6 +21,7 @@ engine forward with spliced rows and the hints-only skip) -> ``loss.backward()``
 Only FSDP wrapping, Ray, and TransferQueue are stubbed."""
 
 from functools import partial
+from itertools import chain
 from types import SimpleNamespace
 
 import pytest
@@ -31,8 +32,11 @@ import torch.nn as nn
 import verl.workers.engine.fsdp.transformer_impl as transformer_impl
 import verl.workers.utils.losses as sdpo_losses
 import verl.workers.utils.padding as padding_mod
+from verl.trainer.ppo.core_algos import SDPO_SPAN_ROWS_KEY
 from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META, SubRow, pack
 from verl.utils import tensordict_utils as tu
+from verl.utils.metric import Metric
+from verl.utils.torch_functional import allgather_dict_into_dict
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
 from verl.workers.engine_workers import ActorRolloutRefWorker
 from verl.workers.utils.losses import sdpo_ppo_loss
@@ -166,6 +170,7 @@ def make_batch(include_hinted=True, include_unhinted=True, loss_agg_mode="token-
         "teacher_input_ids": njt([r["teacher_seq"] for r in rows]),
         "teacher_seq_meta": njt([r["meta"] for r in rows]),
         "self_distillation_mask": njt([r["sd_mask"] for r in rows]),
+        "row_id": njt([torch.tensor([i], dtype=torch.long) for i in range(len(rows))]),
     }
     non_tensor_dict = {
         "use_remove_padding": True,
@@ -322,3 +327,44 @@ def test_all_unhinted_micro_still_runs_teacher(single_process_group, cpu_ops):
     assert teacher_lp[0, 0].abs() > 0, "teacher must score the degenerate token (lockstep)"
     assert teacher_lp[0, 1:].abs().sum() == 0
     assert result["teacher_topk_log_probs"].shape == (1, 9, TOPK)
+
+
+def test_per_span_export_names_its_span_and_matches_the_batch_metrics(single_process_group, cpu_ops):
+    """The batch holds exactly one supervised span, so every per-span aggregate has to come out
+    equal to the batch metric computed independently over the same positions."""
+    data = make_batch(include_hinted=True, include_unhinted=True)
+    _, outputs = run_update(data)
+    metrics = outputs["metrics"]
+
+    (span,) = metrics[SDPO_SPAN_ROWS_KEY]
+    assert (span["row_id"], span["start"], span["end"], span["supervised_tokens"]) == (0, 2, 7, 5)
+
+    tokens = metrics["self_distillation/supervised_tokens__sum"].aggregate()
+    assert tokens == span["supervised_tokens"]
+    assert span["absgap_mean"] == pytest.approx(metrics["self_distillation/absgap__sum"].aggregate() / tokens, rel=1e-5)
+    assert span["loss_p50"] == pytest.approx(metrics["self_distillation/loss_p50__sum"].aggregate() / tokens, rel=1e-5)
+    assert span["teacher_prefers_other_token"] == pytest.approx(
+        metrics["self_distillation/teacher_prefers_other__sum"].aggregate() / tokens
+    )
+
+
+def test_nothing_is_exported_without_supervision_or_row_ids(single_process_group, cpu_ops):
+    _, unhinted = run_update(make_batch(include_hinted=False, include_unhinted=True))
+    assert SDPO_SPAN_ROWS_KEY not in unhinted["metrics"]
+
+    data = make_batch(include_hinted=True, include_unhinted=True)
+    del data["row_id"]
+    _, no_ids = run_update(data)
+    assert SDPO_SPAN_ROWS_KEY not in no_ids["metrics"]
+    assert no_ids["metrics"]["self_distillation/supervised_tokens__sum"].aggregate() == 5
+
+
+def test_span_rows_ride_the_dp_metric_channel_as_records(single_process_group, cpu_ops):
+    """The channel out of the update is scalar-only: the records travel as a plain list, which
+    the dp allgather and the mini-batch flattening (train_mini_batch) carry through untouched."""
+    _, outputs = run_update(make_batch(include_hinted=True, include_unhinted=True))
+    rows = outputs["metrics"][SDPO_SPAN_ROWS_KEY]
+    assert not isinstance(rows, Metric), "a Metric would be averaged over the dp ranks instead"
+
+    gathered = allgather_dict_into_dict({SDPO_SPAN_ROWS_KEY: rows})[SDPO_SPAN_ROWS_KEY]
+    assert list(chain.from_iterable(gathered)) == rows
