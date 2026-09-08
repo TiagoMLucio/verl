@@ -29,6 +29,7 @@ from verl.trainer.ppo.core_algos import (
     compute_rloo_outcome_advantage,
     compute_rloo_vectorized_outcome_advantage,
     compute_self_distillation_loss,
+    finalize_ratio_metrics,
     get_adv_estimator_fn,
     kl_penalty,
     register_adv_est,
@@ -516,6 +517,58 @@ def test_compute_self_distillation_loss_optional_is_clip():
     assert torch.isfinite(loss_clip)
     assert loss_clip < loss_no_clip
     assert metrics_clip["self_distillation/is_clip"] == 2.0
+
+
+TOPK_CFG = SimpleNamespace(
+    full_logit_distillation=True, distillation_topk=4, distillation_add_tail=True, alpha=1.0, is_clip=None
+)
+RKL_CFG = SimpleNamespace(
+    full_logit_distillation=False, distillation_topk=None, distillation_add_tail=False, alpha=1.0, is_clip=None
+)
+ARGMAX_SUM = "self_distillation/teacher_prefers_other__sum"
+ARGMAX_RATIO = "self_distillation/teacher_prefers_other_token"
+
+
+def test_teacher_prefers_other_token_is_absent_rather_than_zero_without_the_argmax():
+    """The step-1 gate: a 0.0 here reads as the teacher never disagreeing with the student, not
+    as never measured, so the run without top-k must report nothing at all."""
+    student_topk = torch.log_softmax(torch.randn(2, 3, 4), dim=-1)
+    teacher_topk = torch.log_softmax(torch.randn(2, 3, 4), dim=-1)
+    kwargs = dict(
+        student_log_probs=student_topk[..., 0],
+        teacher_log_probs=teacher_topk[..., 0],
+        response_mask=torch.ones(2, 3),
+    )
+
+    _, topk = compute_self_distillation_loss(
+        self_distillation_config=TOPK_CFG,
+        student_topk_log_probs=student_topk,
+        teacher_topk_log_probs=teacher_topk,
+        **kwargs,
+    )
+    _, rkl = compute_self_distillation_loss(self_distillation_config=RKL_CFG, **kwargs)
+
+    assert ARGMAX_SUM in topk and ARGMAX_RATIO in finalize_ratio_metrics(topk)
+    assert ARGMAX_SUM not in rkl and ARGMAX_RATIO not in finalize_ratio_metrics(rkl)
+    # the other ratios still finalize without it
+    assert "self_distillation/gap_mean" in finalize_ratio_metrics(rkl)
+
+
+def test_the_argmax_key_survives_a_micro_batch_with_no_supervised_token():
+    """dp aggregation counts values per key, so with top-k on, the key set may not depend on
+    whether this particular micro-batch had anything to supervise."""
+    student_topk = torch.log_softmax(torch.randn(2, 3, 4), dim=-1)
+    teacher_topk = torch.log_softmax(torch.randn(2, 3, 4), dim=-1)
+    _, empty = compute_self_distillation_loss(
+        student_log_probs=student_topk[..., 0],
+        teacher_log_probs=teacher_topk[..., 0],
+        response_mask=torch.ones(2, 3),
+        self_distillation_config=TOPK_CFG,
+        student_topk_log_probs=student_topk,
+        teacher_topk_log_probs=teacher_topk,
+        self_distillation_mask=torch.zeros(2, 3),
+    )
+    assert empty[ARGMAX_SUM] == 0.0 and empty["self_distillation/supervised_tokens__sum"] == 0.0
 
 
 def test_agg_loss_traj_mean_token_mean_is_the_mean_of_trajectory_token_means():

@@ -1250,13 +1250,17 @@ def _distillation_signal_metrics(
             "self_distillation/teacher_higher__sum",
             "self_distillation/loss_p50__sum",
             "self_distillation/loss_p90__sum",
-            "self_distillation/teacher_prefers_other__sum",
             "self_distillation/supervised_tokens__sum",
             "self_distillation/inert_rows__sum",
             "self_distillation/supervised_rows__sum",
         ),
         0.0,
     )
+    # the argmax pair is a run-level config, so this key is either seeded on every micro-batch
+    # and rank or on none: a run without it reports no agreement rather than perfect agreement
+    has_argmax = student_topk_log_probs is not None and teacher_topk_log_probs is not None
+    if has_argmax:
+        out["self_distillation/teacher_prefers_other__sum"] = 0.0
     sel = loss_mask.bool()
     n_tok = int(sel.sum())
     if n_tok == 0:
@@ -1286,7 +1290,7 @@ def _distillation_signal_metrics(
     if supervised_rows.any():
         rows = torch.nan_to_num(row_gap[supervised_rows], 0.0, 0.0, 0.0)
         out["self_distillation/inert_rows__sum"] = float(int((rows < inert_threshold).sum()))
-    if student_topk_log_probs is not None and teacher_topk_log_probs is not None:
+    if has_argmax:
         s_top = student_topk_log_probs.detach().argmax(dim=-1)[sel]
         t_top = teacher_topk_log_probs.detach().argmax(dim=-1)[sel]
         out["self_distillation/teacher_prefers_other__sum"] = float((s_top != t_top).sum())
