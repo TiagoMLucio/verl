@@ -375,8 +375,8 @@ def sdpo_ppo_loss(
         )
         policy_loss -= config.entropy_coeff * entropy_loss
         metrics["actor/entropy_loss"] = Metric(value=entropy_loss, aggregation=metric_aggregation)
-        # Is the policy sharpening only where we train it, or everywhere? Summed, not meaned:
-        # un-hinted micro-batches would otherwise drag the average toward zero.
+        # the token-weighted mean over the same positions, which entropy_loss is not: that one
+        # carries the loss normalisation. Summed: un-hinted micro-batches would dilute a mean.
         metrics["entropy_hinted__sum"] = Metric(
             value=(entropy.detach() * entropy_mask).sum(), aggregation=AggregationType.SUM
         )
