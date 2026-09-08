@@ -67,7 +67,6 @@ actor_rollout_ref:
     clip_ratio_high: 0.2
     tau_pos: 1.0
     tau_neg: 1.05
-    freeze_vision_tower: false
     policy_loss:
       _target_: verl.workers.config.PolicyLossConfig
       loss_mode: vanilla
@@ -175,6 +174,7 @@ actor_rollout_ref:
 
           '
         environment_feedback_only_without_solution: true
+        chat_template_kwargs: {}
     router_replay:
       _target_: verl.workers.config.RouterReplayConfig
       mode: disabled

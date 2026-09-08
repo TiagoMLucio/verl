@@ -180,6 +180,42 @@ def test_reprompt_truncation_side_scoped_to_the_reprompt():
     assert tok.truncation_side == "right"
 
 
+def _qwen35_tokenizer():
+    from transformers import AutoTokenizer
+
+    try:
+        return AutoTokenizer.from_pretrained("Qwen/Qwen3.5-4B")
+    except OSError:
+        pytest.skip("Qwen/Qwen3.5-4B tokenizer is not in the local HF cache")
+
+
+def _generation_header(tok, kwargs):
+    """The tokens apply_chat_template appends for the assistant turn about to be sampled."""
+    messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    without = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=False, **kwargs)
+    with_header = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, **kwargs)
+    assert with_header.startswith(without)
+    return tok.encode(with_header[len(without) :], add_special_tokens=False)
+
+
+def test_reprompt_header_follows_chat_template_kwargs():
+    """The response was sampled after the rollout's generation header, so the reprompt has to
+    end with the same one: under Qwen3.5 that is 7 tokens with enable_thinking off and 5 with
+    the template's default, which is what the dataset's empty kwargs render."""
+    tok = _qwen35_tokenizer()
+    rollout_header = _generation_header(tok, {"enable_thinking": False})
+    default_header = _generation_header(tok, {})
+    assert len(rollout_header) == 7 and len(default_header) == 5
+    assert tok.decode(rollout_header) == "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+    inputs = _inputs([{}], ["a"], [0.0], ["fb"], responses=[torch.tensor([9, 9, 9])])
+    for kwargs, header in (({"enable_thinking": False}, rollout_header), ({}, default_header)):
+        teacher = RepromptTeacher(tok, success_reward_threshold=0.5, chat_template_kwargs=kwargs)
+        prompt = teacher.build(inputs).fields["teacher_input_ids"][0][:-3]
+        assert prompt[-len(header) :].tolist() == header, kwargs
+        assert tok.decode(prompt).endswith(tok.decode(header))
+
+
 def test_teacher_options_are_validated_at_construction():
     tok = ToyTokenizer()
     with pytest.raises(TypeError, match="max_hinted_turns"):
@@ -220,6 +256,9 @@ def test_reprompt_yaml_is_the_teacher_default_and_hydra_leaves_the_block_alone()
     options = {k: v for k, v in cfg.teacher.items() if k != "_target_"}
     assert set(options) == set(params) - {"self", "tokenizer", "max_prefix_len", "apply_chat_template_kwargs",
                                           "success_reward_threshold"}
+    # empty in the yaml, None in the signature: the reprompt renders with the dataset's kwargs
+    assert options.pop("chat_template_kwargs") == {} and params["chat_template_kwargs"].default is None
+    assert teacher.template_kwargs == {"a": 1}
     for name, value in options.items():
         assert getattr(teacher, name) == value
         assert params[name].default == value, f"{name}: reprompt.yaml and the constructor default differ"
@@ -479,24 +518,23 @@ def test_trainer_traj_mean_shares_and_trajectory_count(monkeypatch):
     assert update_batch.extra_info["mini_batch_size"] == 4
 
 
-def test_trainer_traj_mean_rejects_more_than_one_mini_batch(monkeypatch):
+def test_trainer_traj_mean_mini_batch_is_the_update_batch(monkeypatch):
+    """The configured mini-batch size is not what the worker splits by: the whole update batch
+    is one mini-batch, however many rows condensation left in it."""
     trainer, _, batch, sent = _traj_mean_trainer(monkeypatch, ppo_mini_batch_size=2)
-    with pytest.raises(ValueError, match=r"traj-mean-token-mean.*4 rows but ppo_mini_batch_size \* rollout\.n = 2"):
-        trainer._update_actor(batch, {})
-    assert sent == []
-
-    trainer, _, batch, sent = _traj_mean_trainer(monkeypatch, ppo_epochs=2)
-    with pytest.raises(ValueError, match=r"traj-mean-token-mean needs ppo_epochs=1, got 2"):
-        trainer._update_actor(batch, {})
-    assert sent == []
-
-
-def test_trainer_traj_mean_all_unsupervised_count_clamps_to_one(monkeypatch):
-    trainer, stub, batch, sent = _traj_mean_trainer(monkeypatch)
-    stub.data["trace_weight"] = torch.zeros_like(stub.data["trace_weight"])
     trainer._update_actor(batch, {})
     (update_batch,) = sent
-    assert update_batch.extra_info["global_batch_size"] == 1
+    assert update_batch.extra_info["mini_batch_size"] == 4
+    assert update_batch.extra_info["global_batch_size"] == 2
+
+
+def test_trainer_traj_mean_skips_the_update_without_supervision(monkeypatch):
+    trainer, stub, batch, sent = _traj_mean_trainer(monkeypatch)
+    stub.data["trace_weight"] = torch.zeros_like(stub.data["trace_weight"])
+    metrics = {}
+    assert trainer._update_actor(batch, metrics) is batch
+    assert sent == [], "no forward, no optimizer step"
+    assert metrics == {"actor/skipped_update": 1.0}
 
 
 def test_trainer_seq_mean_keeps_the_rescaled_weights_and_row_denominator(monkeypatch):

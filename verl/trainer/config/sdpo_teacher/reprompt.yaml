@@ -34,3 +34,8 @@ feedback_template: "\nThe following is feedback from your unsuccessful earlier a
 
 # Use feedback only when no successful demonstration is available
 environment_feedback_only_without_solution: true
+
+# Rollout-side apply_chat_template kwargs for rendering the reprompt (e.g. {enable_thinking: false}
+# for Qwen3.5), so its generation header matches the one the response was sampled after; empty
+# falls back to data.apply_chat_template_kwargs
+chat_template_kwargs: {}

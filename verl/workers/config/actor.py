@@ -237,7 +237,6 @@ class ActorConfig(BaseConfig):
     clip_ratio: float = 0.2
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.2
-    freeze_vision_tower: bool = False
     policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
@@ -306,6 +305,18 @@ class ActorConfig(BaseConfig):
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""
+        if self.loss_agg_mode == "traj-mean-token-mean":
+            if self.policy_loss.loss_mode != "sdpo":
+                raise ValueError(
+                    "loss_agg_mode=traj-mean-token-mean needs policy_loss.loss_mode=sdpo: the per-row shares "
+                    "and trajectory ids it divides by come from the self-distillation batch"
+                )
+            if self.ppo_mini_batch_size != train_batch_size or self.ppo_epochs != 1:
+                raise ValueError(
+                    "loss_agg_mode=traj-mean-token-mean is one optimizer step over the whole batch: it needs "
+                    f"ppo_mini_batch_size == data.train_batch_size (got {self.ppo_mini_batch_size} and "
+                    f"{train_batch_size}) and ppo_epochs == 1 (got {self.ppo_epochs})"
+                )
         if not self.use_dynamic_bsz:
             if train_batch_size < self.ppo_mini_batch_size:
                 raise ValueError(

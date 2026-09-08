@@ -1553,21 +1553,13 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 if not bool((scale == 1).all()):
                     logits.div_(scale)
 
-                if calculate_entropy:
-                    # same flag-aware entropy as the rmpad path: the raw call materializes
-                    # fp32 full-vocab logits (37k tokens x 248k vocab = 37 GiB on Qwen3.5)
-                    if not self.engine_config.entropy_checkpointing:
-                        entropy = self.compute_entropy_from_logits(logits)
-                    else:
-                        entropy = torch.utils.checkpoint.checkpoint(self.compute_entropy_from_logits, logits)
-
                 if calculate_sum_pi_squared:
                     sum_pi_squared = verl_F.calculate_sum_pi_squared_from_logits(logits)
 
                 if pad_mode == DatasetPadMode.NO_PADDING:
                     cu_seqlens = input_ids.offsets()
                     seq_lengths = cu_seqlens.diff()
-                    # also consumed by the entropy narrow further down
+                    # also consumed by the sum_pi_squared narrow further down
                     starts = torch.zeros_like(seq_lengths, dtype=torch.int64)
                     if int(seq_lengths.sum()) == logits.shape[0] * logits.shape[1]:
                         # nothing was padded (always so at micro_batch_size_per_gpu=1):
@@ -1578,6 +1570,17 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         logits_rmpad = torch.cat([t for t in logits.unbind()])
                     input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
                     log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
+
+                    if calculate_entropy:
+                        # same flag-aware entropy as the rmpad path, on the same (tokens, vocab)
+                        # layout: the chunked variant splits dim 0, and the raw call materializes
+                        # fp32 full-vocab logits (37k tokens x 248k vocab = 37 GiB on Qwen3.5)
+                        if not self.engine_config.entropy_checkpointing:
+                            entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)
+                        else:
+                            entropy_rmpad = torch.utils.checkpoint.checkpoint(
+                                self.compute_entropy_from_logits, logits_rmpad
+                            )
 
                     # Mirror the use_remove_padding=True branch (see verl#6293).
                     # No Ulysses SP gather here: this branch is the no-SP path
@@ -1596,8 +1599,6 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     # (bsz, j1), for each sample, length of each sample: [real_prompt_length + real_response_length]
                     log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
                     if calculate_entropy:
-                        entropy = torch.nested.narrow(entropy, 1, starts, seq_lengths, layout=torch.jagged)
-                        entropy_rmpad = torch.cat([t for t in entropy.unbind()])
                         entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
                     if calculate_sum_pi_squared:
                         sum_pi_squared = torch.nested.narrow(

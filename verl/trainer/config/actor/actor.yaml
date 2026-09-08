@@ -48,9 +48,6 @@ tau_pos: 1.0
 # negative tau for smoothing function in SAPO
 tau_neg: 1.05
 
-# Whether to freeze vision model, if set true, it will be freeze vision model
-freeze_vision_tower: false
-
 # policy loss config
 policy_loss:
 

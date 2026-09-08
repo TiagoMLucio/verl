@@ -1626,7 +1626,7 @@ class PPOTrainer:
         return batch
 
     def _drop_unsupervised_rows(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
-        """Keep only rows the update can learn from, then re-pad for divisibility.
+        """Keep only rows the update can learn from, then re-pad and re-balance across dp.
 
         A row whose trace_weight is zero contributes no gradient: seq-mean-token-mean drops
         fully masked sequences and weights the rest by that number. It still costs a full
@@ -1652,28 +1652,11 @@ class PPOTrainer:
             fields=batch.fields,
             extra_info=batch.extra_info,
         )
-        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
-        return upsample_batch_to_divisible_size(
-            batch, self._get_required_batch_multiple(dp_size), self.tokenizer.eos_token_id
-        )
+        return self._balance_batch(batch, metrics, logging_prefix="update_seqlen")
 
-    def _supervised_trajectory_count(self, batch: KVBatchMeta, mini_batch_rows: int, sdpo_enabled: bool) -> int:
+    def _supervised_trajectory_count(self, batch: KVBatchMeta) -> int:
         """Denominator of traj-mean-token-mean: the trajectories with any supervised token in
-        the update batch. Every mini-batch is divided by this whole-batch count, so the update
-        has to be one mini-batch and one epoch."""
-        if not sdpo_enabled:
-            raise ValueError(
-                "loss_agg_mode=traj-mean-token-mean needs policy_loss.loss_mode=sdpo: the per-row shares "
-                "and trajectory ids it divides by come from the self-distillation batch"
-            )
-        if len(batch.keys) != mini_batch_rows:
-            raise ValueError(
-                "loss_agg_mode=traj-mean-token-mean needs a single mini-batch per step: the update batch "
-                f"has {len(batch.keys)} rows but ppo_mini_batch_size * rollout.n = {mini_batch_rows}"
-            )
-        ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
-        if ppo_epochs != 1:
-            raise ValueError(f"loss_agg_mode=traj-mean-token-mean needs ppo_epochs=1, got {ppo_epochs}")
+        the update batch (the padding rows carry traj_id -1 and weight 0)."""
         fields = tq.kv_batch_get(
             keys=batch.keys, partition_id=batch.partition_id, select_fields=["trace_weight", "traj_id"]
         )
@@ -1681,7 +1664,7 @@ class PPOTrainer:
         weight = (weight.to_padded_tensor(0.0) if weight.is_nested else weight).reshape(len(batch.keys), -1).sum(-1)
         traj = (traj.to_padded_tensor(-1) if traj.is_nested else traj).reshape(len(batch.keys), -1)[:, 0]
         supervised = {int(t) for t, w in zip(traj.tolist(), weight.tolist(), strict=True) if w > 0 and t >= 0}
-        return max(len(supervised), 1)
+        return len(supervised)
 
     def _update_actor(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Update the actor network."""
@@ -1715,9 +1698,14 @@ class PPOTrainer:
         if self.config.actor_rollout_ref.actor.get("drop_unsupervised_rows", False):
             update_batch = self._drop_unsupervised_rows(batch, metrics)
         if self.config.actor_rollout_ref.actor.get("loss_agg_mode") == "traj-mean-token-mean":
-            extra_info["global_batch_size"] = self._supervised_trajectory_count(
-                update_batch, ppo_mini_batch_size, sdpo_enabled
-            )
+            # one optimizer step over the whole update batch, whatever condensation and the
+            # drop left of it (ActorConfig.validate pins mini == train batch and one epoch)
+            supervised_trajectories = self._supervised_trajectory_count(update_batch)
+            if supervised_trajectories == 0:
+                metrics["actor/skipped_update"] = 1.0
+                return batch
+            extra_info["global_batch_size"] = supervised_trajectories
+            extra_info["mini_batch_size"] = len(update_batch.keys)
         update_batch.extra_info.update(extra_info)
 
         output: TensorDict = self.actor_rollout_wg.update_actor(update_batch)

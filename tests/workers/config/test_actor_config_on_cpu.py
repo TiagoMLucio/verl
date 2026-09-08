@@ -21,6 +21,7 @@ from verl.workers.config import (
     FSDPActorConfig,
     McoreActorConfig,
     OptimizerConfig,
+    PolicyLossConfig,
 )
 
 
@@ -250,6 +251,42 @@ class TestActorConfig(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             config.validate(n_gpus=16, train_batch_size=512)
         self.assertIn("must be >= n_gpus", str(cm.exception))
+
+    def test_traj_mean_needs_one_mini_batch_one_epoch_and_sdpo(self):
+        """traj-mean-token-mean divides by a whole-batch trajectory count, so the config has to
+        describe one optimizer step over the whole batch; caught before any rollout."""
+
+        def config(**overrides):
+            kwargs = dict(
+                strategy="fsdp",
+                loss_agg_mode="traj-mean-token-mean",
+                policy_loss=PolicyLossConfig(loss_mode="sdpo"),
+                ppo_mini_batch_size=128,
+                ppo_epochs=1,
+                ppo_micro_batch_size_per_gpu=1,
+                optim=OptimizerConfig(lr=0.1),
+                rollout_n=1,
+            )
+            kwargs.update(overrides)
+            return ActorConfig(**kwargs)
+
+        config().validate(n_gpus=4, train_batch_size=128)
+
+        with self.assertRaises(ValueError) as cm:
+            config(ppo_mini_batch_size=64).validate(n_gpus=4, train_batch_size=128)
+        self.assertIn("one optimizer step over the whole batch", str(cm.exception))
+        self.assertIn("got 64 and 128", str(cm.exception))
+
+        with self.assertRaises(ValueError) as cm:
+            config(ppo_epochs=2).validate(n_gpus=4, train_batch_size=128)
+        self.assertIn("ppo_epochs == 1 (got 2)", str(cm.exception))
+
+        with self.assertRaises(ValueError) as cm:
+            config(policy_loss=PolicyLossConfig(loss_mode="vanilla")).validate(n_gpus=4, train_batch_size=128)
+        self.assertIn("needs policy_loss.loss_mode=sdpo", str(cm.exception))
+
+        # the other modes keep the mini-batch free
+        config(loss_agg_mode="seq-mean-token-mean", ppo_mini_batch_size=64).validate(n_gpus=4, train_batch_size=128)
 
 
 if __name__ == "__main__":

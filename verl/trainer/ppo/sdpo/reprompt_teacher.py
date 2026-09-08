@@ -60,6 +60,7 @@ class RepromptTeacher(SDPOTeacher):
             "\nThe following is feedback from your unsuccessful earlier attempt:\n\n{feedback_raw}\n\n"
         ),
         environment_feedback_only_without_solution: bool = True,
+        chat_template_kwargs: Optional[dict] = None,
     ):
         super().__init__(
             tokenizer,
@@ -69,6 +70,8 @@ class RepromptTeacher(SDPOTeacher):
         )
         if reprompt_truncation not in ("right", "left"):
             raise ValueError(f"reprompt_truncation must be right|left, got {reprompt_truncation!r}")
+        # empty falls back to the dataset's kwargs, which is what the paper repro renders with
+        self.template_kwargs = dict(chat_template_kwargs) if chat_template_kwargs else self.apply_chat_template_kwargs
         self.max_reprompt_len = max_reprompt_len
         self.reprompt_truncation = reprompt_truncation
         self.dont_reprompt_on_self_success = dont_reprompt_on_self_success
@@ -99,7 +102,7 @@ class RepromptTeacher(SDPOTeacher):
             build_reprompt_messages(ctx, None if row is None else solution_text[row], self)
             for ctx, row in zip(contexts, solution_row, strict=True)
         ]
-        prompts = tokenize_reprompt_batch(self.tokenizer, messages, self, self.apply_chat_template_kwargs)
+        prompts = tokenize_reprompt_batch(self.tokenizer, messages, self, self.template_kwargs)
         reprompt_mask = [
             row is not None
             or prompt_feedback_used(ctx.feedback, row is not None, self.environment_feedback_only_without_solution)
