@@ -70,3 +70,22 @@ def test_rl_collate_fn():
         assert isinstance(batch[key][0], dtype), (
             f"'{key}' should contain elements of type {dtype}, but got {type(batch[key][0])}"
         )
+
+
+def test_extra_info_survives_as_a_row_column():
+    """The agent loop reads its per-row prompt values out of `extra_info`, and the loop manager
+    hands each loop one slice per non-tensor column, so `extra_info` has to be one of them.
+    """
+    from verl.utils.dataset.rl_dataset import collate_fn
+
+    rows = [
+        {"input_ids": torch.zeros(2, dtype=torch.long),
+         "extra_info": {"index": 0, "prompt_values": {"workdir": "/testbed"}}},
+        {"input_ids": torch.zeros(2, dtype=torch.long),
+         "extra_info": {"index": 1, "prompt_values": {"workdir": "/repo"}}},
+    ]
+    batch = collate_fn(rows)
+
+    assert "extra_info" in batch, "promoting only index and tools_kwargs would strand it"
+    # this is the slice the loop manager takes per row
+    assert batch["extra_info"][1]["prompt_values"] == {"workdir": "/repo"}

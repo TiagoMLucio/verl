@@ -306,3 +306,57 @@ async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
     torch.testing.assert_close(internal.routed_experts[:, 2:6], expected)
     assert torch.count_nonzero(internal.routed_experts[:, :2]) == 0
     assert torch.count_nonzero(internal.routed_experts[:, 6:]) == 0
+
+
+class _PostprocessWorker:
+    """Enough of the worker to reach the raw_prompt line and pad what follows."""
+
+    _compute_multi_modal_inputs = AgentLoopWorker._compute_multi_modal_inputs
+    _compute_position_ids = AgentLoopWorker._compute_position_ids
+    _get_mm_processor_kwargs = AgentLoopWorker._get_mm_processor_kwargs
+    _compute_score = AgentLoopWorker._compute_score
+    _compute_teacher_logprobs = AgentLoopWorker._compute_teacher_logprobs
+    _pad_token_ids = AgentLoopWorker._pad_token_ids
+    distillation_enabled = False
+
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.rollout_config = OmegaConf.create({"prompt_length": 4, "response_length": 4})
+        self.processor = None
+        self.mm_processor_kwargs = {}
+        self.reward_loop_worker_handles = None
+
+
+def _output(extra_fields):
+    return AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[11, 12],
+        response_mask=[1, 1],
+        metrics=AgentLoopMetrics(),
+        extra_fields=extra_fields,
+    )
+
+
+COLUMN = [{"role": "user", "content": "the prompt baked into the parquet"}]
+COMPOSED = [
+    {"role": "system", "content": "composed at rollout"},
+    {"role": "user", "content": "from a template and this row's values"},
+]
+
+
+@pytest.mark.asyncio
+async def test_a_loop_that_composed_its_prompt_reports_that_one_on_cpu():
+    """The dumps are how offline analysis reconstructs what the model saw, so a loop that did
+    not open on the dataset column must not be recorded as though it had."""
+    internal = await AgentLoopWorker._agent_loop_postprocess(
+        _PostprocessWorker(), _output({"raw_prompt": COMPOSED}), validate=False, raw_prompt=COLUMN
+    )
+    assert internal.extra_fields["raw_prompt"] == COMPOSED
+
+
+@pytest.mark.asyncio
+async def test_a_loop_that_reported_none_still_gets_the_dataset_column_on_cpu():
+    internal = await AgentLoopWorker._agent_loop_postprocess(
+        _PostprocessWorker(), _output({}), validate=False, raw_prompt=COLUMN
+    )
+    assert internal.extra_fields["raw_prompt"] == COLUMN

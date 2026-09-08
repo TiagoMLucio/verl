@@ -644,7 +644,10 @@ class AgentLoopWorker:
 
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
-        output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+        # a loop that composes its own opening messages reports them here, and the dumps are how
+        # every offline analysis reconstructs what the model saw; the dataset column is the
+        # fallback for loops that take their prompt from it unchanged
+        output.extra_fields.setdefault("raw_prompt", kwargs["raw_prompt"])
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
