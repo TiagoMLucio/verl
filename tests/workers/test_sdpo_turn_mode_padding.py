@@ -124,3 +124,34 @@ def test_padding_template_rebuilds_teacher_fields():
     run_teacher_grid_path(mixed)
     for idx in ([0], [1]):
         run_teacher_grid_path(tu.index_select_tensor_dict(mixed, idx))
+
+
+def test_a_pad_made_after_the_advantage_pass_sits_on_its_own_grid():
+    """The update re-pads after dropping unsupervised rows, when the source already carries the
+    log-prob and advantage passes' fields; a pad inheriting them has a 1-token response with
+    9000-token advantages, which the SDPO row cut then cannot align with the student."""
+    source = make_hinted_sample()
+    source.update(
+        prompts=torch.full((50,), 7, dtype=torch.long),
+        input_ids=torch.arange(9050, dtype=torch.long),
+        attention_mask=torch.ones(9050, dtype=torch.long),
+        position_ids=torch.arange(9050),
+        loss_mask=torch.ones(9000),
+        self_distillation_mask=torch.ones(9000),
+        rm_scores=torch.zeros(9000),
+        rollout_log_probs=torch.zeros(9000),
+        old_log_probs=torch.randn(9000),
+        entropy=torch.rand(9000),
+        advantages=torch.randn(9000),
+        returns=torch.randn(9000),
+        uid="real-0",
+        num_turns=40,
+    )
+    template, _ = construct_minimal_padding_template(source, {"seq_len": 9050}, eos_token_id=2)
+
+    for key in ("old_log_probs", "entropy", "advantages", "returns", "response_mask", "loss_mask"):
+        assert template[key].shape == (1,), key
+        assert not template[key].any(), key
+    assert template["responses"].tolist() == [2] and template["prompts"].tolist() == [2]
+    assert template["input_ids"].tolist() == [2, 2]
+    assert template["teacher_seq_meta"].tolist() == list(DEGENERATE_META)

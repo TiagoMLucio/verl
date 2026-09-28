@@ -40,7 +40,11 @@ from verl.utils.torch_functional import allgather_dict_into_dict
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
 from verl.workers.engine_workers import ActorRolloutRefWorker
 from verl.workers.utils.losses import sdpo_ppo_loss
-from verl.workers.utils.sdpo import attach_response_keep_positions, truncate_rows_after_last_supervised_token
+from verl.workers.utils.sdpo import (
+    _raise_if_partly_on_the_grid,
+    attach_response_keep_positions,
+    truncate_rows_after_last_supervised_token,
+)
 
 VOCAB, HIDDEN, TOPK = 64, 8, 5
 
@@ -440,6 +444,33 @@ def test_a_row_with_no_supervised_token_is_untouched(single_process_group, cpu_o
     ref_engine, _ = run_update(reference)
     for g_cut, g_ref in zip(_grads(cut_engine), _grads(ref_engine), strict=True):
         assert torch.equal(g_cut, g_ref)
+
+
+def test_a_field_off_the_response_grid_on_one_row_is_reported_not_skipped(single_process_group, cpu_ops):
+    """One row of old_log_probs longer than its response: skipping the field would cut the student
+    rows and leave old_log_probs whole, which is the misalignment the IS ratio then trips over."""
+    torch.manual_seed(0)
+    data = make_batch(loss_agg_mode="traj-mean-token-mean")
+    rows = list(data["old_log_probs"].unbind())
+    rows[1] = torch.cat([rows[1], torch.zeros(2)])
+    data["old_log_probs"] = torch.nested.nested_tensor(rows, layout=torch.jagged)
+
+    with pytest.raises(RuntimeError, match=r"'old_log_probs' is on the response grid for 1 of 2 rows") as err:
+        truncate_rows_after_last_supervised_token(data)
+    assert "row 1: old_log_probs 11, responses 9" in str(err.value)
+
+
+def test_a_constant_length_field_is_on_no_grid_even_where_a_pad_row_matches_it(single_process_group, cpu_ops):
+    """A per-row placeholder of length 1 coincides with a 1-token pad row's response, and is still
+    no response-grid field: the cut leaves it alone instead of reporting it."""
+    torch.manual_seed(0)
+    data = make_batch(loss_agg_mode="traj-mean-token-mean")
+    rows = list(data["responses"].unbind())
+    rows[1] = rows[1][:1]
+    data["responses"] = torch.nested.nested_tensor(rows, layout=torch.jagged)
+    data["dummy_tensor"] = torch.nested.nested_tensor([torch.zeros(1), torch.zeros(1)], layout=torch.jagged)
+
+    _raise_if_partly_on_the_grid(data, "dummy_tensor", [1, 1], _lens(data, "responses"), _lens(data, "input_ids"))
 
 
 def test_a_causal_forward_does_not_see_the_tail_it_is_cut_from():

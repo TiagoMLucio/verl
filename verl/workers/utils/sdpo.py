@@ -203,6 +203,37 @@ def attach_response_keep_positions(data) -> None:
 _TRUNCATION_EXEMPT = frozenset({"prompts", "teacher_input_ids", "teacher_seq_meta", "trace_weight"})
 
 
+def _raise_if_partly_on_the_grid(data, key, lens, resp_lens, seq_lens) -> None:
+    """A field that matches the response (or sequence) grid on some rows but not all is an upstream
+    length disagreement, not another grid: skipping it would cut the student rows and leave it whole."""
+    # a per-row constant (a length-1 placeholder) is on no grid, even where a 1-token pad row matches it
+    if len(set(lens)) == 1:
+        return
+    for grid, ref in (("response", resp_lens), ("sequence", seq_lens)):
+        off = [i for i, (n, r) in enumerate(zip(lens, ref, strict=True)) if n != r]
+        if len(off) == len(lens):
+            continue
+
+        def row_lens(name, i):
+            value = data.get(name, None)
+            return value.offsets().diff().tolist()[i] if torch.is_tensor(value) and value.is_nested else None
+
+        def row_id(name, i):
+            value = data.get(name, None)
+            return int(value.reshape(-1)[i]) if torch.is_tensor(value) and not value.is_nested else None
+
+        rows = [
+            f"row {i}: {key} {lens[i]}, responses {resp_lens[i]}, response_mask {row_lens('response_mask', i)}, "
+            f"input_ids {seq_lens[i]}, row_id {row_id('row_id', i)}, traj_id {row_id('traj_id', i)}"
+            for i in off[:8]
+        ]
+        raise RuntimeError(
+            f"SDPO row truncation: {key!r} is on the {grid} grid for {len(lens) - len(off)} of {len(lens)} rows "
+            f"but not for {len(off)}; cutting the others would leave it misaligned with the student.\n  "
+            + "\n  ".join(rows)
+        )
+
+
 def truncate_rows_after_last_supervised_token(data) -> float:
     """Cut every student row after its last supervised token; returns the kept token fraction.
 
@@ -249,6 +280,7 @@ def truncate_rows_after_last_supervised_token(data) -> float:
         elif lens == seq_lens:
             new_lens = seq_keep_lens
         else:
+            _raise_if_partly_on_the_grid(data, key, lens, resp_lens, seq_lens)
             continue
         if value.dim() > 2:
             raise RuntimeError(f"SDPO row truncation does not support the {value.dim()}d field {key!r}")

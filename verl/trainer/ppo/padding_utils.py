@@ -100,6 +100,18 @@ def construct_minimal_padding_template(
     position_ids = build_padding_position_ids(template_sample.get("position_ids"), attention_mask)
     routed_experts = build_padding_routed_experts(template_sample.get("routed_experts"), input_ids.size(0))
 
+    # A pad added after the log-prob and advantage passes (the update's re-balance) would otherwise
+    # inherit the source's old_log_probs, entropy, advantages...: every tensor still on the source's
+    # response or sequence grid is zeroed onto the stub's; the fields set below override this.
+    source_resp_len, source_seq_len = source_td["responses"].shape[0], source_td["input_ids"].shape[0]
+    for key, value in template_sample.items():
+        if not isinstance(value, torch.Tensor) or value.dim() == 0:
+            continue
+        if value.shape[0] == source_resp_len:
+            template_sample[key] = value.new_zeros((1, *value.shape[1:]))
+        elif value.shape[0] == source_seq_len:
+            template_sample[key] = value.new_zeros((2, *value.shape[1:]))
+
     # Update the fields and remove redundant parts
     template_sample.update(
         prompts=prompts,
