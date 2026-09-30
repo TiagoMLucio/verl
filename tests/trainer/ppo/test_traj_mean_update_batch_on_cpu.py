@@ -72,6 +72,10 @@ class KV:
                 v = fields[f]
                 self.store[k][f] = v[i] if isinstance(v, torch.Tensor | list) else v
 
+    def kv_clear(self, keys, partition_id):
+        for k in keys:
+            self.store.pop(k, None)
+
 
 def _row(weight, traj, seq_len):
     return dict(
@@ -94,9 +98,9 @@ def _row(weight, traj, seq_len):
     )
 
 
-def _trainer(monkeypatch, n_tasks, n_rows, supervised_rows):
+def _trainer(monkeypatch, n_tasks, n_rows, supervised_rows, micro=None):
     """``n_rows - n_tasks`` tasks condensed into two segments; the first ``supervised_rows``
-    rows carry weight. Returns the trainer, the balanced batch and the captured update calls."""
+    rows carry weight. Returns the trainer, the balanced batch, the captured update calls and the KV."""
     monkeypatch.setattr(main_ppo_sync, "KVBatchMeta", KVBatchMeta)
     monkeypatch.setattr(padding_utils, "KVBatchMeta", KVBatchMeta)
     kv = KV()
@@ -119,6 +123,7 @@ def _trainer(monkeypatch, n_tasks, n_rows, supervised_rows):
             "actor_rollout_ref": {
                 "actor": {
                     "ppo_mini_batch_size": MINI,
+                    "ppo_micro_batch_size_per_gpu": micro,
                     "ppo_epochs": 1,
                     "drop_unsupervised_rows": True,
                     "loss_agg_mode": "traj-mean-token-mean",
@@ -129,7 +134,7 @@ def _trainer(monkeypatch, n_tasks, n_rows, supervised_rows):
                     "data_loader_seed": 1,
                     "shuffle": True,
                 },
-                "rollout": {"n": 1, "temperature": 1.0},
+                "rollout": {"n": 1, "temperature": 1.0, "log_prob_micro_batch_size_per_gpu": micro},
             },
             "trainer": {"critic_warmup": 0},
         }
@@ -138,18 +143,21 @@ def _trainer(monkeypatch, n_tasks, n_rows, supervised_rows):
     trainer.global_steps = 1
     trainer.tokenizer = SimpleNamespace(eos_token_id=0)
     trainer._get_dp_size = lambda wg, role: DP
+    removed = []
+    trainer.replay_buffer = SimpleNamespace(removed=removed, remove=lambda partition_id, keys: removed.extend(keys))
     sent = []
     trainer.actor_rollout_wg = SimpleNamespace(update_actor=lambda b: sent.append(b) or {"metrics": {"mfu": 0.0}})
     batch = trainer._balance_batch(KVBatchMeta(keys=keys, tags=tags, partition_id="train"), metrics={})
-    return trainer, batch, sent
+    return trainer, batch, sent, kv
 
 
 CASES = [
-    # (tasks, rows, supervised rows) -> (rows after balance, mini-batch rows sent, supervised trajectories)
-    pytest.param(128, 128, 90, 128, 128, 90, id="no condensation, 90 hinted"),
-    pytest.param(128, 150, 100, 256, 128, 78, id="22 condensed, 100 hinted rows"),
-    pytest.param(128, 150, 130, 256, 256, 108, id="22 condensed, 130 hinted rows"),
-    pytest.param(128, 129, 129, 256, 256, 128, id="1 condensed, all 129 hinted"),
+    # (tasks, rows, supervised rows) -> (rows after balance, mini-batch rows sent, supervised trajectories);
+    # one mini-batch per step, so the padding only rounds each up to a multiple of dp
+    pytest.param(128, 128, 90, 128, 92, 90, id="no condensation, 90 hinted"),
+    pytest.param(128, 150, 100, 152, 100, 78, id="22 condensed, 100 hinted rows"),
+    pytest.param(128, 150, 130, 152, 132, 108, id="22 condensed, 130 hinted rows"),
+    pytest.param(128, 129, 129, 132, 132, 128, id="1 condensed, all 129 hinted"),
 ]
 
 
@@ -157,7 +165,7 @@ CASES = [
 def test_traj_mean_update_batch_is_one_mini_batch(
     monkeypatch, n_tasks, n_rows, supervised_rows, balanced, mini_rows, trajectories
 ):
-    trainer, batch, sent = _trainer(monkeypatch, n_tasks, n_rows, supervised_rows)
+    trainer, batch, sent, kv = _trainer(monkeypatch, n_tasks, n_rows, supervised_rows)
     assert len(batch) == balanced
     metrics = {}
     assert trainer._update_actor(batch, metrics) is batch
@@ -166,8 +174,14 @@ def test_traj_mean_update_batch_is_one_mini_batch(
     assert update_batch.extra_info["mini_batch_size"] == mini_rows, "one mini-batch per rank"
     assert update_batch.extra_info["mini_batch_size"] % DP == 0
     assert update_batch.extra_info["global_batch_size"] == trajectories
-    assert metrics["self_distillation/dropped_unsupervised_rows"] == balanced - supervised_rows
+    # real rows only: the balance's own padding is not a dropped row
+    assert metrics["self_distillation/dropped_unsupervised_rows"] == n_rows - supervised_rows
     assert "actor/skipped_update" not in metrics
+    # the drop's re-pad rows exist only in the update batch, and fit clears only the batch's keys
+    stray = [k for k in update_batch.keys if k not in set(batch.keys)]
+    assert len(stray) == mini_rows - supervised_rows
+    assert not any(k in kv.store for k in stray)
+    assert trainer.replay_buffer.removed == stray
 
 
 @pytest.mark.parametrize(
@@ -178,7 +192,7 @@ def test_traj_mean_update_batch_is_one_mini_batch(
     ],
 )
 def test_traj_mean_skips_the_update_without_supervision(monkeypatch, n_tasks, n_rows):
-    trainer, batch, sent = _trainer(monkeypatch, n_tasks, n_rows, supervised_rows=0)
+    trainer, batch, sent, _ = _trainer(monkeypatch, n_tasks, n_rows, supervised_rows=0)
     metrics = {}
     assert trainer._update_actor(batch, metrics) is batch
     assert sent == []
@@ -187,7 +201,7 @@ def test_traj_mean_skips_the_update_without_supervision(monkeypatch, n_tasks, n_
 
 def test_dropped_batch_is_length_balanced_across_dp(monkeypatch):
     """After the drop the padding rows are spread by _balance_batch, not stacked on the last rank."""
-    trainer, batch, sent = _trainer(monkeypatch, 128, 150, 100)
+    trainer, batch, sent, _ = _trainer(monkeypatch, 128, 150, 97)
     metrics = {}
     trainer._update_actor(batch, metrics)
     (update_batch,) = sent
@@ -196,6 +210,16 @@ def test_dropped_batch_is_length_balanced_across_dp(monkeypatch):
         sum(bool(t.get("is_padding", False)) for t in update_batch.tags[r * per_rank : (r + 1) * per_rank])
         for r in range(DP)
     ]
-    assert sum(padding_per_rank) == 28
-    assert max(padding_per_rank) < 28
+    assert sum(padding_per_rank) == 3
+    assert max(padding_per_rank) == 1
     assert metrics["update_seqlen/balanced_max"] - metrics["update_seqlen/balanced_min"] <= 4
+
+
+def test_the_multiple_follows_the_micro_batch_size(monkeypatch):
+    """Each rank's share has to split into whole micro-batches: dp x micro rows, not the mini-batch."""
+    trainer, batch, sent, _ = _trainer(monkeypatch, 128, 150, 100, micro=2)
+    assert len(batch) == 152
+    trainer._update_actor(batch, {})
+    (update_batch,) = sent
+    assert len(update_batch) == 104
+    assert (len(update_batch) // DP) % 2 == 0

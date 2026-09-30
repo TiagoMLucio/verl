@@ -412,6 +412,31 @@ def test_bool_rollout_is_threshold_is_rejected():
         )
 
 
+def test_a_padding_row_changes_no_metric():
+    """A dp padding row has no response token; the per-sequence stats used to read it as a sequence
+    with weight 0 and log-ppl 0 (seq_min 0, the ppl means halved)."""
+    generator = torch.Generator().manual_seed(0)
+    old_log_prob = -torch.rand(3, 6, generator=generator)
+    rollout_log_prob = old_log_prob + 0.05 * torch.randn(3, 6, generator=generator)
+    response_mask = torch.ones(3, 6)
+    response_mask[2] = 0
+
+    def metrics(rows):
+        return compute_rollout_correction_and_rejection_mask(
+            old_log_prob=old_log_prob[:rows],
+            rollout_log_prob=rollout_log_prob[:rows],
+            response_mask=response_mask[:rows],
+            rollout_is="token",
+            rollout_is_threshold=2.0,
+            rollout_rs=None,
+        )[2]
+
+    real, padded = metrics(2), metrics(3)
+    assert real.keys() == padded.keys()
+    for key in real:
+        assert padded[key] == pytest.approx(real[key], rel=1e-3, abs=1e-6), key
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Rollout Correction Test Suite")

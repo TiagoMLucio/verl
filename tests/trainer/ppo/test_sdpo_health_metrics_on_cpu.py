@@ -82,7 +82,8 @@ def test_empty_patch_after_source_edit_is_emitted_at_zero():
 
 def test_empty_patch_after_source_edit_reproduces_the_reference_run():
     """111 of the 8000 rollouts of the reference validation pass applied edits and still
-    produced an empty patch, all of them scored as ordinary wrong answers."""
+    produced an empty patch, all of them scored as ordinary wrong answers (counted under the
+    old applied-edits definition; the fraction arithmetic is what this pins)."""
     out = health.trajectory_timing_metrics(_timing_rows([1] * 111 + [0] * 7889))
     assert out["reward_health/empty_patch_after_source_edit_fraction"] == pytest.approx(0.0138750)
 

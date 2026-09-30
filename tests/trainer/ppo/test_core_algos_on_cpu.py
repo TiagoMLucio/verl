@@ -610,10 +610,6 @@ def test_agg_loss_traj_mean_token_mean_all_masked_is_finite():
     assert got == 0.0 and torch.isfinite(got)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 @pytest.mark.parametrize(
     "parts",
     [
@@ -640,3 +636,7 @@ def test_loss_quantiles_are_over_every_token_of_the_step(parts):
     assert out["self_distillation/loss_p50"] == pytest.approx(torch.quantile(every, 0.5).item(), rel=0.2)
     assert out["self_distillation/loss_p90"] == pytest.approx(torch.quantile(every, 0.9).item(), rel=0.2)
     assert not any("loss_hist" in key for key in out)
+
+
+if __name__ == "__main__":
+    unittest.main()
