@@ -133,6 +133,21 @@ def _token_count(tensor: torch.Tensor) -> int:
     return tensor.values().numel() if tensor.is_nested else tensor.numel()
 
 
+def _dp_fraction(numerator: float, denominator: float, dp_group) -> float:
+    """numerator / denominator summed over the dp group: only rank 0's metrics survive the collect."""
+    pair = torch.tensor([numerator, denominator], dtype=torch.float64, device=get_device_name())
+    if dp_group is not None:
+        torch.distributed.all_reduce(pair, group=dp_group)
+    return (pair[0] / pair[1].clamp(min=1)).item()
+
+
+def _sum_counts_over_mini_batches(metrics: dict, epochs: int) -> None:
+    """A '__sum' count adds across mini-batches like it does across micro-batches and ranks; the
+    trainer's reduce takes the mean of each list, so the step total is passed as a one-item list."""
+    for key in [k for k in metrics if k.endswith("__sum")]:
+        metrics[key] = [sum(metrics[key]) / max(epochs, 1)]
+
+
 class TrainingWorker(Worker, DistProfilerExtension):
     """
     TrainingWorker provides a Tinker-like API (https://thinkingmachines.ai/tinker/) as a RayWorkerGroup
@@ -387,6 +402,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
                                 else list(chain.from_iterable(val))
                             )
                     append_to_dict(metrics, output)
+                _sum_counts_over_mini_batches(metrics, epochs)
 
                 output = tu.get_tensordict(
                     tensor_dict={}, non_tensor_dict={"metrics": metrics, "did_update": did_update}
@@ -773,9 +789,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # full response grid, which the reward, the advantage and the IS metrics index
             truncate_rows_after_last_supervised_token(data)
             attach_response_keep_positions(data)
-            kept_tokens = torch.tensor(
-                [_token_count(data["responses"]), response_tokens], dtype=torch.float64, device=get_device_name()
-            )
+            kept_tokens = (_token_count(data["responses"]), response_tokens)
         # SDPO reads top-k and a logsumexp off the real logits, which the fused kernel
         # never materializes; span-only keeps this pass cheap anyway. Other loss modes
         # never read logits, so they keep the engine's configured fused setting
@@ -789,12 +803,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         output = self.actor.train_mini_batch(data=data)
         if kept_tokens is not None:
-            # only rank 0's metrics dict survives the dp collect, so the fraction is the global one
-            dp_group = self.actor.engine.get_data_parallel_group()
-            if dp_group is not None:
-                torch.distributed.all_reduce(kept_tokens, group=dp_group)
             metrics = tu.get_non_tensor_data(output, "metrics", default={})
-            metrics["self_distillation/kept_token_fraction"] = (kept_tokens[0] / kept_tokens[1].clamp(min=1)).item()
+            metrics["self_distillation/kept_token_fraction"] = _dp_fraction(
+                *kept_tokens, self.actor.engine.get_data_parallel_group()
+            )
         if self.sdpo_enabled and tu.get_non_tensor_data(output, "did_update", default=True):
             self._update_teacher_ema()
         return output.cpu() if output is not None else None

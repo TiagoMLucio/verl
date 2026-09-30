@@ -197,10 +197,13 @@ def make_batch(include_hinted=True, include_unhinted=True, loss_agg_mode="token-
     return tu.get_tensordict(tensor_dict=tensor_dict, non_tensor_dict=non_tensor_dict)
 
 
-def run_update(data, loss_agg_mode="token-mean"):
-    """Mirror ActorRolloutRefWorker.update_actor minus Ray/FSDP/TQ."""
+def run_update(data, loss_agg_mode="token-mean", dp_size=None):
+    """Mirror ActorRolloutRefWorker.update_actor minus Ray/FSDP/TQ; ``dp_size`` fakes the rank count the
+    loss is told, as if every rank held this same batch."""
     student_engine = make_engine(ToyLM(seed=0))
     student_engine.engine_config.forward_only = False
+    if dp_size is not None:
+        student_engine.get_data_parallel_size = lambda: dp_size
     teacher_engine = make_engine(ToyLM(seed=1))
 
     worker = SimpleNamespace(
@@ -353,6 +356,17 @@ def test_per_span_export_names_its_span_and_matches_the_batch_metrics(single_pro
     assert span["teacher_prefers_other_token"] == pytest.approx(
         metrics["self_distillation/teacher_prefers_other__sum"].aggregate() / tokens
     )
+
+
+def test_summed_counts_are_global_over_dp(single_process_group, cpu_ops):
+    """aggregate_dp averages SUM metrics over ranks, so each rank's '__sum' carries the dp factor:
+    two ranks holding this batch count its tokens twice, while the ratios stay what they were."""
+    one = run_update(make_batch(include_hinted=True, include_unhinted=True))[1]["metrics"]
+    two = run_update(make_batch(include_hinted=True, include_unhinted=True), dp_size=2)[1]["metrics"]
+    key = "self_distillation/supervised_tokens__sum"
+    assert two[key].aggregate() == 2 * one[key].aggregate()
+    ratio = "self_distillation/gap__sum"
+    assert two[ratio].aggregate() / two[key].aggregate() == pytest.approx(one[ratio].aggregate() / one[key].aggregate())
 
 
 def test_nothing_is_exported_without_supervision_or_row_ids(single_process_group, cpu_ops):
