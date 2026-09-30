@@ -32,7 +32,7 @@ from tqdm import tqdm
 from verl import DataProto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
-from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss, finalize_ratio_metrics
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -633,7 +633,9 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             with marked_timer("update_actor", timing_raw, color="red"):
                 actor_output = self._update_actor(batch)
 
-            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+            actor_output_metrics = finalize_ratio_metrics(
+                reduce_metrics(actor_output.meta_info["metrics"]), prefix="actor/"
+            )
             metrics.update(actor_output_metrics)
         return batch
 
