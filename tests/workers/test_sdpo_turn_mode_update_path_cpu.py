@@ -32,7 +32,7 @@ import torch.nn as nn
 import verl.workers.engine.fsdp.transformer_impl as transformer_impl
 import verl.workers.utils.losses as sdpo_losses
 import verl.workers.utils.padding as padding_mod
-from verl.trainer.ppo.core_algos import SDPO_SPAN_ROWS_KEY
+from verl.trainer.ppo.core_algos import SDPO_SPAN_ROWS_KEY, finalize_ratio_metrics
 from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META, SubRow, pack
 from verl.utils import tensordict_utils as tu
 from verl.utils.metric import Metric
@@ -347,7 +347,9 @@ def test_per_span_export_names_its_span_and_matches_the_batch_metrics(single_pro
     tokens = metrics["self_distillation/supervised_tokens__sum"].aggregate()
     assert tokens == span["supervised_tokens"]
     assert span["absgap_mean"] == pytest.approx(metrics["self_distillation/absgap__sum"].aggregate() / tokens, rel=1e-5)
-    assert span["loss_p50"] == pytest.approx(metrics["self_distillation/loss_p50__sum"].aggregate() / tokens, rel=1e-5)
+    summed = finalize_ratio_metrics({k: v.aggregate() for k, v in metrics.items() if k.endswith("__sum")})
+    # the step median is read off a histogram with bins 1.18x wide, the span's is exact
+    assert span["loss_p50"] == pytest.approx(summed["self_distillation/loss_p50"], rel=0.2)
     assert span["teacher_prefers_other_token"] == pytest.approx(
         metrics["self_distillation/teacher_prefers_other__sum"].aggregate() / tokens
     )

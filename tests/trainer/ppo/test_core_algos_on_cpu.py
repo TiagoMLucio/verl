@@ -468,7 +468,7 @@ def test_compute_self_distillation_loss_topk_and_masking():
         self_distillation_mask=zero_mask,
     )
     assert torch.allclose(loss_masked, torch.tensor(0.0, dtype=loss_masked.dtype, device=loss_masked.device))
-    assert metrics_masked["self_distillation/supervised_token_fraction"] == 0.0
+    assert finalize_ratio_metrics(metrics_masked)["self_distillation/supervised_token_fraction"] == 0.0
 
 
 def test_compute_self_distillation_loss_optional_is_clip():
@@ -612,3 +612,31 @@ def test_agg_loss_traj_mean_token_mean_all_masked_is_finite():
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [
+        [torch.rand(1, 400, generator=torch.Generator().manual_seed(0)) * 1e-3,
+         torch.rand(1, 50, generator=torch.Generator().manual_seed(1)) * 5.0],
+        # the rkl_token loss is signed: a median below zero must not read as the smallest edge
+        [-torch.rand(1, 300, generator=torch.Generator().manual_seed(2)) * 1e-2,
+         torch.rand(1, 100, generator=torch.Generator().manual_seed(3)) * 1e-2],
+    ],
+)
+def test_loss_quantiles_are_over_every_token_of_the_step(parts):
+    """Summed over micro-batches, the histogram gives the step's own quantiles, not a mean of
+    per-micro-batch ones: a heavy-tailed micro-batch must not pull the median up."""
+    from verl.trainer.ppo.core_algos import _distillation_signal_metrics
+
+    summed = {}
+    for loss in parts:
+        mask = torch.ones_like(loss)
+        zeros = torch.zeros_like(loss)
+        for key, value in _distillation_signal_metrics(loss, mask, zeros, zeros).items():
+            summed[key] = summed.get(key, 0.0) + value
+    out = finalize_ratio_metrics(summed)
+    every = torch.cat([p.flatten() for p in parts])
+    assert out["self_distillation/loss_p50"] == pytest.approx(torch.quantile(every, 0.5).item(), rel=0.2)
+    assert out["self_distillation/loss_p90"] == pytest.approx(torch.quantile(every, 0.9).item(), rel=0.2)
+    assert not any("loss_hist" in key for key in out)

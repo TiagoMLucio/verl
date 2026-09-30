@@ -1226,6 +1226,34 @@ def agg_loss(
     return loss
 
 
+#: Per-token loss histogram, log-spaced on both signs (rkl_token is signed), summed like the other pairs.
+_LOSS_HIST_MAGNITUDES = torch.logspace(-7, 2, 129, dtype=torch.float64)
+LOSS_HIST_EDGES = torch.cat([-_LOSS_HIST_MAGNITUDES.flip(0), _LOSS_HIST_MAGNITUDES])
+LOSS_HIST_KEYS = tuple(f"self_distillation/loss_hist_{i:03d}__sum" for i in range(len(LOSS_HIST_EDGES) + 1))
+
+
+def _hist_quantile(counts: list[float], q: float) -> float:
+    total = sum(counts)
+    if not total:
+        return 0.0
+    edges = LOSS_HIST_EDGES.tolist()
+    target, cum = q * total, 0.0
+    for i, count in enumerate(counts):
+        if count and cum + count >= target:
+            if i == 0:
+                return edges[0]
+            if i == len(edges):
+                return edges[-1]
+            lo, hi, frac = edges[i - 1], edges[i], (target - cum) / count
+            if lo > 0:
+                return lo * (hi / lo) ** frac
+            if hi < 0:
+                return -((-lo) * (hi / lo) ** frac)
+            return lo + (hi - lo) * frac
+        cum += count
+    return edges[-1]
+
+
 @torch.no_grad()
 def _distillation_signal_metrics(
     per_token_loss: torch.Tensor,
@@ -1248,11 +1276,10 @@ def _distillation_signal_metrics(
             "self_distillation/absgap__sum",
             "self_distillation/absgap_top_decile__sum",
             "self_distillation/teacher_higher__sum",
-            "self_distillation/loss_p50__sum",
-            "self_distillation/loss_p90__sum",
             "self_distillation/supervised_tokens__sum",
             "self_distillation/inert_rows__sum",
             "self_distillation/supervised_rows__sum",
+            *LOSS_HIST_KEYS,
         ),
         0.0,
     )
@@ -1280,13 +1307,13 @@ def _distillation_signal_metrics(
             "self_distillation/absgap__sum": absgap.sum().item(),
             "self_distillation/absgap_top_decile__sum": absgap[top_decile].sum().item(),
             "self_distillation/teacher_higher__sum": float((gap > 0).sum()),
-            # token-weighted so the ratio stays a per-token statistic after summing
-            "self_distillation/loss_p50__sum": torch.quantile(loss_q, 0.5).item() * n_tok,
-            "self_distillation/loss_p90__sum": torch.quantile(loss_q, 0.9).item() * n_tok,
             "self_distillation/supervised_tokens__sum": float(n_tok),
             "self_distillation/supervised_rows__sum": float(int(supervised_rows.sum())),
         }
     )
+    bins = torch.bucketize(loss_q.double().cpu(), LOSS_HIST_EDGES)
+    for i, count in enumerate(torch.bincount(bins, minlength=len(LOSS_HIST_KEYS)).tolist()):
+        out[LOSS_HIST_KEYS[i]] = float(count)
     if supervised_rows.any():
         rows = torch.nan_to_num(row_gap[supervised_rows], 0.0, 0.0, 0.0)
         out["self_distillation/inert_rows__sum"] = float(int((rows < inert_threshold).sum()))
@@ -1356,8 +1383,6 @@ SDPO_RATIO_METRICS = (
         "self_distillation/teacher_higher__sum",
         "self_distillation/supervised_tokens__sum",
     ),
-    ("self_distillation/loss_p50", "self_distillation/loss_p50__sum", "self_distillation/supervised_tokens__sum"),
-    ("self_distillation/loss_p90", "self_distillation/loss_p90__sum", "self_distillation/supervised_tokens__sum"),
     (
         "self_distillation/teacher_prefers_other_token",
         "self_distillation/teacher_prefers_other__sum",
@@ -1369,6 +1394,11 @@ SDPO_RATIO_METRICS = (
         "self_distillation/supervised_rows__sum",
     ),
     ("entropy_hinted_span", "entropy_hinted__sum", "entropy_hinted_tokens__sum"),
+    (
+        "self_distillation/supervised_token_fraction",
+        "self_distillation/supervised_tokens__sum",
+        "self_distillation/response_tokens__sum",
+    ),
 )
 
 
@@ -1380,6 +1410,11 @@ def finalize_ratio_metrics(metrics: dict, prefix: str = "") -> dict:
         if num is None or den is None:
             continue
         out[prefix + name] = float(num) / float(den) if den else 0.0
+    counts = [out.pop(prefix + key, None) for key in LOSS_HIST_KEYS]
+    if all(count is not None for count in counts):
+        counts = [float(count) for count in counts]
+        out[prefix + "self_distillation/loss_p50"] = _hist_quantile(counts, 0.5)
+        out[prefix + "self_distillation/loss_p90"] = _hist_quantile(counts, 0.9)
     tokens = out.get(prefix + "self_distillation/supervised_tokens__sum")
     if tokens is not None:
         out[prefix + "self_distillation/supervised_tokens"] = float(tokens)
@@ -1571,9 +1606,7 @@ def compute_self_distillation_loss(
             "self_distillation/full_logit_distillation": float(self_distillation_config.full_logit_distillation),
             "self_distillation/use_topk": float(self_distillation_config.distillation_topk is not None),
             "self_distillation/topk_value": float(self_distillation_config.distillation_topk or 0),
-            "self_distillation/supervised_token_fraction": (
-                loss_mask.sum() / response_mask.sum().clamp(min=1)
-            ).item(),
+            "self_distillation/response_tokens__sum": float(response_mask.sum()),
             "self_distillation/variant_code": {
                 "rkl_token": 3.0,
                 "full_logit_topk": 1.0,

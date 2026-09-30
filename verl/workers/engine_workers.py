@@ -129,6 +129,10 @@ def _trace_mini_batch_groups(batch_idx: int, mini_batch_td) -> None:
     )
 
 
+def _token_count(tensor: torch.Tensor) -> int:
+    return tensor.values().numel() if tensor.is_nested else tensor.numel()
+
+
 class TrainingWorker(Worker, DistProfilerExtension):
     """
     TrainingWorker provides a Tinker-like API (https://thinkingmachines.ai/tinker/) as a RayWorkerGroup
@@ -762,12 +766,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         from verl.utils.debug_breakpoints import should_break
         if should_break("update_actor"): breakpoint()
 
-        kept_token_fraction = None
+        kept_tokens = None
         if self.sdpo_enabled:
+            response_tokens = _token_count(data["responses"])
             # the update pass only: compute_log_prob writes old_log_probs and entropy back on the
             # full response grid, which the reward, the advantage and the IS metrics index
-            kept_token_fraction = truncate_rows_after_last_supervised_token(data)
+            truncate_rows_after_last_supervised_token(data)
             attach_response_keep_positions(data)
+            kept_tokens = torch.tensor(
+                [_token_count(data["responses"]), response_tokens], dtype=torch.float64, device=get_device_name()
+            )
         # SDPO reads top-k and a logsumexp off the real logits, which the fused kernel
         # never materializes; span-only keeps this pass cheap anyway. Other loss modes
         # never read logits, so they keep the engine's configured fused setting
@@ -780,9 +788,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             tu.assign_non_tensor(data, chunked_distill_topk=self._chunked_distill_topk())
 
         output = self.actor.train_mini_batch(data=data)
-        if kept_token_fraction is not None:
+        if kept_tokens is not None:
+            # only rank 0's metrics dict survives the dp collect, so the fraction is the global one
+            dp_group = self.actor.engine.get_data_parallel_group()
+            if dp_group is not None:
+                torch.distributed.all_reduce(kept_tokens, group=dp_group)
             metrics = tu.get_non_tensor_data(output, "metrics", default={})
-            metrics["self_distillation/kept_token_fraction"] = kept_token_fraction
+            metrics["self_distillation/kept_token_fraction"] = (kept_tokens[0] / kept_tokens[1].clamp(min=1)).item()
         if self.sdpo_enabled and tu.get_non_tensor_data(output, "did_update", default=True):
             self._update_teacher_ema()
         return output.cpu() if output is not None else None

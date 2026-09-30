@@ -1812,7 +1812,9 @@ class RayPPOTrainer:
                         with marked_timer("update_weights", timing_raw, color="red"):
                             self.checkpoint_manager.update_weights(self.global_steps)
 
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        actor_output_metrics = core_algos.finalize_ratio_metrics(
+                            reduce_metrics(actor_output.meta_info["metrics"]), prefix="actor/"
+                        )
                         metrics.update(actor_output_metrics)
 
                     # Log rollout generations if enabled

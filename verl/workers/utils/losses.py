@@ -348,8 +348,9 @@ def sdpo_ppo_loss(
 
     # records, not a scalar: they ride the metrics dict out of the update untouched
     span_rows = metrics.pop(SDPO_SPAN_ROWS_KEY, None)
-    # '__sum' pairs must add across micro-batches; everything else is a per-micro-batch mean
-    summed = {k: v for k, v in metrics.items() if k.endswith("__sum")}
+    # '__sum' pairs must add across micro-batches; everything else is a per-micro-batch mean.
+    # aggregate_dp averages SUM metrics over ranks, so the dp factor restores the global count
+    summed = {k: v * data["dp_size"] for k, v in metrics.items() if k.endswith("__sum")}
     metrics = Metric.from_dict(
         {k: v for k, v in metrics.items() if not k.endswith("__sum")}, aggregation=AggregationType.MEAN
     )
