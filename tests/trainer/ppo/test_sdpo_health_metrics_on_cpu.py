@@ -14,7 +14,7 @@
 """The health metrics that must read something while a run is healthy.
 
 The per-reason exit keys only exist once that reason has fired, so nothing charts or alerts at
-zero. ``harness_abort_fraction`` and ``work_lost_fraction`` are the two that have to be there
+zero. ``harness_abort_fraction`` and ``empty_patch_after_source_edit_fraction`` are the two that have to be there
 before the bad thing happens.
 """
 
@@ -64,31 +64,46 @@ def test_a_batch_with_no_reason_at_all_still_reports_the_fraction():
     assert health.condensation_metrics(fields, scores, 1.0)["rollout/harness_abort_fraction"] == 0.0
 
 
-def _timing_rows(work_lost):
-    return [{"segment_index": 0, "timings": {"loop_wall": 1.0, "empty_patch": float(w), "work_lost": float(w)}}
-            for w in work_lost]
+def _timing_rows(lost):
+    return [{"segment_index": 0, "timings": {"loop_wall": 1.0, "empty_patch": float(w), "empty_patch_after_source_edit": float(w)}}
+            for w in lost]
 
 
-def test_work_lost_joins_the_reward_health_family():
+def test_empty_patch_after_source_edit_joins_the_reward_health_family():
     out = health.trajectory_timing_metrics(_timing_rows([1, 0, 0, 0]))
-    assert out["reward_health/work_lost_fraction"] == 0.25
+    assert out["reward_health/empty_patch_after_source_edit_fraction"] == 0.25
     assert out["reward_health/empty_patch_fraction"] == 0.25
 
 
-def test_work_lost_is_emitted_at_zero():
+def test_empty_patch_after_source_edit_is_emitted_at_zero():
     out = health.trajectory_timing_metrics(_timing_rows([0, 0]))
-    assert out["reward_health/work_lost_fraction"] == 0.0
+    assert out["reward_health/empty_patch_after_source_edit_fraction"] == 0.0
 
 
-def test_work_lost_reproduces_the_reference_run():
+def test_empty_patch_after_source_edit_reproduces_the_reference_run():
     """111 of the 8000 rollouts of the reference validation pass applied edits and still
     produced an empty patch, all of them scored as ordinary wrong answers."""
     out = health.trajectory_timing_metrics(_timing_rows([1] * 111 + [0] * 7889))
-    assert out["reward_health/work_lost_fraction"] == pytest.approx(0.0138750)
+    assert out["reward_health/empty_patch_after_source_edit_fraction"] == pytest.approx(0.0138750)
 
 
 def test_a_run_that_never_measured_it_reports_nothing():
     """Absent means never measured, not healthy: a rollout whose reward never ran must not
     read as one that lost no work."""
     rows = [{"segment_index": 0, "timings": {"loop_wall": 1.0}}]
-    assert "reward_health/work_lost_fraction" not in health.trajectory_timing_metrics(rows)
+    assert "reward_health/empty_patch_after_source_edit_fraction" not in health.trajectory_timing_metrics(rows)
+
+
+def test_a_sandbox_that_never_came_up_counts_in_the_setup_rate_not_the_timings():
+    ran = [{"segment_index": 0, "timings": {"loop_wall": 2.0, "agent/setup_attempts": float(a),
+                                            "agent/setup_retried": float(a > 1)}} for a in (1, 2)]
+    dead = [{"segment_index": 0, "timings": {"agent/setup_attempts": 3.0, "agent/setup_retried": 1.0}}]
+    out = health.trajectory_timing_metrics(ran + dead)
+    assert out["agent_loop/setup_retried_mean"] == pytest.approx(2 / 3)
+    assert out["agent_loop/setup_attempts_max"] == 3.0
+    assert out["traj_time/loop_wall_mean"] == 2.0
+    # no generate call reported a preemption count, so nothing reads as an engine that did not report
+    assert "rollout/preempted_reported_fraction" not in out
+    only_dead = health.trajectory_timing_metrics(dead)
+    assert only_dead == {"agent_loop/setup_attempts_mean": 3.0, "agent_loop/setup_attempts_max": 3.0,
+                         "agent_loop/setup_retried_mean": 1.0, "agent_loop/setup_retried_max": 1.0}

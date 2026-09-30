@@ -31,7 +31,7 @@ AGENT_METRIC_PREFIX = "agent/"
 #: below only exist once that reason has fired, so a healthy run has nothing to chart or alert
 #: on. ``unknown_error`` stays out of it, being what the loop could not classify at all.
 HARNESS_ABORT_REASONS = frozenset(
-    {"setup_timeout", "agent_loop_failed", "terminal_dead", "timeout_budget_exhausted"}
+    {"setup_timeout", "agent_loop_failed", "terminal_dead", "timeout_budget_exhausted", "no_response"}
 )
 
 
@@ -117,12 +117,26 @@ def trajectory_timing_metrics(extra_fields: list[dict]) -> dict:
     """Per-trajectory time split. The residual (loop_wall minus the parts) is the in-loop
     overhead we have not attributed yet; step wall clock is set by the slowest trajectory,
     so the max matters more than the mean."""
-    rows = [ef.get("timings") or {} for ef in extra_fields if int(ef.get("segment_index", 0) or 0) == 0]
-    rows = [t for t in rows if t.get("loop_wall")]
-    if not rows:
-        return {}
-    parts = ("generate_sequences", "tool_calls", "condense", "parse_action", "tokenize_observations")
+    all_rows = [ef.get("timings") or {} for ef in extra_fields if int(ef.get("segment_index", 0) or 0) == 0]
     out = {}
+    # over every trajectory that reports the key: a sandbox that never came up has no loop_wall
+    for key in (
+        "eval_completed", "patch_apply_failed", "empty_patch", "empty_patch_after_source_edit",
+        "reflect_failed", "reflect_empty",
+    ):
+        vals = [float(t[key]) for t in all_rows if key in t]  # absent means never measured, not OK
+        if vals:
+            out[f"reward_health/{key}_fraction"] = sum(vals) / len(vals)
+    # both readings, since which one a forwarded metric wants is knowledge this side does not have
+    for key in sorted({k for t in all_rows for k in t if k.startswith(AGENT_METRIC_PREFIX)}):
+        vals = [float(t[key]) for t in all_rows if key in t]
+        name = key[len(AGENT_METRIC_PREFIX):]
+        out[f"agent_loop/{name}_mean"] = sum(vals) / len(vals)
+        out[f"agent_loop/{name}_max"] = max(vals)
+    rows = [t for t in all_rows if t.get("loop_wall")]
+    if not rows:
+        return out
+    parts = ("generate_sequences", "tool_calls", "condense", "parse_action", "tokenize_observations")
     for key in parts + ("loop_wall", "env_setup", "reward_eval", "reflect"):
         vals = [float(t.get(key, 0.0)) for t in rows]
         out[f"traj_time/{key}_mean"] = sum(vals) / len(vals)
@@ -138,10 +152,12 @@ def trajectory_timing_metrics(extra_fields: list[dict]) -> dict:
     ]
     # vLLM preemption count per trajectory: >0 means the KV cache could not hold the
     # working set, so sequences were evicted and their prefill recomputed (wasted GPU
-    # work that shows up as high utilization with low goodput). -1 = engine did not report.
-    preempted = [float(t.get("num_preempted", -1)) for t in rows]
+    # work that shows up as high utilization with low goodput). -1 = engine did not report;
+    # absent = no generate call at all (a prompt already over the budget), which says nothing
+    preempted = [float(t["num_preempted"]) for t in rows if "num_preempted" in t]
     reported = [p for p in preempted if p >= 0]
-    out["rollout/preempted_reported_fraction"] = len(reported) / len(preempted)
+    if preempted:
+        out["rollout/preempted_reported_fraction"] = len(reported) / len(preempted)
     if reported:
         out["rollout/preempted_mean"] = sum(reported) / len(reported)
         out["rollout/preempted_max"] = max(reported)
@@ -158,18 +174,6 @@ def trajectory_timing_metrics(extra_fields: list[dict]) -> dict:
     for key in parts + ("loop_wall", "env_setup", "reward_eval", "reflect"):
         out[f"traj_time/slowest_{key}"] = float(slowest.get(key, 0.0))
     out["traj_time/unattributed_share"] = sum(residual) / max(sum(totals), 1e-6)
-    for key in (
-        "eval_completed", "patch_apply_failed", "empty_patch", "work_lost", "reflect_failed", "reflect_empty"
-    ):
-        vals = [float(t[key]) for t in rows if key in t]  # absent means never measured, not OK
-        if vals:
-            out[f"reward_health/{key}_fraction"] = sum(vals) / len(vals)
-    # both readings, since which one a forwarded metric wants is knowledge this side does not have
-    for key in sorted({k for t in rows for k in t if k.startswith(AGENT_METRIC_PREFIX)}):
-        vals = [float(t[key]) for t in rows if key in t]
-        name = key[len(AGENT_METRIC_PREFIX):]
-        out[f"agent_loop/{name}_mean"] = sum(vals) / len(vals)
-        out[f"agent_loop/{name}_max"] = max(vals)
     capped = [float(t.get("capped_turns", 0.0)) for t in rows]
     out["reward_health/capped_turns_mean"] = sum(capped) / len(capped)
     out["reward_health/capped_rollouts_fraction"] = sum(1.0 for c in capped if c > 0) / len(capped)

@@ -116,8 +116,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     advantages = batch.batch["advantages"]
     returns = batch.batch["returns"]
 
-    max_prompt_length = batch.batch["prompts"].shape[-1]
-    max_response_length = batch.batch["responses"].shape[-1]
+    # a batch padded to its own longest row would call that row clipped: the caller's caps win
+    max_prompt_length = batch.meta_info.get("max_prompt_length", batch.batch["prompts"].shape[-1])
+    max_response_length = batch.meta_info.get("max_response_length", batch.batch["responses"].shape[-1])
 
     response_mask = batch.batch["response_mask"].bool()
 

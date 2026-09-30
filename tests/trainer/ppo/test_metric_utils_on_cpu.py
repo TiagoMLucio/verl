@@ -317,6 +317,15 @@ class TestComputeDataMetrics(unittest.TestCase):
             ),
             "values": torch.tensor([[0.9, 1.0], [1.1, 1.2]]),
         }
+        self.batch.meta_info = {}
+
+    def test_clip_ratio_reads_the_configured_caps(self):
+        """Padded to its own longest row, every row reads as clipped; the caps say none is."""
+        self.assertEqual(compute_data_metrics(self.batch, use_critic=False)["response_length/clip_ratio"], 1.0)
+        self.batch.meta_info = {"max_prompt_length": 4, "max_response_length": 4}
+        metrics = compute_data_metrics(self.batch, use_critic=False)
+        self.assertEqual(metrics["response_length/clip_ratio"], 0.0)
+        self.assertEqual(metrics["prompt_length/clip_ratio"], 0.0)
 
     def test_compute_data_metrics_with_critic(self):
         """Test compute_data_metrics with critic enabled."""

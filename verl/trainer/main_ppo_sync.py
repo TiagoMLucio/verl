@@ -1443,7 +1443,16 @@ class PPOTrainer:
             required_multiple = math.lcm(required_multiple, critic_global_mini_batch_size)
 
         # If there is an actor update, the batch should align with actor PPO mini-batches too.
-        if self.config.trainer.critic_warmup <= self.global_steps:
+        # traj-mean is one mini-batch per step (ActorConfig.validate): each rank only splits into micro-batches
+        arr = self.config.actor_rollout_ref
+        if arr.actor.get("loss_agg_mode") == "traj-mean-token-mean":
+            if not arr.actor.get("use_dynamic_bsz", False):
+                micro = (
+                    arr.actor.get("ppo_micro_batch_size_per_gpu"),
+                    arr.rollout.get("log_prob_micro_batch_size_per_gpu"),
+                )
+                required_multiple = math.lcm(required_multiple, dp_size * math.lcm(*(m for m in micro if m)))
+        elif self.config.trainer.critic_warmup <= self.global_steps:
             actor_global_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
             actor_global_mini_batch_size *= self.config.actor_rollout_ref.rollout.n
             required_multiple = math.lcm(required_multiple, actor_global_mini_batch_size)
@@ -1680,7 +1689,9 @@ class PPOTrainer:
         weights = (weights.to_padded_tensor(0.0) if weights.is_nested else weights).reshape(len(batch.keys), -1)
         supervised = [bool(w.abs().sum() > 0) for w in weights.unbind()]
         kept = sum(supervised)
-        metrics["self_distillation/dropped_unsupervised_rows"] = len(supervised) - kept
+        metrics["self_distillation/dropped_unsupervised_rows"] = sum(
+            not keep and not tag.get("is_padding", False) for keep, tag in zip(supervised, batch.tags, strict=True)
+        )
         if kept == 0 or kept == len(supervised):
             return batch
 
@@ -1749,6 +1760,12 @@ class PPOTrainer:
         update_batch.extra_info.update(extra_info)
 
         output: TensorDict = self.actor_rollout_wg.update_actor(update_batch)
+        # the drop's re-padding put rows only update_batch holds; fit clears batch.keys alone
+        own = set(batch.keys)
+        stray = [k for k in update_batch.keys if k not in own]
+        if stray:
+            tq.kv_clear(keys=stray, partition_id=batch.partition_id)
+            self.replay_buffer.remove(batch.partition_id, stray)
         output = rename_dict(output["metrics"], "actor/")
         self._sdpo_span_rows = output.pop("actor/" + core_algos.SDPO_SPAN_ROWS_KEY, [])
         output["perf/mfu/actor"] = output.pop("actor/mfu")
@@ -1803,7 +1820,12 @@ class PPOTrainer:
             data["token_level_rewards"] = data["rm_scores"]
         data["prompt_length"] = prompt_length.float()
         data["response_length"] = response_length.float()
-        batch = DataProto(batch=data, meta_info={"global_token_num": global_token_num})
+        # the row builder truncates at these, so a clipped row's length equals its cap
+        caps = {
+            "max_prompt_length": self.config.actor_rollout_ref.rollout.prompt_length,
+            "max_response_length": self.config.actor_rollout_ref.rollout.response_length,
+        }
+        batch = DataProto(batch=data, meta_info={"global_token_num": global_token_num, **caps})
         metrics_batch = batch.select_idxs(non_padding_mask) if non_padding_mask.any() else batch
 
         # 2. compute metrics
@@ -1824,6 +1846,7 @@ class PPOTrainer:
         gen_s = timing_raw.get("gen")
         if gen_tokens and gen_s:
             metrics["perf/gen_tokens_per_s"] = gen_tokens / gen_s / max(n_gpus, 1)
+            metrics["timing_per_token_ms/gen"] = gen_s * 1000 / gen_tokens
 
         # 3. other auxiliary metrics
         if non_padding_mask.any():
