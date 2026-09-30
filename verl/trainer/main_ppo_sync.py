@@ -939,6 +939,7 @@ class PPOTrainer:
         sample_turns = []
         sample_exit_reasons = []
         data_sources = []
+        uid_to_band: dict[str, Optional[str]] = {}
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
         dump_all_inputs: list[str] = []
         dump_all_outputs: list[str] = []
@@ -954,6 +955,8 @@ class PPOTrainer:
             batch_dict["uid"] = np.array(
                 [str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object
             )
+            for uid, extra_info in zip(batch_dict["uid"], batch_dict.get("extra_info", [None] * n_prompts)):
+                uid_to_band[uid] = extra_info.get("val_band") if isinstance(extra_info, dict) else None
             batch = tu.get_tensordict(batch_dict)
             tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
             tu.assign_non_tensor_data(batch, "validate", True)
@@ -1083,7 +1086,13 @@ class PPOTrainer:
                 dump_path=val_data_dir,
             )
 
-        return health.validation_metrics(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        return health.validation_metrics(
+            data_sources,
+            sample_uids,
+            reward_extra_infos_dict,
+            sample_turns,
+            sample_bands=[uid_to_band.get(uid) for uid in sample_uids],
+        )
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""

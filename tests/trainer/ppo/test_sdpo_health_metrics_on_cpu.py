@@ -108,3 +108,24 @@ def test_a_sandbox_that_never_came_up_counts_in_the_setup_rate_not_the_timings()
     only_dead = health.trajectory_timing_metrics(dead)
     assert only_dead == {"agent_loop/setup_attempts_mean": 3.0, "agent_loop/setup_attempts_max": 3.0,
                          "agent_loop/setup_retried_mean": 1.0, "agent_loop/setup_retried_max": 1.0}
+
+
+def _val(bands):
+    uids = [f"u{i // 2}" for i in range(len(bands))]  # two draws per task
+    rewards = [1.0, 0.0, 1.0, 1.0, 0.0, 0.0][: len(bands)]
+    return ["v128"] * len(bands), uids, {"reward": rewards}, [3] * len(bands), bands
+
+
+def test_a_band_splits_its_source_next_to_the_total():
+    out = health.validation_metrics(*_val(["mid", "mid", "likely", "likely", "rare", "rare"]))
+    assert out["val-core/v128/reward/mean@2"] == pytest.approx(0.5)
+    assert out["val-core/v128_mid/reward/mean@2"] == 0.5
+    assert out["val-core/v128_likely/reward/mean@2"] == 1.0
+    assert out["val-core/v128_rare/reward/mean@2"] == 0.0
+    assert "val-core/all/reward/mean@2" not in out
+
+
+def test_rows_without_a_band_log_only_their_source():
+    out = health.validation_metrics(*_val([None] * 4))
+    assert not any("v128_" in key for key in out)
+    assert out["val-core/v128/reward/mean@2"] == 0.75

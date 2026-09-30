@@ -180,12 +180,24 @@ def trajectory_timing_metrics(extra_fields: list[dict]) -> dict:
     return out
 
 
-def validation_metrics(data_sources, sample_uids, reward_extra_infos_dict, sample_turns) -> dict[str, float]:
+def validation_metrics(
+    data_sources, sample_uids, reward_extra_infos_dict, sample_turns, sample_bands=None
+) -> dict[str, float]:
     data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
     # with multiple sources (e.g. difficulty bands) also log the combined total under "all"
     if len(set(data_sources)) > 1:
         merged = process_validation_metrics(["all"] * len(data_sources), sample_uids, reward_extra_infos_dict)
         data_src2var2metric2val.update(merged)
+    # a row's extra_info.val_band splits its source further, next to the source's own total
+    banded = [i for i, band in enumerate(sample_bands or []) if band is not None]
+    if banded:
+        data_src2var2metric2val.update(
+            process_validation_metrics(
+                [f"{data_sources[i]}_{sample_bands[i]}" for i in banded],
+                [sample_uids[i] for i in banded],
+                {key: [values[i] for i in banded] for key, values in reward_extra_infos_dict.items()},
+            )
+        )
     metric_dict = {}
     for data_source, var2metric2val in data_src2var2metric2val.items():
         core_var = "acc" if "acc" in var2metric2val else "reward"
