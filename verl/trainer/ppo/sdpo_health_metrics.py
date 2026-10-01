@@ -180,6 +180,32 @@ def trajectory_timing_metrics(extra_fields: list[dict]) -> dict:
     return out
 
 
+def turn_entropy_metrics(entropy, response_mask, extra_fields, is_padding) -> dict[str, float]:
+    """The student's entropy per turn, from the log-prob pass before the update, over every turn
+    and over the hinted ones: as a mean of per-turn means (every turn counts once) and token-weighted.
+    ``entropy``/``response_mask`` are padded [rows, response]; only the model's tokens count."""
+    turns, hinted = [], []  # (entropy sum, model tokens) per turn
+    for row, ef in enumerate(extra_fields):
+        if is_padding[row] or not isinstance(ef, dict):
+            continue
+        hinted_steps = {int(entry[0]) for entry in (ef.get("turn_hints") or [])}
+        for step, start, end in ef.get("turn_spans") or []:
+            mask = response_mask[row, int(start):int(end)].bool()
+            tokens = int(mask.sum())
+            if not tokens:
+                continue
+            pair = (float(entropy[row, int(start):int(end)][mask].sum()), tokens)
+            turns.append(pair)
+            if int(step) in hinted_steps:
+                hinted.append(pair)
+    out = {}
+    for suffix, pairs in (("", turns), ("_hinted", hinted)):
+        if pairs:
+            out["actor/entropy_per_turn" + suffix] = sum(s / n for s, n in pairs) / len(pairs)
+            out["actor/entropy_per_token" + suffix] = sum(s for s, _ in pairs) / sum(n for _, n in pairs)
+    return out
+
+
 def validation_metrics(
     data_sources, sample_uids, reward_extra_infos_dict, sample_turns, sample_bands=None, sample_exit_reasons=None
 ) -> dict[str, float]:

@@ -125,6 +125,29 @@ def test_a_band_splits_its_source_next_to_the_total():
     assert "val-core/all/reward/mean@2" not in out
 
 
+def test_turn_entropy_counts_model_tokens_per_turn_and_skips_padding():
+    import torch
+
+    entropy = torch.tensor([[1, 1, 1, 9, 2, 4, 6, 9, 9, 9],
+                            [5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+                            [3, 3, 0, 0, 0, 0, 0, 0, 0, 0]], dtype=torch.float32)
+    mask = torch.tensor([[1, 1, 1, 0, 1, 1, 1, 0, 0, 0],
+                         [1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+                         [1, 1, 0, 0, 0, 0, 0, 0, 0, 0]])
+    extra = [{"turn_spans": [[0, 0, 4], [1, 4, 10]], "turn_hints": [[1, "h"]]},
+             {"turn_spans": [[0, 0, 10]], "turn_hints": [[0, "h"]]},  # a padding row
+             {"turn_spans": [[0, 0, 2]], "turn_hints": []}]
+    out = health.turn_entropy_metrics(entropy, mask, extra, [False, True, False])
+    # turns (model tokens only): mean 1 over 3, mean 4 over 3 (hinted), mean 3 over 2
+    assert out == pytest.approx({
+        "actor/entropy_per_turn": (1 + 4 + 3) / 3,
+        "actor/entropy_per_token": (3 + 12 + 6) / 8,
+        "actor/entropy_per_turn_hinted": 4.0,
+        "actor/entropy_per_token_hinted": 4.0,
+    })
+    assert health.turn_entropy_metrics(entropy, mask, [{}, {}, {}], [False] * 3) == {}
+
+
 def test_val_exit_reasons_are_fractions_of_the_samples_that_report_one():
     sources, uids, infos, turns, bands = _val([None] * 4)
     out = health.validation_metrics(sources, uids, infos, turns, bands,

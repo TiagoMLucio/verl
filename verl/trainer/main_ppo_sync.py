@@ -1549,6 +1549,16 @@ class PPOTrainer:
             # "perf/mfu/actor_infer": old_log_prob_mfu,
         }
         metrics.update(old_log_prob_metrics)
+        try:  # a metric must not take the step down: without turn spans there is nothing to report
+            got = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=["extra_fields"])
+            extra_fields = got["extra_fields"]
+            extra_fields = extra_fields.tolist() if hasattr(extra_fields, "tolist") else list(extra_fields)
+            metrics.update(health.turn_entropy_metrics(
+                data.batch["entropy"], data.batch["response_mask"], extra_fields,
+                [tag.get("is_padding", False) for tag in batch.tags],
+            ))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"turn entropy metrics unavailable: {e}")
 
         # 4. calculate rollout vs actor logprobs diff
         if self.config.actor_rollout_ref.rollout.calculate_log_probs:
