@@ -1053,6 +1053,13 @@ def _trace_lm_head(logits_rmpad, keep_idx, output_args, input_ids) -> None:
     )
 
 
+def _is_unit_temperature(temperature) -> bool:
+    """Whether dividing the logits by ``temperature`` is a no-op; a host scalar answers without a device sync."""
+    if isinstance(temperature, torch.Tensor):
+        return bool((temperature == 1).all())
+    return float(temperature) == 1.0
+
+
 @EngineRegistry.register(model_type="language_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
 class FSDPEngineWithLMHead(FSDPEngine):
     def prepare_model_inputs(self, micro_batch: TensorDict):
@@ -1168,6 +1175,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 output_args["input_ids_rmpad_rolled"] = input_ids_rmpad_rolled
                 # we store the per sample temperature
                 output_args["temperature"] = temperature
+                output_args["temperature_is_one"] = _is_unit_temperature(temperature_item)
 
                 input_ids = torch.nested.to_padded_tensor(
                     input_ids, padding=pad_token_id, output_size=(batch_size, max_seq_len)
@@ -1476,10 +1484,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
             )  # (n_keep_total, vocab)
 
             # per-position temperature, restricted to the kept positions
-            temperature_keep = (
-                output_args["temperature"].repeat_interleave(cu_seqlens.diff())[keep_idx]
-            )
-            logits_rmpad = logits_rmpad / temperature_keep.clamp(min=1e-8).unsqueeze(-1).to(logits_rmpad.dtype)
+            if not output_args.get("temperature_is_one", False):
+                temperature_keep = output_args["temperature"].repeat_interleave(cu_seqlens.diff())[keep_idx]
+                logits_rmpad = logits_rmpad / temperature_keep.clamp(min=1e-8).unsqueeze(-1).to(logits_rmpad.dtype)
 
             labels_keep = output_args["input_ids_rmpad_rolled"][keep_idx]
             log_probs = logprobs_from_logits(
@@ -1550,7 +1557,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 scale = temperature.clamp(min=1e-8).to(logits.dtype)
                 # SFT runs at temperature 1: dividing would rewrite the whole
                 # (tokens x 248k vocab) tensor to no effect
-                if not bool((scale == 1).all()):
+                if not output_args.get("temperature_is_one", False):
                     logits.div_(scale)
 
                 if calculate_sum_pi_squared:
