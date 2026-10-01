@@ -256,6 +256,20 @@ def test_all_unhinted_micro_batch_is_a_finite_noop(single_process_group, cpu_ops
     assert sum(g.abs().sum() for g in grads) == 0, "un-hinted rows must contribute zero gradient"
 
 
+def test_only_a_forward_only_pass_returns_model_output(single_process_group, cpu_ops):
+    """The update releases each micro-batch's outputs after its backward; the loss, the metrics
+    and the span records still come back."""
+    data = make_batch(include_hinted=True, include_unhinted=True)
+    student_engine, outputs = run_update(data)
+    assert outputs["model_output"] == {}
+    assert len(outputs["loss"]) == len(data)
+    assert "actor/pg_loss" in outputs["metrics"] and SDPO_SPAN_ROWS_KEY in outputs["metrics"]
+
+    tu.assign_non_tensor(data, distillation_use_topk=False)
+    inferred = student_engine.forward_backward_batch(data, None, forward_only=True)
+    assert inferred["model_output"]["log_probs"].shape[0] == len(data)
+
+
 def _pg_loss(outputs):
     metric = outputs["metrics"]["actor/pg_loss"]
     return sum(float(m.aggregate()) for m in (metric if isinstance(metric, list) else [metric]))

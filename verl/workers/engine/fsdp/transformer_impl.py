@@ -705,6 +705,8 @@ class FSDPEngine(BaseEngine):
                     if traced:
                         bwd_peak = take_peak()
                         trace_file.emit("update/bwd", bwd_start, time.time(), **_gb_args("peak", bwd_peak))
+                    # train_batch drops model_output; kept, every micro-batch's outputs would pile up to the end
+                    meta_info.pop("model_output", None)
 
             if traced:
                 trace_file.emit(
