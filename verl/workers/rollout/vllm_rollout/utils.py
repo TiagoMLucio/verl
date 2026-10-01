@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import ctypes
+import dataclasses
+import functools
 import json
 import logging
 import os
@@ -344,6 +346,26 @@ class SuppressSignalInThread:
         signal.signal = self.original_signal
 
 
+@functools.lru_cache(maxsize=1)
+def _optional_bool_vllm_args() -> set[str]:
+    """Return boolean engine fields for which omitting False changes semantics.
+
+    For such fields an omitted flag leaves the None default, which vLLM can
+    resolve to True at engine-config time (e.g. `enable_prefix_caching`), so
+    an explicit False must be serialized as `--no-<flag>` instead of being
+    dropped. Some vLLM versions annotate delayed-default fields as plain bool
+    despite a None default (e.g. enable_flashinfer_autotune in 0.26). Plain
+    bool fields defaulting to True also require an explicit negative flag.
+    """
+    from vllm.engine.arg_utils import AsyncEngineArgs
+
+    return {
+        f.name
+        for f in dataclasses.fields(AsyncEngineArgs)
+        if set(get_args(f.type)) == {bool, type(None)} or (f.type is bool and (f.default is None or f.default is True))
+    }
+
+
 def build_cli_args_from_config(config: dict[str, Any]) -> list[str]:
     """
     Convert a config dictionary to CLI arguments for vLLM server.
@@ -351,7 +373,8 @@ def build_cli_args_from_config(config: dict[str, Any]) -> list[str]:
     Handles different value types appropriately:
     - None: skipped
     - bool True: adds '--key'
-    - bool False: skipped
+    - bool False: adds '--no-key' for optional boolean engine args or plain
+      boolean engine args defaulting to None/True, otherwise skipped
     - list: expands to '--key item1 item2 ...'
     - empty list: skipped (vLLM uses nargs="+" which requires at least one value)
     - dict: JSON serialized
@@ -370,6 +393,9 @@ def build_cli_args_from_config(config: dict[str, Any]) -> list[str]:
         if isinstance(v, bool):
             if v:
                 cli_args.append(f"--{k}")
+            elif k.replace("-", "_") in _optional_bool_vllm_args():
+                # Omission may preserve True or resolve a delayed None to True.
+                cli_args.append(f"--no-{k}")
         elif isinstance(v, list):
             if not v:
                 # Skip empty lists - vLLM uses nargs="+" which requires at least one value
