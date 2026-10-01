@@ -430,15 +430,27 @@ class TestLoadBalancerRouting:
 
     def test_new_requests_route_to_least_loaded(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None, "s2": None})
-        # Load s0 with 3 inflight requests
-        ray.get(lb.acquire_server.remote(request_id="a"))[0]  # -> s0
-        ray.get(lb.acquire_server.remote(request_id="a"))[0]  # sticky -> s0
-        ray.get(lb.acquire_server.remote(request_id="a"))[0]  # sticky -> s0
-        # Load s1 with 1 inflight request
-        ray.get(lb.acquire_server.remote(request_id="b"))[0]  # -> s1
-        # s2 has 0 inflight, so next new request must go to s2
+        # Load one server with 3 inflight requests (sticky); ties are random, so observe which
+        s_heavy = ray.get(lb.acquire_server.remote(request_id="a"))[0]
+        ray.get(lb.acquire_server.remote(request_id="a"))[0]
+        ray.get(lb.acquire_server.remote(request_id="a"))[0]
+        # Load a second server with 1 inflight request
+        s_mid = ray.get(lb.acquire_server.remote(request_id="b"))[0]
+        assert s_mid != s_heavy
+        # The remaining server has 0 inflight, so the next new request must go there
+        idle = ({"s0", "s1", "s2"} - {s_heavy, s_mid}).pop()
         s_new = ray.get(lb.acquire_server.remote(request_id="d"))[0]
-        assert s_new == "s2"
+        assert s_new == idle
+
+    def test_ties_spread_across_servers(self, ray_for_lb):
+        lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None, "s2": None, "s3": None})
+        chosen = set()
+        # Release after each acquire so every pick is made with all counts tied at zero
+        for i in range(100):
+            server_id = ray.get(lb.acquire_server.remote(request_id=f"r{i}"))[0]
+            ray.get(lb.release_server.remote(server_id=server_id))
+            chosen.add(server_id)
+        assert chosen == {"s0", "s1", "s2", "s3"}
 
     def test_release_rebalances(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None})
@@ -474,6 +486,15 @@ class TestLoadBalancerStickySession:
         s1 = ray.get(lb.acquire_server.remote(request_id="conv-abc"))[0]
         assert s0 == s1
 
+    def test_sticky_session_ignores_tie_break(self, ray_for_lb):
+        lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None, "s2": None, "s3": None})
+        pinned = ray.get(lb.acquire_server.remote(request_id="conv"))[0]
+        for i in range(20):
+            other = ray.get(lb.acquire_server.remote(request_id=f"other-{i}"))[0]
+            ray.get(lb.release_server.remote(server_id=other))
+            # "conv" is never released, so its server is the most loaded and still wins
+            assert ray.get(lb.acquire_server.remote(request_id="conv"))[0] == pinned
+
 
 class TestLoadBalancerHybrid:
     """Dynamic server add/remove for hybrid scaling."""
@@ -499,17 +520,16 @@ class TestLoadBalancerHybrid:
     def test_removed_server_invalidates_sticky_session(self, ray_for_lb):
         """When a sticky session points to a removed server, cache is invalidated."""
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None})
-        # Occupy s0 so that the sticky request is assigned to s1
-        ray.get(lb.acquire_server.remote(request_id="occupy-s0"))[0]  # -> s0
-        # Pin request to s1 (least-loaded now)
-        s1 = ray.get(lb.acquire_server.remote(request_id="sticky-req"))[0]
-        assert s1 == "s1"
-        ray.get(lb.release_server.remote(server_id=s1))
-        # Remove s1
-        ray.get(lb.remove_servers.remote(server_ids=["s1"]))
-        # Sticky session should be invalidated and reroute to s0
+        # Occupy one server so that the sticky request is assigned to the other
+        occupied = ray.get(lb.acquire_server.remote(request_id="occupy"))[0]
+        sticky_server = ray.get(lb.acquire_server.remote(request_id="sticky-req"))[0]
+        assert sticky_server != occupied
+        ray.get(lb.release_server.remote(server_id=sticky_server))
+        # Remove the sticky server
+        ray.get(lb.remove_servers.remote(server_ids=[sticky_server]))
+        # Sticky session should be invalidated and reroute to the remaining server
         s_new = ray.get(lb.acquire_server.remote(request_id="sticky-req"))[0]
-        assert s_new == "s0"
+        assert s_new == occupied
 
     def test_remove_server_also_purges_registry(self, ray_for_lb):
         """remove_servers atomically purges from both LB pool and handle registry."""
@@ -549,8 +569,10 @@ class TestLoadBalancerHybrid:
     def test_get_inflight_count(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None})
         assert ray.get(lb.get_inflight_count.remote(server_id="s0")) == 0
-        ray.get(lb.acquire_server.remote(request_id="r1"))[0]  # -> s0 (least loaded)
-        assert ray.get(lb.get_inflight_count.remote(server_id="s0")) == 1
+        assigned = ray.get(lb.acquire_server.remote(request_id="r1"))[0]
+        assert ray.get(lb.get_inflight_count.remote(server_id=assigned)) == 1
+        other = "s1" if assigned == "s0" else "s0"
+        assert ray.get(lb.get_inflight_count.remote(server_id=other)) == 0
 
     def test_get_status_reports_active_correctly(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None, "s2": None})
