@@ -125,6 +125,16 @@ def test_a_band_splits_its_source_next_to_the_total():
     assert "val-core/all/reward/mean@2" not in out
 
 
+def test_val_exit_reasons_are_fractions_of_the_samples_that_report_one():
+    sources, uids, infos, turns, bands = _val([None] * 4)
+    out = health.validation_metrics(sources, uids, infos, turns, bands,
+                                    sample_exit_reasons=["finished", "finished", "terminal_dead", None])
+    assert out["val-aux/exit_finished_fraction"] == pytest.approx(2 / 3)
+    assert out["val-aux/exit_terminal_dead_fraction"] == pytest.approx(1 / 3)
+    assert out["val-aux/harness_abort_fraction"] == pytest.approx(1 / 3)
+    assert "val-aux/exit_stuck_fraction" not in out
+
+
 def test_rows_without_a_band_log_only_their_source():
     out = health.validation_metrics(*_val([None] * 4))
     assert not any("v128_" in key for key in out)

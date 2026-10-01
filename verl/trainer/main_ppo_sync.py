@@ -1092,6 +1092,7 @@ class PPOTrainer:
             reward_extra_infos_dict,
             sample_turns,
             sample_bands=[uid_to_band.get(uid) for uid in sample_uids],
+            sample_exit_reasons=sample_exit_reasons,
         )
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):

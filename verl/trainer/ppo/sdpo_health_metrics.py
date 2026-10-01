@@ -181,7 +181,7 @@ def trajectory_timing_metrics(extra_fields: list[dict]) -> dict:
 
 
 def validation_metrics(
-    data_sources, sample_uids, reward_extra_infos_dict, sample_turns, sample_bands=None
+    data_sources, sample_uids, reward_extra_infos_dict, sample_turns, sample_bands=None, sample_exit_reasons=None
 ) -> dict[str, float]:
     data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
     # with multiple sources (e.g. difficulty bands) also log the combined total under "all"
@@ -220,5 +220,12 @@ def validation_metrics(
         metric_dict["val-aux/num_turns/min"] = sample_turns.min()
         metric_dict["val-aux/num_turns/max"] = sample_turns.max()
         metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
+
+    # how the val rollouts ended, as training reports it under rollout/: a reason is logged once it occurs
+    reasons = [r for r in (sample_exit_reasons or []) if r]
+    if reasons:
+        for reason, count in sorted(Counter(reasons).items()):
+            metric_dict[f"val-aux/exit_{reason}_fraction"] = count / len(reasons)
+        metric_dict["val-aux/harness_abort_fraction"] = sum(r in HARNESS_ABORT_REASONS for r in reasons) / len(reasons)
 
     return metric_dict
