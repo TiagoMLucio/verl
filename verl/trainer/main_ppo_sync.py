@@ -29,7 +29,7 @@ import os
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pprint import pprint
@@ -210,6 +210,21 @@ def _final_segment_local_indices(keys: list[str]) -> list[int]:
         if session_key not in best or best[session_key][0] < index:
             best[session_key] = (index, row)
     return [row for _, row in best.values()]
+
+
+#: Exits where the harness, not the policy, ended the rollout.
+INFRA_FAILURE_REASONS = frozenset(
+    {"agent_loop_failed", "setup_timeout", "terminal_dead", "generation_timeout", "build_failed"}
+)
+
+
+def _raise_if_all_rollouts_failed(exit_reasons: list, global_steps: int) -> None:
+    """A step whose every rollout ended in an infra failure has nothing to learn from: stop the run."""
+    if all(reason in INFRA_FAILURE_REASONS for reason in exit_reasons):
+        raise RuntimeError(
+            f"All rollouts failed at global_steps={global_steps}: "
+            f"{dict(Counter(exit_reasons)) or 'no rollout returned'}"
+        )
 
 
 def _json_encode_default(obj):
@@ -1322,6 +1337,13 @@ class PPOTrainer:
             if self.use_critic:
                 self.critic_wg.stop_profile()
 
+    def _abort_if_all_rollouts_failed(self, batch: KVBatchMeta) -> None:
+        exit_reasons = []
+        if batch.keys:
+            data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=["extra_fields"])
+            exit_reasons = [ef.get("traj_exit_reason") if isinstance(ef, dict) else None for ef in data["extra_fields"]]
+        _raise_if_all_rollouts_failed(exit_reasons, self.global_steps)
+
     def _add_remax_reward_baselines(self, batch: KVBatchMeta) -> KVBatchMeta:
         """Attach one greedy baseline reward to every sampled ReMax trajectory."""
         baseline_prefix = "remax_baseline_"
@@ -2012,6 +2034,7 @@ class PPOTrainer:
         # 2. sample batch from replay buffer
         with marked_timer("gen", timing_raw, color="red"):
             batch = self.replay_buffer.sample(partition_id="train", global_steps=self.global_steps)
+        self._abort_if_all_rollouts_failed(batch)
         batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         self.checkpoint_manager.sleep_replicas()
 
