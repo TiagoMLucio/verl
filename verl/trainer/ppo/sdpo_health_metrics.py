@@ -180,6 +180,21 @@ def trajectory_timing_metrics(extra_fields: list[dict]) -> dict:
     return out
 
 
+def sampled_entropy_metrics(extra_fields: list[dict], traj_of_row: list) -> dict[str, float]:
+    """``rollout/entropy_est``: the mean -log p of the sampled tokens over every rollout, an
+    unbiased entropy estimate at temperature 1. Unlike ``actor/entropy`` it covers every generated
+    token, rows the update drops and turns the row builder truncated included. The agent reports
+    the sum and the count per trajectory, so each trajectory is read off one of its rows."""
+    neg_logprob, tokens, seen = 0.0, 0, set()
+    for traj, ef in zip(traj_of_row, extra_fields, strict=True):
+        if traj in seen or ef.get("sampled_token_count") is None or ef.get("sampled_neg_logprob_sum") is None:
+            continue
+        seen.add(traj)
+        neg_logprob += float(ef["sampled_neg_logprob_sum"])
+        tokens += int(ef["sampled_token_count"])
+    return {"rollout/entropy_est": neg_logprob / tokens} if tokens else {}
+
+
 def turn_entropy_metrics(entropy, response_mask, extra_fields, is_padding) -> dict[str, float]:
     """The student's entropy per turn, from the log-prob pass before the update, over every turn
     and over the hinted ones: as a mean of per-turn means (every turn counts once) and token-weighted.

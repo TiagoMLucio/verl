@@ -162,3 +162,13 @@ def test_rows_without_a_band_log_only_their_source():
     out = health.validation_metrics(*_val([None] * 4))
     assert not any("v128_" in key for key in out)
     assert out["val-core/v128/reward/mean@2"] == 0.75
+
+
+def test_entropy_est_reads_each_trajectory_once_over_every_rollout():
+    extra = [{"sampled_neg_logprob_sum": 6.0, "sampled_token_count": 4},  # condensed: two rows, one trajectory
+             {"sampled_neg_logprob_sum": 6.0, "sampled_token_count": 4},
+             {"sampled_neg_logprob_sum": 2.0, "sampled_token_count": 4},
+             {"traj_exit_reason": "setup_timeout"}]  # never generated
+    out = health.sampled_entropy_metrics(extra, ["a", "a", "b", "c"])
+    assert out == {"rollout/entropy_est": pytest.approx(8.0 / 8)}
+    assert health.sampled_entropy_metrics([{}, {}], ["a", "b"]) == {}

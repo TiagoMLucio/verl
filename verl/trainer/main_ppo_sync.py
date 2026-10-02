@@ -1457,6 +1457,7 @@ class PPOTrainer:
         metrics.update(teacher.metrics)
         metrics.update(health.condensation_metrics(extra_fields, seq_scores, cfg.success_reward_threshold))
         metrics.update(health.trajectory_timing_metrics(extra_fields))
+        metrics.update(health.sampled_entropy_metrics(extra_fields, traj_of_row))
         metrics.update(self.sdpo_teacher.trajectory_metrics(teacher, inputs, supervised_per_row, weights))
 
         tq.kv_batch_put(
