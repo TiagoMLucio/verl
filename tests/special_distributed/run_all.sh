@@ -20,3 +20,5 @@ torchrun --nproc-per-node=4 --standalone tests/special_distributed/test_torch_fu
 # Regression for verl#5995 (FSDP2 + CPUOffloadPolicy state_dict crash). Only
 # needs 2 ranks to exercise CPUOffloadPolicy sharding.
 torchrun --nproc-per-node=2 --standalone tests/special_distributed/test_fsdp2_cpu_offload_state_dict.py
+# Per-update optimizer offload: sharded Adam parity, residency, skipped updates, and state reload.
+torchrun --nproc-per-node=2 --standalone tests/special_distributed/test_fsdp2_optimizer_offload_step.py
