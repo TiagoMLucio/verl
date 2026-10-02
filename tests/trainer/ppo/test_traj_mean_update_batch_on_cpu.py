@@ -13,7 +13,8 @@
 # limitations under the License.
 """traj-mean-token-mean under condensation: the update batch the trainer hands the worker,
 through ``_balance_batch`` -> ``_drop_unsupervised_rows`` -> ``_update_actor`` over an in-memory
-TransferQueue, at the production shape (batch 128, mini 128, n 1, dp 4)."""
+TransferQueue, at the production shape (batch 128, mini 128, n 1, dp 4). The drop runs before
+the old log-prob pass, so every pass after it sees the kept rows only."""
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -151,6 +152,14 @@ def _trainer(monkeypatch, n_tasks, n_rows, supervised_rows, micro=None):
     return trainer, batch, sent, kv
 
 
+def _update(trainer, batch, metrics):
+    """step()'s order around the update: drop, (the log-prob and advantage passes), update, clear."""
+    update_batch = trainer._select_update_rows(batch, metrics)
+    assert trainer._update_actor(update_batch, metrics) is update_batch
+    trainer._clear_update_padding(batch, update_batch.keys)
+    return update_batch
+
+
 CASES = [
     # (tasks, rows, supervised rows) -> (rows after balance, mini-batch rows sent, supervised trajectories);
     # one mini-batch per step, so the padding only rounds each up to a multiple of dp
@@ -168,8 +177,8 @@ def test_traj_mean_update_batch_is_one_mini_batch(
     trainer, batch, sent, kv = _trainer(monkeypatch, n_tasks, n_rows, supervised_rows)
     assert len(batch) == balanced
     metrics = {}
-    assert trainer._update_actor(batch, metrics) is batch
-    (update_batch,) = sent
+    update_batch = _update(trainer, batch, metrics)
+    assert sent == [update_batch]
     assert len(update_batch) == mini_rows
     assert update_batch.extra_info["mini_batch_size"] == mini_rows, "one mini-batch per rank"
     assert update_batch.extra_info["mini_batch_size"] % DP == 0
@@ -194,7 +203,7 @@ def test_traj_mean_update_batch_is_one_mini_batch(
 def test_traj_mean_skips_the_update_without_supervision(monkeypatch, n_tasks, n_rows):
     trainer, batch, sent, _ = _trainer(monkeypatch, n_tasks, n_rows, supervised_rows=0)
     metrics = {}
-    assert trainer._update_actor(batch, metrics) is batch
+    assert _update(trainer, batch, metrics) is batch, "nothing to keep: the batch goes through whole"
     assert sent == []
     assert metrics["actor/skipped_update"] == 1.0
 
@@ -203,8 +212,7 @@ def test_dropped_batch_is_length_balanced_across_dp(monkeypatch):
     """After the drop the padding rows are spread by _balance_batch, not stacked on the last rank."""
     trainer, batch, sent, _ = _trainer(monkeypatch, 128, 150, 97)
     metrics = {}
-    trainer._update_actor(batch, metrics)
-    (update_batch,) = sent
+    update_batch = _update(trainer, batch, metrics)
     per_rank = len(update_batch) // DP
     padding_per_rank = [
         sum(bool(t.get("is_padding", False)) for t in update_batch.tags[r * per_rank : (r + 1) * per_rank])
@@ -219,7 +227,83 @@ def test_the_multiple_follows_the_micro_batch_size(monkeypatch):
     """Each rank's share has to split into whole micro-batches: dp x micro rows, not the mini-batch."""
     trainer, batch, sent, _ = _trainer(monkeypatch, 128, 150, 100, micro=2)
     assert len(batch) == 152
-    trainer._update_actor(batch, {})
-    (update_batch,) = sent
+    update_batch = _update(trainer, batch, {})
     assert len(update_batch) == 104
     assert (len(update_batch) // DP) % 2 == 0
+
+
+def test_the_passes_after_the_drop_see_the_kept_rows_and_fit_gets_every_row(monkeypatch):
+    trainer, balanced, sent, kv = _trainer(monkeypatch, 128, 150, 97)
+    real = [(k, t) for k, t in zip(balanced.keys, balanced.tags, strict=True) if not t.get("is_padding")]
+    sampled = KVBatchMeta(keys=[k for k, _ in real], tags=[t for _, t in real], partition_id="train")
+    monkeypatch.setattr(
+        main_ppo_sync, "tu", SimpleNamespace(get_tensordict=lambda d: d, assign_non_tensor_data=lambda *a: None)
+    )
+    trainer.config.algorithm = {"adv_estimator": "grpo"}
+    trainer.use_reference_policy = False
+    trainer.async_rollout_manager = SimpleNamespace(generate_sequences=lambda b: None)
+    trainer.replay_buffer.sample = lambda partition_id, global_steps: sampled
+    trainer.checkpoint_manager = SimpleNamespace(sleep_replicas=lambda: None)
+    trainer._abort_if_all_rollouts_failed = lambda b: None
+    trainer._maybe_build_self_distillation_batch = lambda b, metrics: None
+    passes = []
+    trainer._compute_old_log_prob = lambda b, metrics: passes.append(("old_log_prob", len(b))) or b
+    trainer._compute_advantage = lambda b, metrics: passes.append(("adv", len(b))) or b
+
+    metrics = {}
+    batch = trainer.step({"raw_prompt": [None] * 128}, metrics, timing_raw={})
+    (update_batch,) = sent
+    assert passes == [("old_log_prob", 100), ("adv", 100)]
+    assert len(update_batch) == 100 and trainer._update_keys == set(update_batch.keys)
+    # fit computes metrics over the full balanced batch, and the drop's own padding is already gone
+    assert len(batch) == 152 and sum(not t.get("is_padding") for t in batch.tags) == 150
+    stray = [k for k in update_batch.keys if k not in set(batch.keys)]
+    assert len(stray) == 3 and not any(k in kv.store for k in stray)
+    assert all(k in kv.store for k in batch.keys)
+
+
+class ReadyKV(KV):
+    """TransferQueue's readiness rule: a field on some of the requested keys but not all is an error."""
+
+    def kv_batch_get(self, keys, partition_id, select_fields=None):
+        present = [f for f in select_fields if any(f in self.store[k] for k in keys)]
+        if any(not all(f in self.store[k] for k in keys) for f in present):
+            raise ValueError("Some fields are not ready in all the requested keys!")
+        rows = [self.store[k] for k in keys]
+        stack = lambda vals: torch.stack(vals) if vals[0].dim() == 0 else torch.nested.nested_tensor(  # noqa: E731
+            vals, layout=torch.jagged
+        )
+        return TensorDict({f: stack([r[f] for r in rows]) for f in present}, batch_size=len(keys))
+
+
+def test_metrics_keep_every_row_and_read_advantages_off_the_kept_ones(monkeypatch):
+    kv = ReadyKV()
+    monkeypatch.setattr(main_ppo_sync, "tq", kv)
+    keys = [f"u{i}_0_0" for i in range(4)]
+    for i, k in enumerate(keys):
+        n = 3 + i
+        kv.store[k] = dict(
+            prompts=torch.tensor([1, 2]),
+            responses=torch.arange(n),
+            response_mask=torch.ones(n, dtype=torch.int64),
+            rm_scores=torch.tensor([0.0] * (n - 1) + [float(i % 2)]),
+            num_turns=torch.tensor(1),
+        )
+    for k, adv in ((keys[0], 2.0), (keys[1], 4.0)):  # the two rows the drop kept
+        n = kv.store[k]["responses"].shape[0]
+        kv.store[k].update(advantages=torch.full((n,), adv), returns=torch.full((n,), adv))
+
+    trainer = object.__new__(main_ppo_sync.PPOTrainer)
+    trainer.config = OmegaConf.create(
+        {"actor_rollout_ref": {"model": {}, "rollout": {"prompt_length": 8, "response_length": 16}}}
+    )
+    trainer.use_critic = False
+    trainer.resource_pool_manager = SimpleNamespace(get_n_gpus=lambda: DP)
+    trainer._update_keys = set(keys[:2])
+    batch = KVBatchMeta(keys=keys, tags=[{} for _ in keys], partition_id="train")
+    metrics = {}
+    trainer._compute_metrics(batch, metrics, timing_raw={"step": 1.0}, global_steps=1, epoch=0)
+    assert metrics["critic/advantages/mean"] == pytest.approx((3 * 2.0 + 4 * 4.0) / 7)
+    assert metrics["critic/advantages/min"] == 2.0
+    assert metrics["response_length/mean"] == pytest.approx(4.5), "lengths are over every row"
+    assert metrics["critic/score/mean"] == pytest.approx(0.5), "scores are over every row"

@@ -593,6 +593,7 @@ class PPOTrainer:
         self.use_teacher_policy = need_teacher_policy(self.config)
         self.replay_buffer = ReplayBuffer()
         self._sdpo_span_rows = []
+        self._update_keys = None
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
@@ -1762,8 +1763,10 @@ class PPOTrainer:
         """Keep only rows the update can learn from, then re-pad and re-balance across dp.
 
         A row whose trace_weight is zero contributes no gradient: seq-mean-token-mean drops
-        fully masked sequences and weights the rest by that number. It still costs a full
-        forward and backward, which is a third of the update at our hint rate.
+        fully masked sequences and weights the rest by that number. It still costs the old
+        log-prob forward and a full forward and backward in the update. Runs before the old
+        log-prob pass, so ``actor/entropy``, ``calculate_debug_metrics``, ``rollout_corr/*`` and the
+        advantage stats cover the kept rows only; ``rollout/entropy_est`` covers every rollout.
 
         The per-trajectory weighting is untouched. A row with no supervision has share
         zero, so neither traj_supervised nor the renormalising scale moves when it goes.
@@ -1788,6 +1791,23 @@ class PPOTrainer:
             extra_info=batch.extra_info,
         )
         return self._balance_batch(batch, metrics, logging_prefix="update_seqlen")
+
+    def _select_update_rows(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        """The rows old log-prob, advantage and the update run on; ``batch`` keeps every row for
+        ``_compute_metrics``."""
+        update_batch = batch
+        if self.config.actor_rollout_ref.actor.get("drop_unsupervised_rows", False):
+            update_batch = self._drop_unsupervised_rows(batch, metrics)
+        self._update_keys = set(update_batch.keys)
+        return update_batch
+
+    def _clear_update_padding(self, batch: KVBatchMeta, update_keys: list[str]) -> None:
+        """The drop's re-padding put rows only the update batch holds; fit clears ``batch.keys`` alone."""
+        own = set(batch.keys)
+        stray = [k for k in update_keys if k not in own]
+        if stray:
+            tq.kv_clear(keys=stray, partition_id=batch.partition_id)
+            self.replay_buffer.remove(batch.partition_id, stray)
 
     def _supervised_trajectory_count(self, batch: KVBatchMeta) -> int:
         """Denominator of traj-mean-token-mean: the trajectories with any supervised token in
@@ -1828,29 +1848,18 @@ class PPOTrainer:
             "temperature": self.config.actor_rollout_ref.rollout.temperature,
         }
         self._sdpo_span_rows = []
-        # a separate handle: this function's return feeds _compute_metrics, which must still
-        # see every row or reward and length statistics would describe the supervised subset
-        update_batch = batch
-        if self.config.actor_rollout_ref.actor.get("drop_unsupervised_rows", False):
-            update_batch = self._drop_unsupervised_rows(batch, metrics)
         if self.config.actor_rollout_ref.actor.get("loss_agg_mode") == "traj-mean-token-mean":
             # one optimizer step over the whole update batch, whatever condensation and the
             # drop left of it (ActorConfig.validate pins mini == train batch and one epoch)
-            supervised_trajectories = self._supervised_trajectory_count(update_batch)
+            supervised_trajectories = self._supervised_trajectory_count(batch)
             if supervised_trajectories == 0:
                 metrics["actor/skipped_update"] = 1.0
                 return batch
             extra_info["global_batch_size"] = supervised_trajectories
-            extra_info["mini_batch_size"] = len(update_batch.keys)
-        update_batch.extra_info.update(extra_info)
+            extra_info["mini_batch_size"] = len(batch.keys)
+        batch.extra_info.update(extra_info)
 
-        output: TensorDict = self.actor_rollout_wg.update_actor(update_batch)
-        # the drop's re-padding put rows only update_batch holds; fit clears batch.keys alone
-        own = set(batch.keys)
-        stray = [k for k in update_batch.keys if k not in own]
-        if stray:
-            tq.kv_clear(keys=stray, partition_id=batch.partition_id)
-            self.replay_buffer.remove(batch.partition_id, stray)
+        output: TensorDict = self.actor_rollout_wg.update_actor(batch)
         output = rename_dict(output["metrics"], "actor/")
         self._sdpo_span_rows = output.pop("actor/" + core_algos.SDPO_SPAN_ROWS_KEY, [])
         output["perf/mfu/actor"] = output.pop("actor/mfu")
@@ -1876,18 +1885,22 @@ class PPOTrainer:
         mb_keys = [k for k, keep in zip(batch.keys, non_padding_mask, strict=True) if keep]
         final_seg_idx = _final_segment_local_indices(mb_keys)
         multi_segment = 0 < len(final_seg_idx) < len(mb_keys)
-        fields = [
-            "prompts",
-            "responses",
-            "response_mask",
-            "values",
-            "advantages",
-            "returns",
-            "rm_scores",
-            "token_level_rewards",
-            "num_turns",
-        ]
-        data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        fields = ["prompts", "responses", "response_mask", "rm_scores", "num_turns"]
+        update_fields = ["values", "advantages", "returns", "token_level_rewards"]
+        # the passes after the unsupervised-row drop wrote their fields on the kept rows only
+        trained = np.array([self._update_keys is None or k in self._update_keys for k in batch.keys], dtype=bool)
+        data = tq.kv_batch_get(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            select_fields=fields + (update_fields if trained.all() else []),
+        )
+        update_data = None
+        if not trained.all():
+            update_data = tq.kv_batch_get(
+                keys=[k for k, keep in zip(batch.keys, trained, strict=True) if keep],
+                partition_id=batch.partition_id,
+                select_fields=update_fields,
+            )
         num_turns = np.array(data.pop("num_turns").tolist())
         prompt_length = data["prompts"].offsets().diff()
         response_length = data["responses"].offsets().diff()
@@ -1908,6 +1921,14 @@ class PPOTrainer:
             spec_verifies = [extra_field["spec_num_verify_steps"] for extra_field in extra_fields]
 
         data = data.to_padded_tensor()
+        if update_data is not None:
+            update_data = update_data.to_padded_tensor()
+            rows, grid = torch.from_numpy(trained), data["rm_scores"]
+            for key in update_data.keys():
+                # a dropped row's reward is its unpenalized score; the critic/ stats below skip it
+                full = grid.clone() if key == "token_level_rewards" else torch.zeros_like(grid)
+                full[rows, : update_data[key].shape[-1]] = update_data[key].to(full.dtype)
+                data[key] = full
         data["token_level_scores"] = data["rm_scores"]
         if "token_level_rewards" not in data:
             data["token_level_rewards"] = data["rm_scores"]
@@ -1924,6 +1945,17 @@ class PPOTrainer:
         # 2. compute metrics
         metrics.update({"training/global_step": global_steps, "training/epoch": epoch})
         metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
+        if update_data is not None:
+            trained_rows = compute_data_metrics(
+                batch=batch.select_idxs(trained & non_padding_mask), use_critic=self.use_critic
+            )
+            metrics.update(
+                {
+                    k: v
+                    for k, v in trained_rows.items()
+                    if k.startswith(("critic/advantages/", "critic/returns/", "critic/values/", "critic/vf_"))
+                }
+            )
         if multi_segment:
             # score/reward are per-trajectory; recompute their stats over final segments only.
             per_traj = compute_data_metrics(batch=metrics_batch.select_idxs(final_seg_idx), use_critic=self.use_critic)
@@ -2100,34 +2132,39 @@ class PPOTrainer:
         # 4. balance batch across data parallel groups
         batch = self._balance_batch(batch, metrics=metrics)
 
+        # 4.5 [OPTIONAL] drop the rows the update cannot learn from before any pass runs on them
+        update_batch = self._select_update_rows(batch, metrics=metrics)
+        update_keys = update_batch.keys
+
         # 5. compute old_log_prob
         with marked_timer("old_log_prob", timing_raw, color="blue"):
-            batch = self._compute_old_log_prob(batch, metrics=metrics)
+            update_batch = self._compute_old_log_prob(update_batch, metrics=metrics)
 
         # 6. [OPTIONAL] compute ref_log_prob
         if self.use_reference_policy:
             with marked_timer("ref", timing_raw, color="olive"):
-                batch = self._compute_ref_log_prob(batch, metrics=metrics)
+                update_batch = self._compute_ref_log_prob(update_batch, metrics=metrics)
 
         # 7. [OPTIONAL] compute critic values
         if self.use_critic:
             with marked_timer("values", timing_raw, color="cyan"):
-                batch = self._compute_values(batch, metrics=metrics)
+                update_batch = self._compute_values(update_batch, metrics=metrics)
 
         # 8. compute advantage and return
         with marked_timer("adv", timing_raw, color="brown"):
-            batch = self._compute_advantage(batch, metrics=metrics)
+            update_batch = self._compute_advantage(update_batch, metrics=metrics)
 
         # 9. [OPTIONAL] update critic
         if self.use_critic:
             with marked_timer("update_critic", timing_raw, color="pink"):
-                batch = self._update_critic(batch, metrics=metrics)
+                update_batch = self._update_critic(update_batch, metrics=metrics)
 
         # 10. update actor
         if self.config.trainer.critic_warmup <= self.global_steps:
             with marked_timer("update_actor", timing_raw, color="red"):
-                batch = self._update_actor(batch, metrics=metrics)
+                update_batch = self._update_actor(update_batch, metrics=metrics)
 
+        self._clear_update_padding(batch, update_keys)
         return batch
 
 
