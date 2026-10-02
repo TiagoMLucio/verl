@@ -31,7 +31,15 @@ AGENT_METRIC_PREFIX = "agent/"
 #: below only exist once that reason has fired, so a healthy run has nothing to chart or alert
 #: on. ``unknown_error`` stays out of it, being what the loop could not classify at all.
 HARNESS_ABORT_REASONS = frozenset(
-    {"setup_timeout", "agent_loop_failed", "terminal_dead", "timeout_budget_exhausted", "no_response"}
+    {
+        "setup_timeout",
+        "agent_loop_failed",
+        "terminal_dead",
+        "timeout_budget_exhausted",
+        "no_response",
+        "build_failed",
+        "missing",
+    }
 )
 
 
