@@ -215,7 +215,7 @@ def _final_segment_local_indices(keys: list[str]) -> list[int]:
 
 #: Exits where the harness, not the policy, ended the rollout.
 INFRA_FAILURE_REASONS = frozenset(
-    {"agent_loop_failed", "setup_timeout", "terminal_dead", "generation_timeout", "build_failed"}
+    {"agent_loop_failed", "setup_timeout", "terminal_dead", "generation_timeout", "episode_timeout", "build_failed"}
 )
 
 
