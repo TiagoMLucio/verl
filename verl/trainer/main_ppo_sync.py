@@ -37,6 +37,7 @@ from typing import Any, Optional
 
 import hydra
 import numpy as np
+import psutil
 import ray
 import torch
 
@@ -1817,6 +1818,14 @@ class PPOTrainer:
 
         return batch
 
+    def _host_rss_metrics(self) -> dict[str, float]:
+        """Host RSS after the weight sync, where verl#6468 sees the actor workers grow every step."""
+        worker_rss = self.actor_rollout_wg.host_rss_bytes()
+        return {
+            "perf/trainer_rss_gb": psutil.Process().memory_info().rss / (1024**3),
+            "perf/worker_rss_gb_max": max(worker_rss) / (1024**3),
+        }
+
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
         # 1. collect necessary fields from TransferQueue for computing metrics
         non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool)
@@ -1974,6 +1983,7 @@ class PPOTrainer:
                     with marked_timer("update_weights", timing_raw, color="red"):
                         self.checkpoint_manager.update_weights()
                 self._stop_profiling()
+                metrics.update(self._host_rss_metrics())
 
                 # 4. validate
                 if self.config.trainer.test_freq > 0 and (
