@@ -47,6 +47,8 @@ class TokenOutput(BaseModel):
     """stop reason: 'completed', 'aborted', or None for unknown"""
     num_preempted: Optional[int] = None
     """number of preempted times for metric calculation"""
+    num_cached_tokens: int = -1
+    """prompt tokens served from the prefix cache; -1 if the engine did not report it"""
     extra_fields: dict[str, Any] = {}
     """Extra fields for dynamic addition."""
 

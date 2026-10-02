@@ -172,3 +172,14 @@ def test_entropy_est_reads_each_trajectory_once_over_every_rollout():
     out = health.sampled_entropy_metrics(extra, ["a", "a", "b", "c"])
     assert out == {"rollout/entropy_est": pytest.approx(8.0 / 8)}
     assert health.sampled_entropy_metrics([{}, {}], ["a", "b"]) == {}
+
+
+def test_prefix_cache_hit_rate_skips_trajectories_with_an_unreported_turn():
+    extra = [{"num_cached_tokens": 300, "num_prompt_tokens": 400},  # condensed: two rows, one trajectory
+             {"num_cached_tokens": 300, "num_prompt_tokens": 400},
+             {"num_cached_tokens": 0, "num_prompt_tokens": 100},
+             {"num_cached_tokens": -1, "num_prompt_tokens": 500},  # a turn the engine did not report
+             {"traj_exit_reason": "setup_timeout"}]  # never generated
+    out = health.prefix_cache_metrics(extra, ["a", "a", "b", "c", "d"])
+    assert out == {"rollout/prefix_cache_hit_rate": pytest.approx(300 / 500)}
+    assert health.prefix_cache_metrics([{"num_cached_tokens": -1, "num_prompt_tokens": 9}], ["a"]) == {}

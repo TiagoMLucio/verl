@@ -588,6 +588,7 @@ class vLLMHttpServer:
 
         if hasattr(final_res.outputs[0], "num_preempted"):
             num_preempted = final_res.outputs[0].num_preempted
+        num_cached_tokens = getattr(final_res, "num_cached_tokens", None)
 
         # Re-key backend spec-decoding stats to the rollout-common names.
         if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
@@ -603,6 +604,7 @@ class vLLMHttpServer:
             routed_experts=routed_experts,
             stop_reason=stop_reason,
             num_preempted=num_preempted,
+            num_cached_tokens=num_cached_tokens if num_cached_tokens is not None else -1,
             extra_fields=extra_fields,
         )
 

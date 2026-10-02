@@ -195,6 +195,20 @@ def sampled_entropy_metrics(extra_fields: list[dict], traj_of_row: list) -> dict
     return {"rollout/entropy_est": neg_logprob / tokens} if tokens else {}
 
 
+def prefix_cache_metrics(extra_fields: list[dict], traj_of_row: list) -> dict[str, float]:
+    """``rollout/prefix_cache_hit_rate``: the share of prompt tokens vLLM served from its prefix
+    cache, over the trajectories whose every turn reported it (the agent ships -1 otherwise)."""
+    cached, prompt, seen = 0, 0, set()
+    for traj, ef in zip(traj_of_row, extra_fields, strict=True):
+        if traj in seen or ef.get("num_cached_tokens") is None or ef.get("num_prompt_tokens") is None:
+            continue
+        seen.add(traj)
+        if int(ef["num_cached_tokens"]) >= 0:
+            cached += int(ef["num_cached_tokens"])
+            prompt += int(ef["num_prompt_tokens"])
+    return {"rollout/prefix_cache_hit_rate": cached / prompt} if prompt else {}
+
+
 def turn_entropy_metrics(entropy, response_mask, extra_fields, is_padding) -> dict[str, float]:
     """The student's entropy per turn, from the log-prob pass before the update, over every turn
     and over the hinted ones: as a mean of per-turn means (every turn counts once) and token-weighted.
