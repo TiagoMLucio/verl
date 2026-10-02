@@ -962,12 +962,20 @@ class PPOTrainer:
         dump_all_keys: list[str] = []
         dump_all_indices: list = []
         session_to_sample_idx: dict[str, int] = {}
+        missing: list[tuple] = []  # (uid, data_source, ground_truth) per session that never returned
+        n_dispatched = 0
 
         for batch_dict in self.val_dataloader:
             # 1. put batch to agent loop manager
             n_prompts = len(batch_dict["raw_prompt"])
             val_n = self.config.actor_rollout_ref.rollout.val_kwargs.n
             logger.info(f"validation dispatch: {n_prompts} prompts x n={val_n} = {n_prompts * val_n} agent loops")
+            n_dispatched += n_prompts * val_n
+            prompt_sources = list(batch_dict.get("data_source", ["unknown"] * n_prompts))
+            prompt_gts = [
+                rm.get("ground_truth") if isinstance(rm, dict) else None
+                for rm in batch_dict.get("reward_model", [None] * n_prompts)
+            ]
             batch_dict["uid"] = np.array(
                 [str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object
             )
@@ -980,6 +988,15 @@ class PPOTrainer:
 
             # 2. sample batch from replay buffer
             batch = self.replay_buffer.sample(partition_id="val", global_steps=self.global_steps)
+            returned = {_session_key(key) for key in batch.keys}
+            missing.extend(
+                (uid, prompt_sources[i], prompt_gts[i])
+                for i, uid in enumerate(batch_dict["uid"])
+                for session_id in range(val_n)
+                if f"{uid}_{session_id}" not in returned
+            )
+            if not batch.keys:
+                continue
 
             # 3. collect necessary data for logging
             # For multi-output agent loops, only use the final output per session for metrics.
@@ -1067,6 +1084,27 @@ class PPOTrainer:
             tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
             self.replay_buffer.remove(batch.partition_id, batch.keys)
 
+        # a session that never returned is a failed sample, so accuracy stays over every dispatched one
+        if missing:
+            logger.warning(
+                f"validation: {len(missing)} of {n_dispatched} dispatched sessions never returned, "
+                f"scored 0 with exit reason 'missing'"
+            )
+            for key in {"reward", *reward_extra_infos_dict}:
+                values = reward_extra_infos_dict[key]
+                first = next((v for v in values if v is not None), None)
+                numeric = key == "reward" or isinstance(first, int | float | np.number)
+                values.extend([0.0 if numeric else None] * len(missing))
+            for uid, source, gt in missing:
+                sample_uids.append(uid)
+                sample_inputs.append("")
+                sample_outputs.append("")
+                sample_gts.append(gt)
+                sample_scores.append(0.0)
+                sample_turns.append(0)
+                sample_exit_reasons.append("missing")
+                data_sources.append(source)
+
         # logger to wandb
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
@@ -1102,7 +1140,7 @@ class PPOTrainer:
                 dump_path=val_data_dir,
             )
 
-        return health.validation_metrics(
+        val_metrics = health.validation_metrics(
             data_sources,
             sample_uids,
             reward_extra_infos_dict,
@@ -1110,6 +1148,8 @@ class PPOTrainer:
             sample_bands=[uid_to_band.get(uid) for uid in sample_uids],
             sample_exit_reasons=sample_exit_reasons,
         )
+        val_metrics.setdefault("val-aux/exit_missing_fraction", 0.0)
+        return val_metrics
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
