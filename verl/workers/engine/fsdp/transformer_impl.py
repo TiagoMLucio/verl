@@ -831,7 +831,8 @@ class FSDPEngine(BaseEngine):
         Save FSDP checkpoint, handling parameter offload as needed.
         """
         origin_module_device = next(self.module.parameters()).device.type
-        if self._is_offload_param or origin_module_device == "cpu":
+        # FSDP2 CPUOffloadPolicy owns placement; moving the module half-moves it and breaks state_dict() (#5995)
+        if not self._uses_fsdp2_cpu_offload_policy and (self._is_offload_param or origin_module_device == "cpu"):
             load_fsdp_model_to_gpu(self.module)
 
         self.checkpoint_manager.save_checkpoint(

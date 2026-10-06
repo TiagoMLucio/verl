@@ -27,10 +27,17 @@ This test rebuilds that exact sequence on a tiny Qwen2 model and asserts:
   - the pre-fix sequence (load + state_dict) still crashes today (informational;
     the fix is still correct on PyTorch versions that have relaxed this check).
 
+FSDPEngine.save_checkpoint had the same move for a module whose parameters sit on
+CPU, which is how SDPO checkpoints its forward-only EMA teacher; the engine
+checkpoint round trip below covers it.
+
 Launch:
     torchrun --nproc-per-node=2 --standalone \\
         tests/special_distributed/test_fsdp2_cpu_offload_state_dict.py
 """
+
+import shutil
+import tempfile
 
 import torch
 import torch.distributed
@@ -39,9 +46,12 @@ from torch.distributed.fsdp import CPUOffloadPolicy
 from torch.distributed.tensor import DTensor
 from transformers import AutoModelForCausalLM, Qwen2Config
 
+from verl.trainer.config import CheckpointConfig
+from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.distributed import initialize_global_process_group
 from verl.utils.fsdp_utils import MixedPrecisionPolicy, apply_fsdp2, load_fsdp_model_to_gpu
+from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
 
 
 def _build_fsdp2_cpu_offload_module(device_mesh):
@@ -94,6 +104,38 @@ def _assert_fixed_path_succeeds(device_mesh, rank):
         print("fixed path: state_dict() + DTensor materialisation succeeded")
 
 
+def _assert_engine_checkpoint_round_trip(device_mesh, rank):
+    """FSDPEngine.save_checkpoint and load_checkpoint on a CPUOffloadPolicy module, as for a forward-only engine."""
+    module = _build_fsdp2_cpu_offload_module(device_mesh)
+    engine = object.__new__(FSDPEngine)
+    engine.module = module
+    engine.optimizer = None
+    engine._is_offload_param = False
+    engine._is_offload_optimizer = False
+    engine._uses_fsdp2_cpu_offload_policy = True
+    engine.checkpoint_manager = FSDPCheckpointManager(
+        model=module, checkpoint_config=CheckpointConfig(save_contents=["model"], load_contents=["model"])
+    )
+    path = [tempfile.mkdtemp() if rank == 0 else None]
+    torch.distributed.broadcast_object_list(path, src=0)
+
+    saved = {name: tensor.to_local().clone() for name, tensor in module.state_dict().items()}
+    engine.save_checkpoint(path[0], global_step=1)
+    with torch.no_grad():
+        for param in module.parameters():
+            param.to_local().add_(1.0)
+    engine.load_checkpoint(path[0])
+
+    for name, tensor in module.state_dict().items():
+        torch.testing.assert_close(tensor.to_local(), saved[name], atol=0.0, rtol=0.0)
+    assert next(module.parameters()).device.type == "cpu", "the offload policy no longer owns the parameters"
+
+    torch.distributed.barrier()
+    if rank == 0:
+        shutil.rmtree(path[0])
+        print("engine checkpoint round trip under CPUOffloadPolicy succeeded")
+
+
 def _probe_pre_fix_crash(device_mesh, rank):
     """Reproduce the pre-fix sequence and report whether it still crashes."""
     module = _build_fsdp2_cpu_offload_module(device_mesh)
@@ -124,6 +166,7 @@ def main():
     device_mesh = init_device_mesh(get_device_name(), mesh_shape=(world_size,), mesh_dim_names=("dp",))
 
     _assert_fixed_path_succeeds(device_mesh, rank)
+    _assert_engine_checkpoint_round_trip(device_mesh, rank)
     # _probe_pre_fix_crash(device_mesh, rank)
 
     torch.distributed.barrier()
