@@ -832,6 +832,13 @@ class PPOTrainer:
 
         logger.info("all initialize finished, ready to fit")
 
+    def _sdpo_enabled(self) -> bool:
+        actor_cfg = self.config.actor_rollout_ref.actor
+        return (
+            actor_cfg.get("self_distillation", None) is not None
+            and actor_cfg.policy_loss.get("loss_mode", "vanilla") == "sdpo"
+        )
+
     def _load_checkpoint(self):
         self.global_steps = 0
 
@@ -866,6 +873,11 @@ class PPOTrainer:
             local_path=os.path.join(global_step_folder, "actor"),
             del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
         )
+        if self._sdpo_enabled():
+            self.actor_rollout_wg.load_teacher_checkpoint(
+                local_path=os.path.join(global_step_folder, "teacher"),
+                del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
+            )
 
         # 3. load critic checkpoint
         if self.use_critic:
@@ -915,6 +927,18 @@ class PPOTrainer:
         self.actor_rollout_wg.save_checkpoint(
             actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
         )
+        if self._sdpo_enabled():
+            teacher_remote_path = (
+                None
+                if self.config.trainer.default_hdfs_dir is None
+                else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "teacher")
+            )
+            self.actor_rollout_wg.save_teacher_checkpoint(
+                os.path.join(local_global_step_folder, "teacher"),
+                teacher_remote_path,
+                self.global_steps,
+                max_ckpt_to_keep=max_actor_ckpt_to_keep,
+            )
 
         # save critic
         if self.use_critic:

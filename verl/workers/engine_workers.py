@@ -19,6 +19,7 @@ import time
 from collections import defaultdict
 from contextlib import nullcontext
 from copy import deepcopy
+from dataclasses import replace
 from functools import partial
 from itertools import chain
 from typing import Optional
@@ -140,6 +141,11 @@ def _dp_fraction(numerator: float, denominator: float, dp_group) -> float:
     if dp_group is not None:
         torch.distributed.all_reduce(pair, group=dp_group)
     return (pair[0] / pair[1].clamp(min=1)).item()
+
+
+def _local_shard(tensor: torch.Tensor) -> torch.Tensor:
+    """This rank's shard of an FSDP2 (DTensor) parameter; FSDP1 flat parameters are local already."""
+    return tensor.to_local() if hasattr(tensor, "to_local") else tensor
 
 
 def _sum_counts_over_mini_batches(metrics: dict, epochs: int) -> None:
@@ -624,7 +630,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 model_config=ref_config.model_config,
                 engine_config=ref_config.engine,
                 optimizer_config=ref_config.optim,
-                checkpoint_config=ref_config.checkpoint,
+                # the ref is never trained: SDPO's EMA teacher is checkpointed as weights only
+                checkpoint_config=replace(ref_config.checkpoint, save_contents=["model"], load_contents=["model"]),
             )
 
             # assign engine configs
@@ -809,7 +816,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 *kept_tokens, self.actor.engine.get_data_parallel_group()
             )
         if self.sdpo_enabled and tu.get_non_tensor_data(output, "did_update", default=True):
-            self._update_teacher_ema()
+            teacher_distance = self._update_teacher_ema()
+            if teacher_distance is not None:
+                metrics = tu.get_non_tensor_data(output, "metrics", default={})
+                metrics["self_distillation/teacher_student_rel_distance"] = teacher_distance
         return output.cpu() if output is not None else None
 
     def _compute_sdpo_teacher_logps_for_loss(
@@ -953,24 +963,35 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             result["teacher_topk_log_probs"] = to_response_grid(model_output["topk_logps"])
         return result
 
-    def _update_teacher_ema(self) -> None:
-        """EMA-update ref model toward actor after gradient step (SDPO)."""
-        if not self.sdpo_enabled or not self._is_ref:
-            return
-        teacher_regularization = self.sdpo_config.teacher_regularization
-        if teacher_regularization != "ema":
-            return
+    def _ema_teacher_active(self) -> bool:
+        """Whether the teacher is SDPO's EMA of the actor; frozen and trust-region teachers keep the base weights."""
+        return (
+            self.sdpo_enabled
+            and self._is_ref
+            and self.sdpo_config.teacher_regularization == "ema"
+            and float(self.sdpo_config.teacher_update_rate) != 0.0
+        )
+
+    def _update_teacher_ema(self) -> Optional[float]:
+        """EMA-update ref model toward actor after gradient step (SDPO). Returns how far the teacher was from the
+        actor before the update, relative to the actor's norm, or None when the teacher is not an EMA."""
+        if not self._ema_teacher_active():
+            return None
         update_rate = float(self.sdpo_config.teacher_update_rate)
-        if update_rate == 0.0:
-            return
+        actor_params = dict(self.actor.engine.module.named_parameters())
+        gap_sq = norm_sq = 0.0
         with torch.no_grad():
-            for ref_param, actor_param in zip(
-                self.ref.engine.module.parameters(),
-                self.actor.engine.module.parameters(),
-                strict=False,
-            ):
+            for name, ref_param in self.ref.engine.module.named_parameters():
+                # the ref is built without MTP, so the actor may hold parameters the ref lacks, never the reverse
+                actor_param = actor_params.get(name)
+                if actor_param is None or actor_param.shape != ref_param.shape:
+                    raise RuntimeError(f"the EMA teacher's parameter {name} has no matching actor parameter")
                 actor_data = actor_param.data.to(device=ref_param.device)
-                ref_param.data.mul_(1.0 - update_rate).add_(actor_data, alpha=update_rate)
+                gap = actor_data - ref_param.data
+                gap_sq += float(torch.linalg.vector_norm(_local_shard(gap))) ** 2
+                norm_sq += float(torch.linalg.vector_norm(_local_shard(actor_data))) ** 2
+                ref_param.data.add_(gap, alpha=update_rate)
+        return _dp_fraction(gap_sq, norm_sq, self.actor.engine.get_data_parallel_group()) ** 0.5
 
     def _configure_sdpo_teacher(self) -> None:
         if self.ref is None:
@@ -1003,6 +1024,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         assert "actor" in self.role, "save_checkpoint only support actor role"
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def save_teacher_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None) -> bool:
+        """Save SDPO's EMA teacher next to the actor; a frozen or trust-region teacher is the base model."""
+        if not self._ema_teacher_active():
+            return False
+        self.ref.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
+        return True
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_teacher_checkpoint(self, local_path, del_local_after_load=False) -> bool:
+        if not self._ema_teacher_active():
+            return False
+        if not os.path.isfile(os.path.join(local_path, "fsdp_config.json")):
+            logger.warning(f"No EMA teacher checkpoint at {local_path}: the teacher restarts from the base model")
+            return False
+        self.ref.load_checkpoint(local_path, None, del_local_after_load)
+        return True
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def host_rss_bytes(self) -> int:
