@@ -240,6 +240,21 @@ def _json_encode_default(obj):
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
+def _escape_surrogates(value):
+    """TransferQueue 0.1.7 cannot decode the pickle it falls back to when msgspec rejects a lone surrogate."""
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            return value.encode("utf-8", "backslashreplace").decode("utf-8")
+        return value
+    if isinstance(value, dict):
+        return {k: _escape_surrogates(v) for k, v in value.items()}
+    if type(value) in (list, tuple) and any(isinstance(v, (str, dict, list, tuple)) for v in value):
+        return type(value)(_escape_surrogates(v) for v in value)
+    return value
+
+
 class ReplayBuffer:
     """Replay buffer periodically polls metadata from transfer queue.
 
@@ -496,6 +511,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             field.update(kwargs)
             # do not store raw image/video
             field.pop("multi_modal_data", None)
+            field = {k: _escape_surrogates(v) for k, v in field.items()}
             # TODO: uniform response_mask and loss_mask
             field["loss_mask"] = field["response_mask"]
             field["input_ids"] = input_ids
