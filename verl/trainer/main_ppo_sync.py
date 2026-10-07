@@ -330,7 +330,7 @@ class ReplayBuffer:
                 should_wait = False
                 partition = self.partitions[partition_id]
                 for key, tag in partition.items():
-                    if tag["global_steps"] == global_steps:
+                    if tag.get("global_steps") == global_steps:
                         if tag["status"] == "running":
                             should_wait = True
                             break
