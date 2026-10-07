@@ -262,9 +262,14 @@ class ReplayBuffer:
         poll_interval (float, optional): Poll interval in seconds. Defaults to 1.0.
     """
 
+    liveness_interval = 30.0
+    liveness_timeout = 10.0
+
     def __init__(self, poll_interval: float = 1.0):
         # partition_id => {key: tags}
         self.partitions: dict[str, dict[str, dict]] = defaultdict(dict)
+        # partition_id => {uid: the agent loop worker running that prompt}
+        self.owners: dict[str, dict[str, Any]] = defaultdict(dict)
 
         self.poll_interval = poll_interval
         self.lock = threading.Lock()
@@ -322,6 +327,29 @@ class ReplayBuffer:
                 if key in partition:
                     del partition[key]
 
+    def assign(self, partition_id: str, owners: dict[str, Any]):
+        """Record which agent loop worker runs each prompt of the latest dispatch."""
+        with self.lock:
+            self.owners[partition_id] = dict(owners)
+
+    def _raise_if_a_worker_died(self, partition_id: str, running: list[str], global_steps: int):
+        """A killed worker never reports its prompts, so waiting for them would hang the run."""
+        owners = self.owners[partition_id]
+        workers = {owners[uid] for uid in running if uid in owners}
+        pings = {worker.__ray_ready__.remote(): worker for worker in workers}
+        if not pings:
+            return
+        ready, _ = ray.wait(list(pings), num_returns=len(pings), timeout=self.liveness_timeout)
+        for ping in ready:
+            try:
+                ray.get(ping)
+            except ray.exceptions.ActorDiedError as e:
+                lost = sum(owners.get(uid) == pings[ping] for uid in running)
+                raise RuntimeError(
+                    f"An agent loop worker died at global_steps={global_steps} with {lost} prompts unfinished; "
+                    f"stopping instead of training on a partial batch. Resume from the last checkpoint. Cause: {e}"
+                ) from e
+
     def sample(self, partition_id: str, global_steps: int = None, batch_size: int = None) -> KVBatchMeta:
         """Sample a batch of data from the replay buffer.
 
@@ -338,24 +366,34 @@ class ReplayBuffer:
             "Either global_steps or batch_size must be specified, but not both."
         )
 
+        last_liveness_check = time.monotonic()
         while True:
             time.sleep(self.poll_interval)
             with self.lock:
-                keys, tags = [], []
-                should_wait = False
+                keys, tags, running, failed = [], [], [], []
                 partition = self.partitions[partition_id]
                 for key, tag in partition.items():
                     if tag.get("global_steps") == global_steps:
                         if tag["status"] == "running":
-                            should_wait = True
-                            break
+                            running.append(key)
                         elif tag["status"] == "success":
                             keys.append(key)
                             tags.append(tag)
+                        elif tag["status"] == "failure":
+                            failed.append(key)
                         else:
                             logger.debug(f"Unknown status {tag['status']} for key {key}")
-                if not should_wait:
-                    return KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags)
+            if failed:
+                raise RuntimeError(
+                    f"{len(failed)} prompts failed in the agent loop at global_steps={global_steps} "
+                    f"(first: {failed[0]}); stopping instead of training on a partial batch. "
+                    "The cause is the 'Error in _run_prompt' traceback in the log."
+                )
+            if not running:
+                return KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags)
+            if time.monotonic() - last_liveness_check >= self.liveness_interval:
+                self._raise_if_a_worker_died(partition_id, running, global_steps)
+                last_liveness_check = time.monotonic()
 
 
 @ray.remote
@@ -575,12 +613,9 @@ class AgentLoopManagerTQ(AgentLoopManager):
         self.replay_buffer.add(partition_id, items)
 
         chunkes = prompts.chunk(len(self.agent_loop_workers))
-        ray.get(
-            [
-                worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=False)
-            ]
-        )
+        dispatch = list(zip(self.agent_loop_workers, chunkes, strict=False))
+        self.replay_buffer.assign(partition_id, {uid: worker for worker, chunk in dispatch for uid in chunk["uid"]})
+        ray.get([worker.generate_sequences.remote(chunk) for worker, chunk in dispatch])
 
 
 # ======================================= USER SECTION END =======================================
