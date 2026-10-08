@@ -919,9 +919,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             "temperature": temperature,
             "pad_token_id": tu.get_non_tensor_data(data=data, key="pad_token_id", default=0),
         }
-        teacher_td = tu.get_tensordict(tensor_dict=tensor_dict, non_tensor_dict=non_tensor_dict)
-        teacher_td = left_right_2_no_padding(teacher_td)
-
         use_logits_processor = return_all_logps or student_topk_indices is not None
         default_keys = {
             "use_remove_padding": tu.get_non_tensor_data(
@@ -929,39 +926,56 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             ),
             "use_dynamic_bsz": False,
             "max_token_len_per_gpu": None,
-            # each spliced sub-row carries its whole prefix, so a trace's sub-rows together can outgrow the GPU
-            "micro_batch_size_per_gpu": 1 if sub_spans is not None else responses.shape[0],
             # the teacher's outputs are top-k logps read off the logits, same as the student
             "use_fused_kernels": False,
             "calculate_entropy": False,
             "distillation_use_topk": use_logits_processor,
         }
-        tu.assign_non_tensor(teacher_td, **default_keys)
 
         # Span-only lm_head: only the supervised-span positions are ever consumed from spliced teacher rows.
-        if sub_spans is not None:
-            teacher_td["logits_keep_positions"] = turn_keep_positions(sub_seqs, sub_resps, sub_spans)
+        keep_positions = turn_keep_positions(sub_seqs, sub_resps, sub_spans).unbind() if sub_spans is not None else None
 
         # When full-logit distillation is on (top-k or all-vocab), run the teacher
         # extractor as the engine's logits processor; otherwise only plain log_probs
         # are needed. The extractor itself picks top-k vs all-vocab from the data.
         loss_function = _sdpo_teacher_extractor if use_logits_processor else None
+        output_keys = ["log_probs"]
+        if return_all_logps:
+            output_keys.append("all_logps")
+        elif student_topk_indices is not None:
+            output_keys.append("topk_logps")
 
+        # each spliced sub-row carries its whole prefix, so a trace's sub-rows are scored one call each: together
+        # they can outgrow the GPU, and every call keeps its own unpadding bookkeeping (max_seq_len, indices)
+        row_slices = [slice(j, j + 1) for j in range(responses.shape[0])] if sub_spans is not None else [slice(None)]
+        parts = {key: [] for key in output_keys}
         with self.ref.engine.eval_mode(disable_auto_offload=False):
-            output = self.ref.engine.infer_batch(teacher_td, loss_function=loss_function)
-        model_output = output["model_output"]
+            for rows in row_slices:
+                teacher_td = tu.get_tensordict(
+                    tensor_dict={key: value[rows] for key, value in tensor_dict.items()},
+                    non_tensor_dict=dict(non_tensor_dict),
+                )
+                teacher_td = left_right_2_no_padding(teacher_td)
+                tu.assign_non_tensor(teacher_td, **default_keys, micro_batch_size_per_gpu=responses[rows].shape[0])
+                if keep_positions is not None:
+                    teacher_td["logits_keep_positions"] = torch.nested.nested_tensor(
+                        list(keep_positions[rows]), layout=torch.jagged
+                    )
+                model_output = self.ref.engine.infer_batch(teacher_td, loss_function=loss_function)["model_output"]
+                for key in output_keys:
+                    parts[key].append(no_padding_2_padding(model_output[key], teacher_td).float())
 
-        def to_response_grid(values: torch.Tensor) -> torch.Tensor:
-            padded = no_padding_2_padding(values, teacher_td).float()
+        def to_response_grid(key: str) -> torch.Tensor:
+            padded = torch.cat(parts[key])
             if sub_spans is None:
                 return padded
             return scatter_turn_teacher_outputs(padded, sub_spans, batch_size, full_response_length)
 
-        result = {"teacher_log_probs": to_response_grid(model_output["log_probs"])}
+        result = {"teacher_log_probs": to_response_grid("log_probs")}
         if return_all_logps:
-            result["teacher_all_log_probs"] = to_response_grid(model_output["all_logps"])
+            result["teacher_all_log_probs"] = to_response_grid("all_logps")
         elif student_topk_indices is not None:
-            result["teacher_topk_log_probs"] = to_response_grid(model_output["topk_logps"])
+            result["teacher_topk_log_probs"] = to_response_grid("topk_logps")
         return result
 
     def _ema_teacher_active(self) -> bool:
