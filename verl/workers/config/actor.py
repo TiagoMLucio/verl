@@ -260,7 +260,8 @@ class ActorConfig(BaseConfig):
     use_fused_kernels: bool = False
 
     # Skip rows the update cannot learn from. They carry no supervision, so seq-mean-token-mean
-    # already gives them zero weight, but they still cost a forward and a backward.
+    # already gives them zero weight, but they still cost a forward and a backward. Without the
+    # sdpo loss: the rows of GRPO groups whose sessions all end on the same score.
     drop_unsupervised_rows: bool = False
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     engine: BaseConfig = field(default_factory=BaseConfig)

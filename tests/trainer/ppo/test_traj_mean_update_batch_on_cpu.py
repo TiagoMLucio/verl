@@ -307,3 +307,92 @@ def test_metrics_keep_every_row_and_read_advantages_off_the_kept_ones(monkeypatc
     assert metrics["critic/advantages/min"] == 2.0
     assert metrics["response_length/mean"] == pytest.approx(4.5), "lengths are over every row"
     assert metrics["critic/score/mean"] == pytest.approx(0.5), "scores are over every row"
+
+
+def _grpo_trainer(monkeypatch, outcome, condensed_every=5, adv_estimator="grpo"):
+    """64 tasks x 4 sessions; ``outcome(task, session)`` is the session's final score. Every
+    ``condensed_every``-th task's session 1 has an earlier segment scored 0, which must not count."""
+    monkeypatch.setattr(main_ppo_sync, "KVBatchMeta", KVBatchMeta)
+    monkeypatch.setattr(padding_utils, "KVBatchMeta", KVBatchMeta)
+    kv = KV()
+    monkeypatch.setattr(main_ppo_sync, "tq", kv)
+    monkeypatch.setattr(padding_utils, "tq", kv)
+
+    keys, tags = [], []
+    for t in range(64):
+        for s in range(4):
+            segments = 2 if (t % condensed_every == 0 and s == 1) else 1
+            for seg in range(segments):
+                key, seq_len = f"u{t}_{s}_{seg}", 8 + (t % 5)
+                row = _row(0.0, t, seq_len)
+                row["rm_scores"][-1] = float(outcome(t, s)) if seg == segments - 1 else 0.0
+                kv.store[key] = row
+                keys.append(key)
+                tags.append({"seq_len": seq_len})
+
+    trainer = object.__new__(main_ppo_sync.PPOTrainer)
+    trainer.config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "actor": {
+                    "ppo_mini_batch_size": 128,
+                    "ppo_micro_batch_size_per_gpu": 1,
+                    "ppo_epochs": 1,
+                    "drop_unsupervised_rows": True,
+                    "loss_agg_mode": "token-mean",
+                    "policy_loss": {"loss_mode": "vanilla"},
+                    "calculate_entropy": False,
+                    "entropy_coeff": 0.0,
+                    "data_loader_seed": 1,
+                    "shuffle": True,
+                },
+                "rollout": {"n": 4, "temperature": 1.0, "log_prob_micro_batch_size_per_gpu": 1},
+            },
+            "algorithm": {"adv_estimator": adv_estimator},
+            "trainer": {"critic_warmup": 0},
+        }
+    )
+    trainer.use_critic = False
+    trainer.global_steps = 1
+    trainer.tokenizer = SimpleNamespace(eos_token_id=0)
+    trainer._get_dp_size = lambda wg, role: DP
+    trainer.replay_buffer = SimpleNamespace(remove=lambda partition_id, keys: None)
+    sent = []
+    trainer.actor_rollout_wg = SimpleNamespace(update_actor=lambda b: sent.append(b) or {"metrics": {"mfu": 0.0}})
+    batch = trainer._balance_batch(KVBatchMeta(keys=keys, tags=tags, partition_id="train"), metrics={})
+    return trainer, batch, sent
+
+
+def _mixed_every_third(t, s):
+    # t % 3 == 0: all pass, 1: all fail, 2: only session 0 passes
+    return 1 if t % 3 == 0 else 0 if t % 3 == 1 else int(s == 0)
+
+
+def test_grpo_drop_keeps_only_groups_with_differing_scores(monkeypatch):
+    trainer, batch, sent = _grpo_trainer(monkeypatch, _mixed_every_third)
+    real = [k for k, t in zip(batch.keys, batch.tags, strict=True) if not t.get("is_padding")]
+    assert len(batch) == 512 and len(real) == 256 + 13
+    metrics = {}
+    update_batch = _update(trainer, batch, metrics)
+    kept = {k for k, t in zip(update_batch.keys, update_batch.tags, strict=True) if not t.get("is_padding")}
+    mixed = {k for k in real if int(k.split("_")[0][1:]) % 3 == 2}
+    # every segment of every session of the mixed tasks, and nothing else
+    assert kept == mixed and len(mixed) == 21 * 4 + 4
+    assert metrics["training/dropped_zero_advantage_rows"] == len(real) - len(mixed)
+    # still one optimizer step: the re-balance pads back to the 512-row mini-batch
+    assert sent == [update_batch] and len(update_batch) == 512
+    assert update_batch.extra_info["mini_batch_size"] == 512
+
+
+def test_grpo_drop_counts_only_each_session_final_segment(monkeypatch):
+    """An all-pass group whose condensed session has an earlier segment scored 0 has zero advantage."""
+    trainer, batch, _ = _grpo_trainer(monkeypatch, lambda t, s: 1, condensed_every=1)
+    metrics = {}
+    assert _update(trainer, batch, metrics) is batch, "nothing varies: the batch goes through whole"
+    assert metrics["training/dropped_zero_advantage_rows"] == 256 + 64
+
+
+def test_grpo_drop_needs_the_grpo_estimator(monkeypatch):
+    trainer, batch, _ = _grpo_trainer(monkeypatch, _mixed_every_third, adv_estimator="gae")
+    with pytest.raises(ValueError, match="adv_estimator=grpo"):
+        trainer._select_update_rows(batch, {})

@@ -1794,14 +1794,22 @@ class PPOTrainer:
 
         The per-trajectory weighting is untouched. A row with no supervision has share
         zero, so neither traj_supervised nor the renormalising scale moves when it goes.
+
+        Without the sdpo loss the rows dropped are those of GRPO groups whose sessions all end on
+        the same score: their advantage is zero on every token.
         """
-        weights = tq.kv_batch_get(
-            keys=batch.keys, partition_id=batch.partition_id, select_fields=["trace_weight"]
-        )["trace_weight"]
-        weights = (weights.to_padded_tensor(0.0) if weights.is_nested else weights).reshape(len(batch.keys), -1)
-        supervised = [bool(w.abs().sum() > 0) for w in weights.unbind()]
+        if self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla") == "sdpo":
+            weights = tq.kv_batch_get(
+                keys=batch.keys, partition_id=batch.partition_id, select_fields=["trace_weight"]
+            )["trace_weight"]
+            weights = (weights.to_padded_tensor(0.0) if weights.is_nested else weights).reshape(len(batch.keys), -1)
+            supervised = [bool(w.abs().sum() > 0) for w in weights.unbind()]
+            metric = "self_distillation/dropped_unsupervised_rows"
+        else:
+            supervised = self._rows_in_varied_groups(batch)
+            metric = "training/dropped_zero_advantage_rows"
         kept = sum(supervised)
-        metrics["self_distillation/dropped_unsupervised_rows"] = sum(
+        metrics[metric] = sum(
             not keep and not tag.get("is_padding", False) for keep, tag in zip(supervised, batch.tags, strict=True)
         )
         if kept == 0 or kept == len(supervised):
@@ -1815,6 +1823,26 @@ class PPOTrainer:
             extra_info=batch.extra_info,
         )
         return self._balance_batch(batch, metrics, logging_prefix="update_seqlen")
+
+    def _rows_in_varied_groups(self, batch: KVBatchMeta) -> list[bool]:
+        """Per row, whether its GRPO group (prompt uid) has sessions ending on different scores; a
+        session's score is its final segment's, as in compute_advantage_for_multi_trajectories."""
+        if self.config.algorithm.adv_estimator != core_algos.AdvantageEstimator.GRPO:
+            raise ValueError("drop_unsupervised_rows without the sdpo loss needs algorithm.adv_estimator=grpo")
+        real = [k for k, tag in zip(batch.keys, batch.tags, strict=True) if not tag.get("is_padding", False)]
+        final_keys = [real[i] for i in _final_segment_local_indices(real)]
+        scores = tq.kv_batch_get(keys=final_keys, partition_id=batch.partition_id, select_fields=["rm_scores"])[
+            "rm_scores"
+        ]
+        scores = (scores.to_padded_tensor(0.0) if scores.is_nested else scores).reshape(len(final_keys), -1).sum(-1)
+        by_uid = defaultdict(list)
+        for key, score in zip(final_keys, scores.tolist(), strict=True):
+            by_uid[_parse_key(key)[0]].append(score)
+        varied = {uid for uid, group in by_uid.items() if max(group) > min(group)}
+        return [
+            not tag.get("is_padding", False) and _parse_key(key)[0] in varied
+            for key, tag in zip(batch.keys, batch.tags, strict=True)
+        ]
 
     def _select_update_rows(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """The rows old log-prob, advantage and the update run on; ``batch`` keeps every row for
