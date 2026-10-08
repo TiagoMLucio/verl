@@ -948,9 +948,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # each spliced sub-row carries its whole prefix, so a trace's sub-rows are scored one call each: together
         # they can outgrow the GPU, and every call keeps its own unpadding bookkeeping (max_seq_len, indices)
         row_slices = [slice(j, j + 1) for j in range(responses.shape[0])] if sub_spans is not None else [slice(None)]
+        n_calls = len(row_slices)
+        if sub_spans is not None and torch.distributed.is_initialized():
+            # each infer_batch runs FSDP all-gathers and an all-reduce, so every rank makes the same number of calls;
+            # a rank with fewer sub-rows repeats its last one and drops the extra outputs
+            group = self.ref.engine.get_data_parallel_group()
+            device = "cpu" if torch.distributed.get_backend(group) == "gloo" else get_device_name()
+            count = torch.tensor(n_calls, device=device)
+            torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.MAX, group=group)
+            n_calls = int(count.item())
         parts = {key: [] for key in output_keys}
         with self.ref.engine.eval_mode(disable_auto_offload=False):
-            for rows in row_slices:
+            for call in range(n_calls):
+                rows = row_slices[min(call, len(row_slices) - 1)]
                 teacher_td = tu.get_tensordict(
                     tensor_dict={key: value[rows] for key, value in tensor_dict.items()},
                     non_tensor_dict=dict(non_tensor_dict),
@@ -962,8 +972,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         list(keep_positions[rows]), layout=torch.jagged
                     )
                 model_output = self.ref.engine.infer_batch(teacher_td, loss_function=loss_function)["model_output"]
-                for key in output_keys:
-                    parts[key].append(no_padding_2_padding(model_output[key], teacher_td).float())
+                if call < len(row_slices):
+                    for key in output_keys:
+                        parts[key].append(no_padding_2_padding(model_output[key], teacher_td).float())
 
         def to_response_grid(key: str) -> torch.Tensor:
             padded = torch.cat(parts[key])
