@@ -929,7 +929,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             ),
             "use_dynamic_bsz": False,
             "max_token_len_per_gpu": None,
-            "micro_batch_size_per_gpu": responses.shape[0],
+            # each spliced sub-row carries its whole prefix, so a trace's sub-rows together can outgrow the GPU
+            "micro_batch_size_per_gpu": 1 if sub_spans is not None else responses.shape[0],
             # the teacher's outputs are top-k logps read off the logits, same as the student
             "use_fused_kernels": False,
             "calculate_entropy": False,
