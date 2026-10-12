@@ -125,6 +125,28 @@ def test_a_band_splits_its_source_next_to_the_total():
     assert "val-core/all/reward/mean@2" not in out
 
 
+def test_a_source_whose_rows_name_band_weights_totals_its_bands_by_them():
+    bands = ["mid", "mid", "likely", "likely", "rare", "rare"]
+    weights = {"mid": 0.2, "likely": 0.5, "rare": 0.1}
+    out = health.validation_metrics(*_val(bands), sample_band_weights=[weights[b] for b in bands])
+    # mid 0.5, likely 1.0, rare 0.0; the plain mean of the rows would read 0.5
+    assert out["val-core/v128/reward/mean@2"] == pytest.approx(0.2 * 0.5 + 0.5 * 1.0 + 0.1 * 0.0)
+    assert out["val-core/v128/reward/best@2/mean"] == pytest.approx(
+        sum(weights[b] * out[f"val-core/v128_{b}/reward/best@2/mean"] for b in weights))
+    assert out["val-core/v128_mid/reward/mean@2"] == 0.5
+    plain = health.validation_metrics(*_val(bands))
+    assert out["val-aux/v128/reward/std@2"] == plain["val-aux/v128/reward/std@2"]
+
+
+def test_a_source_keeps_its_plain_total_unless_every_row_names_its_bands_one_weight():
+    bands = ["mid", "mid", "likely", "likely", "rare", "rare"]
+    plain = health.validation_metrics(*_val(bands))["val-core/v128/reward/mean@2"]
+    some = health.validation_metrics(*_val(bands), sample_band_weights=[0.2, 0.2, 0.5, 0.5, None, None])
+    assert some["val-core/v128/reward/mean@2"] == plain
+    two = health.validation_metrics(*_val(bands), sample_band_weights=[0.2, 0.3, 0.5, 0.5, 0.1, 0.1])
+    assert two["val-core/v128/reward/mean@2"] == plain
+
+
 def test_turn_entropy_counts_model_tokens_per_turn_and_skips_padding():
     import torch
 

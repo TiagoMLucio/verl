@@ -1032,6 +1032,7 @@ class PPOTrainer:
         sample_exit_reasons = []
         data_sources = []
         uid_to_band: dict[str, Optional[str]] = {}
+        uid_to_band_weight: dict[str, Optional[float]] = {}
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
         dump_all_inputs: list[str] = []
         dump_all_outputs: list[str] = []
@@ -1057,6 +1058,7 @@ class PPOTrainer:
             )
             for uid, extra_info in zip(batch_dict["uid"], batch_dict.get("extra_info", [None] * n_prompts)):
                 uid_to_band[uid] = extra_info.get("val_band") if isinstance(extra_info, dict) else None
+                uid_to_band_weight[uid] = extra_info.get("val_band_weight") if isinstance(extra_info, dict) else None
             batch = tu.get_tensordict(batch_dict)
             tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
             tu.assign_non_tensor_data(batch, "validate", True)
@@ -1222,6 +1224,7 @@ class PPOTrainer:
             reward_extra_infos_dict,
             sample_turns,
             sample_bands=[uid_to_band.get(uid) for uid in sample_uids],
+            sample_band_weights=[uid_to_band_weight.get(uid) for uid in sample_uids],
             sample_exit_reasons=sample_exit_reasons,
         )
         val_metrics.setdefault("val-aux/exit_missing_fraction", 0.0)

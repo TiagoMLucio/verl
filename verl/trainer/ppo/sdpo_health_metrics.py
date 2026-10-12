@@ -243,8 +243,26 @@ def turn_entropy_metrics(entropy, response_mask, extra_fields, is_padding) -> di
     return out
 
 
+def _band_weights(data_sources, sample_bands, sample_band_weights) -> dict[str, dict[str, float]]:
+    """Each source's bands and their weights, for the sources whose every row names a band and the band's one weight."""
+    found: dict[str, dict[str, float]] = {}
+    refused = set()
+    for source, band, weight in zip(data_sources, sample_bands or [], sample_band_weights or []):
+        if band is None or weight is None:
+            refused.add(source)
+        elif found.setdefault(source, {}).setdefault(band, float(weight)) != float(weight):
+            refused.add(source)
+    return {source: bands for source, bands in found.items() if source not in refused}
+
+
 def validation_metrics(
-    data_sources, sample_uids, reward_extra_infos_dict, sample_turns, sample_bands=None, sample_exit_reasons=None
+    data_sources,
+    sample_uids,
+    reward_extra_infos_dict,
+    sample_turns,
+    sample_bands=None,
+    sample_exit_reasons=None,
+    sample_band_weights=None,
 ) -> dict[str, float]:
     data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
     # with multiple sources (e.g. difficulty bands) also log the combined total under "all"
@@ -261,6 +279,15 @@ def validation_metrics(
                 {key: [values[i] for i in banded] for key, values in reward_extra_infos_dict.items()},
             )
         )
+    # a set that samples its bands unevenly gives each band's weight (extra_info.val_band_weight): its total is then
+    # the weighted sum of its bands' means, which the plain mean over its rows is not
+    for source, bands in _band_weights(data_sources, sample_bands, sample_band_weights).items():
+        var2metric2val = data_src2var2metric2val[source]
+        core_var = "acc" if "acc" in var2metric2val else "reward"
+        for name in [n for n in var2metric2val.get(core_var, {}) if n.startswith("mean@") or n.endswith("/mean")]:
+            per_band = [data_src2var2metric2val[f"{source}_{band}"][core_var].get(name) for band in bands]
+            if all(value is not None for value in per_band):
+                var2metric2val[core_var][name] = sum(w * value for w, value in zip(bands.values(), per_band))
     metric_dict = {}
     for data_source, var2metric2val in data_src2var2metric2val.items():
         core_var = "acc" if "acc" in var2metric2val else "reward"
