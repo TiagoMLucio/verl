@@ -33,19 +33,22 @@ def njt(rows):
     return torch.nested.nested_tensor(rows, layout=torch.jagged)
 
 
-def make_hinted_sample(resp_len=9000, prompt_len=50):
+def make_hinted_sample(resp_len=9000, prompt_len=50, contrast=False):
     """A spliced teacher row as the turn-hint teacher ships it: one sub-row per hinted turn
     (here [100, 2600) and [2600, resp_len)), each the prompt, the history, the hint and the
-    scored span."""
+    scored span; with ``contrast`` the same sub-rows again after them, a contrast text in place of the hint."""
     response_ids = torch.arange(resp_len, dtype=torch.long)
     prompt_ids = torch.full((prompt_len,), 7, dtype=torch.long)
     hint_ids = [torch.full((20,), 5, dtype=torch.long), torch.full((30,), 6, dtype=torch.long)]
-    pieces, sub_rows = [], []
+    pieces, sub_rows, contrast_pieces, contrast_rows = [], [], [], []
     for (start, end), hint in zip([(100, 2600), (2600, resp_len)], hint_ids, strict=True):
-        body = torch.cat([response_ids[:start], hint, response_ids[start:end]])
-        pieces.append(torch.cat([prompt_ids, body]))
-        sub_rows.append(SubRow(prompt_len + body.shape[0], body.shape[0], start + hint.shape[0], start, end))
-    seq, meta = torch.cat(pieces), pack(sub_rows)
+        for pieces_out, rows_out, text in ((pieces, sub_rows, hint), (contrast_pieces, contrast_rows, hint[:10] + 3)):
+            body = torch.cat([response_ids[:start], text, response_ids[start:end]])
+            pieces_out.append(torch.cat([prompt_ids, body]))
+            rows_out.append(SubRow(prompt_len + body.shape[0], body.shape[0], start + text.shape[0], start, end))
+    if not contrast:
+        contrast_pieces, contrast_rows = [], []
+    seq, meta = torch.cat(pieces + contrast_pieces), pack(sub_rows, contrast_rows)
     return {
         "responses": response_ids,
         "response_mask": torch.ones(resp_len),
@@ -88,6 +91,33 @@ def test_micro_splits_stay_row_aligned():
         run_teacher_grid_path(tu.index_select_tensor_dict(td, idx))
     for micro in tu.chunk_tensordict(td, 2):
         run_teacher_grid_path(micro)
+
+
+def test_contrast_subrows_scatter_apart_from_the_hint_ones():
+    stub = {
+        "responses": torch.tensor([11], dtype=torch.long),
+        "response_mask": torch.zeros(1),
+        "teacher_input_ids": torch.tensor([8, 11], dtype=torch.long),
+        "teacher_seq_meta": torch.tensor(DEGENERATE_META, dtype=torch.int64),
+    }
+    micro = to_td([make_hinted_sample(contrast=True), stub])
+    _, sub_resps, _, sub_spans = explode_turn_teacher_rows(
+        teacher_input_ids=micro["teacher_input_ids"],
+        teacher_seq_meta=micro["teacher_seq_meta"],
+        responses=micro["responses"],
+        mask_dtype=micro["response_mask"].dtype,
+    )
+    assert [(span.parent, span.contrast) for span in sub_spans] == [
+        (0, False), (0, False), (0, True), (0, True), (1, False)
+    ]
+    max_body = max(r.shape[0] for r in sub_resps.unbind())
+    outputs = torch.arange(1.0, 6.0).reshape(5, 1).expand(5, max_body).clone()  # sub-row j is all j + 1
+
+    hint = scatter_turn_teacher_outputs(outputs, sub_spans, 2, 9000)
+    contrast = scatter_turn_teacher_outputs(outputs, sub_spans, 2, 9000, contrast=True)
+    assert hint[0, 100:2600].eq(1).all() and hint[0, 2600:].eq(2).all() and hint[0, :100].eq(0).all()
+    assert contrast[0, 100:2600].eq(3).all() and contrast[0, 2600:].eq(4).all() and contrast[0, :100].eq(0).all()
+    assert hint[1, 0] == 5 and contrast[1].eq(0).all(), "the un-hinted row's stub has no contrast sub-row"
 
 
 def test_corrupt_spans_are_caught():

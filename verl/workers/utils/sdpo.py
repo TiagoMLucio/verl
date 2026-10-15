@@ -97,7 +97,8 @@ def explode_turn_teacher_rows(
     One sub-row per supervised span, each carrying only its own prefix, so the teacher scores
     every span from the context built for it. Rows without supervised spans ship a
     degenerate 2-token sub-row: the teacher forward must run on every rank every micro-batch
-    so its dp-group collectives stay in lockstep. Returns nested sequences / bodies / all-ones
+    so its dp-group collectives stay in lockstep. A sample's contrast sub-rows follow its own,
+    flagged ``contrast`` in their span. Returns nested sequences / bodies / all-ones
     body presence masks (``mask_dtype``) plus one :class:`SubRowSpan` per sub-row.
     """
     seq_list = teacher_input_ids.unbind()
@@ -110,7 +111,10 @@ def explode_turn_teacher_rows(
     )
     for i, (seq, meta) in enumerate(zip(seq_list, meta_list, strict=True)):
         offset = 0
-        for j, sub_row in enumerate(unpack(meta.tolist(), sample=i)):
+        flat = meta.tolist()
+        sub_rows = [(row, False) for row in unpack(flat, sample=i)]
+        sub_rows += [(row, True) for row in unpack(flat, sample=i, contrast=True)]
+        for j, (sub_row, contrast) in enumerate(sub_rows):
             assert 0 < sub_row.body_len <= sub_row.total_len and offset + sub_row.total_len <= seq.shape[0], (
                 f"teacher_seq_meta malformed for sample {i} sub-row {j}: total {sub_row.total_len}, "
                 f"body {sub_row.body_len}, offset {offset}, seq len {seq.shape[0]}"
@@ -123,7 +127,7 @@ def explode_turn_teacher_rows(
             sub_seqs.append(sub)
             sub_resps.append(sub[-sub_row.body_len :])
             sub_masks.append(torch.ones(sub_row.body_len, dtype=mask_dtype, device=sub.device))
-            sub_spans.append(SubRowSpan(i, sub_row.body_start, sub_row.start, sub_row.end))
+            sub_spans.append(SubRowSpan(i, sub_row.body_start, sub_row.start, sub_row.end, contrast))
             offset += sub_row.total_len
 
     return (
@@ -295,13 +299,17 @@ def scatter_turn_teacher_outputs(
     sub_spans: list[SubRowSpan],
     batch_size: int,
     response_length: int,
+    contrast: bool = False,
 ) -> torch.Tensor:
-    """Scatter padded spliced-body teacher outputs back onto the (batch, response) grid.
+    """Scatter padded spliced-body teacher outputs back onto the (batch, response) grid, the
+    contrast teacher's sub-rows or the others.
 
     Positions outside the scored spans stay zero; the per-token distillation mask excludes them.
     """
     full = sub_outputs.new_zeros((batch_size, response_length, *sub_outputs.shape[2:]))
     for j, parent, body_slice, response_slice in body_slices(sub_spans):
+        if sub_spans[j].contrast != contrast:
+            continue
         if parent >= batch_size or response_slice.stop > response_length or sub_outputs.dim() < 2:
             raise RuntimeError(
                 "scatter_turn_teacher_outputs misalignment: "

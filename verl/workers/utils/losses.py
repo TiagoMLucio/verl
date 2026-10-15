@@ -294,6 +294,7 @@ def sdpo_ppo_loss(
     student_all_logps = None
     teacher_topk_logps = None
     teacher_all_logps = None
+    contrast_topk_logps = None
 
     if full_logit_distillation and distill_topk is not None:
         student_topk_logps = no_padding_2_padding(model_output["topk_logps"], data)
@@ -310,6 +311,7 @@ def sdpo_ppo_loss(
         teacher_log_probs = teacher_outputs.get("teacher_log_probs", teacher_log_probs)
         teacher_topk_logps = teacher_outputs.get("teacher_topk_log_probs", teacher_topk_logps)
         teacher_all_logps = teacher_outputs.get("teacher_all_log_probs", teacher_all_logps)
+        contrast_topk_logps = teacher_outputs.get("contrast_topk_log_probs")
 
     if teacher_log_probs is None:
         raise ValueError("SDPO: teacher_log_probs missing and no teacher_logprob_fn produced it.")
@@ -340,6 +342,7 @@ def sdpo_ppo_loss(
         global_batch_info=config.global_batch_info,
         seq_weights=trace_weight,
         supervised_spans=supervised_spans(data),
+        contrast_topk_log_probs=contrast_topk_logps,
     )
     metrics["self_distillation/empty_target_batch"] = (
         self_distillation_mask.sum().item() == 0 if self_distillation_mask is not None else False

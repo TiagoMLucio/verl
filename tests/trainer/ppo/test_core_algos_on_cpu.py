@@ -29,6 +29,7 @@ from verl.trainer.ppo.core_algos import (
     compute_rloo_outcome_advantage,
     compute_rloo_vectorized_outcome_advantage,
     compute_self_distillation_loss,
+    contrastive_target_log_probs,
     finalize_ratio_metrics,
     get_adv_estimator_fn,
     kl_penalty,
@@ -469,6 +470,137 @@ def test_compute_self_distillation_loss_topk_and_masking():
     )
     assert torch.allclose(loss_masked, torch.tensor(0.0, dtype=loss_masked.dtype, device=loss_masked.device))
     assert finalize_ratio_metrics(metrics_masked)["self_distillation/supervised_token_fraction"] == 0.0
+
+
+def _log_dist(*probs):
+    return torch.tensor(probs).log()
+
+
+def test_contrastive_target_is_the_student_where_the_teachers_agree():
+    student = torch.log_softmax(torch.randn(2, 3, 101), dim=-1)
+    hint = torch.log_softmax(torch.randn(2, 3, 101), dim=-1)
+    target, _ = contrastive_target_log_probs(student, hint, hint)
+    torch.testing.assert_close(target, student, atol=1e-6, rtol=0)
+
+
+def test_contrastive_target_is_the_hint_teacher_where_the_contrast_is_the_student():
+    # every bin is above the floor for the student or the hint teacher, so the shift reaches all of them
+    student = torch.log_softmax(torch.randn(2, 3, 9) * 0.5, dim=-1)
+    hint = torch.log_softmax(torch.randn(2, 3, 9) * 0.5, dim=-1)
+    target, reached = contrastive_target_log_probs(student, hint, student)
+    assert reached.all()
+    torch.testing.assert_close(target, hint, atol=1e-6, rtol=0)
+
+
+def test_contrastive_target_leaves_the_bins_no_one_gives_mass_to():
+    student = _log_dist(0.706, 0.28, 0.004, 0.002, 0.008)
+    hint = _log_dist(0.50, 0.46, 0.003, 0.001, 0.036)
+    contrast = _log_dist(0.60, 0.30, 0.0005, 0.0095, 0.09)
+    target, reached = contrastive_target_log_probs(student, hint, contrast)
+
+    # bins 2 and 3 are under the floor for both; the last is under it for the student only
+    assert reached.tolist() == [True, True, False, False, True]
+    shifted = student + torch.tensor([0.5 / 0.6, 0.46 / 0.3, 1.0, 1.0, 0.036 / 0.09]).log()
+    torch.testing.assert_close(target, torch.log_softmax(shifted, dim=-1))
+    # without the floor, bins 2 and 3 would move against each other by the teachers' noise
+    unfloored = torch.log_softmax(student + hint - contrast, dim=-1)
+    assert abs(float(unfloored[3] - unfloored[2] - (student[3] - student[2]))) > 1.0
+    assert float(target[3] - target[2]) == pytest.approx(float(student[3] - student[2]))
+
+
+def test_contrastive_target_is_renormalised_and_a_constant():
+    student = torch.log_softmax(torch.randn(4, 101), dim=-1).requires_grad_(True)
+    hint = torch.log_softmax(torch.randn(4, 101), dim=-1)
+    contrast = torch.log_softmax(torch.randn(4, 101), dim=-1)
+    target, _ = contrastive_target_log_probs(student, hint, contrast)
+    torch.testing.assert_close(target.exp().sum(-1), torch.ones(4))
+    assert not target.requires_grad
+
+
+def _contrast_cfg(**overrides):
+    cfg = dict(full_logit_distillation=True, distillation_topk=6, distillation_add_tail=True, alpha=1.0, is_clip=None)
+    return SimpleNamespace(**{**cfg, **overrides})
+
+
+def _with_tail(topk_log_probs):
+    log_s = torch.logsumexp(topk_log_probs, -1, keepdim=True).clamp(max=-1e-7)
+    return torch.cat([topk_log_probs, torch.log(-torch.expm1(log_s))], -1)
+
+
+def _topk_batch(seed=0):
+    generator = torch.Generator().manual_seed(seed)
+    return [torch.log_softmax(torch.randn(2, 4, 8, generator=generator) * 0.3, dim=-1)[..., :6] for _ in range(3)]
+
+
+def _contrast_loss(student, hint, contrast, cfg=None, mask=None):
+    return compute_self_distillation_loss(
+        student_log_probs=torch.zeros(2, 4),
+        teacher_log_probs=torch.zeros(2, 4),
+        response_mask=torch.ones(2, 4),
+        self_distillation_config=cfg or _contrast_cfg(),
+        student_topk_log_probs=student,
+        teacher_topk_log_probs=hint,
+        contrast_topk_log_probs=contrast,
+        self_distillation_mask=mask,
+    )
+
+
+def test_a_contrast_that_matches_the_hint_teacher_is_a_zero_loss():
+    student, hint, _ = _topk_batch()
+    loss, metrics = _contrast_loss(student, hint, hint)
+    assert float(loss) == pytest.approx(0.0, abs=1e-6)
+    assert metrics["self_distillation/kl_hint__sum"] > 0
+    assert metrics["self_distillation/kl_target__sum"] == pytest.approx(0.0, abs=1e-5)
+
+
+def test_a_contrast_that_matches_the_student_is_the_hint_teacher_loss():
+    student, hint, _ = _topk_batch()
+    plain, _ = compute_self_distillation_loss(
+        student_log_probs=torch.zeros(2, 4),
+        teacher_log_probs=torch.zeros(2, 4),
+        response_mask=torch.ones(2, 4),
+        self_distillation_config=_contrast_cfg(),
+        student_topk_log_probs=student,
+        teacher_topk_log_probs=hint,
+    )
+    loss, metrics = _contrast_loss(student, hint, student)
+    torch.testing.assert_close(loss, plain, atol=1e-6, rtol=0)
+
+    ratios = finalize_ratio_metrics(metrics)
+    assert ratios["self_distillation/kl_target"] == pytest.approx(ratios["self_distillation/kl_hint"], rel=1e-4)
+    assert ratios["self_distillation/contrast_floor_masked"] == 0.0
+    assert metrics["self_distillation/contrast_bins__sum"] == 2 * 4 * 7  # 6 top-k bins and the tail, per token
+
+
+def test_the_contrast_metrics_count_the_supervised_tokens_only():
+    student, hint, contrast = _topk_batch()
+    mask = torch.tensor([1.0, 0.0])
+    _, metrics = _contrast_loss(student, hint, contrast, mask=mask)
+    assert metrics["self_distillation/contrast_bins__sum"] == 4 * 7
+    assert metrics["self_distillation/supervised_tokens__sum"] == 4
+    _, none = _contrast_loss(student, hint, contrast, mask=torch.zeros(2))
+    assert none["self_distillation/contrast_bins__sum"] == 0 and none["self_distillation/kl_target__sum"] == 0.0
+
+
+def test_the_loss_follows_the_student_toward_a_constant_target():
+    student, hint, contrast = _topk_batch()
+    student = student.clone().requires_grad_(True)
+    loss, _ = _contrast_loss(student, hint, contrast)
+    (grad,) = torch.autograd.grad(loss, student)
+
+    binned = _with_tail(student)
+    target, _ = contrastive_target_log_probs(binned.detach(), _with_tail(hint), _with_tail(contrast))
+    reference = (binned.exp() * (binned - target)).sum(-1).mean()
+    (expected,) = torch.autograd.grad(reference, student)
+    torch.testing.assert_close(loss, reference.detach())
+    torch.testing.assert_close(grad, expected)
+
+
+def test_a_contrast_needs_full_logit_top_k_distillation():
+    student, hint, contrast = _topk_batch()
+    for cfg in (_contrast_cfg(distillation_topk=None), _contrast_cfg(full_logit_distillation=False)):
+        with pytest.raises(ValueError, match="distillation_topk"):
+            _contrast_loss(student, hint, contrast, cfg=cfg)
 
 
 def test_compute_self_distillation_loss_optional_is_clip():

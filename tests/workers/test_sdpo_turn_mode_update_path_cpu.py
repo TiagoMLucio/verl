@@ -126,8 +126,11 @@ def make_engine(module):
     return eng
 
 
-def make_batch(include_hinted=True, include_unhinted=True, loss_agg_mode="token-mean", hinted_span=(2, 7)):
-    """Build the turn-mode mini-batch exactly as _maybe_build_self_distillation_batch ships it."""
+def make_batch(
+    include_hinted=True, include_unhinted=True, loss_agg_mode="token-mean", hinted_span=(2, 7), contrast=None
+):
+    """Build the turn-mode mini-batch exactly as _maybe_build_self_distillation_batch ships it; ``contrast``
+    ("same" or "other" tokens than the hint) adds the hinted turn's contrast sub-row."""
     rows = []
     if include_hinted:
         # hinted sample: prompt 4, response 12, one hinted turn covering response [2, 7); its
@@ -138,7 +141,17 @@ def make_batch(include_hinted=True, include_unhinted=True, loss_agg_mode="token-
         hint_ids = torch.tensor([50, 51, 52], dtype=torch.long)
         body = torch.cat([resp[:start], hint_ids, resp[start:end]])
         seq = torch.cat([prompt, body])
-        meta = pack([SubRow(seq.shape[0], body.shape[0], start + hint_ids.shape[0], start, end)])
+        sub_row = SubRow(seq.shape[0], body.shape[0], start + hint_ids.shape[0], start, end)
+        contrast_rows = []
+        if contrast is not None:
+            contrast_ids = hint_ids if contrast == "same" else torch.tensor([60, 61], dtype=torch.long)
+            contrast_body = torch.cat([resp[:start], contrast_ids, resp[start:end]])
+            contrast_seq = torch.cat([prompt, contrast_body])
+            contrast_rows = [
+                SubRow(contrast_seq.shape[0], contrast_body.shape[0], start + contrast_ids.shape[0], start, end)
+            ]
+            seq = torch.cat([seq, contrast_seq])
+        meta = pack([sub_row], contrast_rows)
         sd_mask = torch.zeros(12)
         sd_mask[start:end] = 1.0
         rows.append(dict(prompt=prompt, resp=resp, teacher_seq=seq, meta=torch.tensor(meta), sd_mask=sd_mask))
@@ -197,7 +210,7 @@ def make_batch(include_hinted=True, include_unhinted=True, loss_agg_mode="token-
     return tu.get_tensordict(tensor_dict=tensor_dict, non_tensor_dict=non_tensor_dict)
 
 
-def run_update(data, loss_agg_mode="token-mean", dp_size=None):
+def run_update(data, loss_agg_mode="token-mean", dp_size=None, alpha=0.5):
     """Mirror ActorRolloutRefWorker.update_actor minus Ray/FSDP/TQ; ``dp_size`` fakes the rank count the
     loss is told, as if every rank held this same batch."""
     student_engine = make_engine(ToyLM(seed=0))
@@ -222,7 +235,7 @@ def run_update(data, loss_agg_mode="token-mean", dp_size=None):
         full_logit_distillation=True,
         distillation_topk=TOPK,
         distillation_add_tail=True,
-        alpha=0.5,
+        alpha=alpha,
         is_clip=2.0,
     )
     loss_fn = partial(sdpo_ppo_loss, config=actor_config, sdpo_config=sdpo_config, teacher_logprob_fn=teacher_fn)
@@ -349,6 +362,88 @@ def test_all_unhinted_micro_still_runs_teacher(single_process_group, cpu_ops):
     assert teacher_lp[0, 0].abs() > 0, "teacher must score the degenerate token (lockstep)"
     assert teacher_lp[0, 1:].abs().sum() == 0
     assert result["teacher_topk_log_probs"].shape == (1, 9, TOPK)
+
+
+def _score(data, topk_indices):
+    teacher_engine = make_engine(ToyLM(seed=1))
+    worker = SimpleNamespace(
+        ref=SimpleNamespace(
+            engine=teacher_engine,
+            model_config={"use_remove_padding": True},
+            engine_config=SimpleNamespace(use_fused_kernels=False),
+        )
+    )
+    tu.assign_non_tensor(data, dp_size=1)
+    return ActorRolloutRefWorker._compute_sdpo_teacher_logps_for_loss(
+        worker, data=data, student_topk_indices=topk_indices, return_all_logps=False
+    )
+
+
+def test_the_contrast_subrow_is_scored_at_the_students_indices_apart_from_the_hint_one(single_process_group, cpu_ops):
+    topk = torch.randint(0, VOCAB, (2, 12, TOPK), generator=torch.Generator().manual_seed(0))
+    plain = _score(make_batch(), topk)
+    other = _score(make_batch(contrast="other"), topk)
+    same = _score(make_batch(contrast="same"), topk)
+
+    assert "contrast_topk_log_probs" not in plain
+    for result in (other, same):
+        for key in ("teacher_log_probs", "teacher_topk_log_probs"):
+            torch.testing.assert_close(result[key], plain[key], atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(
+        same["contrast_topk_log_probs"][0], same["teacher_topk_log_probs"][0], atol=1e-6, rtol=1e-6
+    )
+
+    contrast = other["contrast_topk_log_probs"]
+    assert contrast.shape == (2, 12, TOPK)
+    assert contrast[0, 2:7].abs().sum() > 0, "the contrast sub-row's span is scored"
+    assert contrast[0, :2].abs().sum() == 0 and contrast[0, 7:].abs().sum() == 0 and contrast[1].abs().sum() == 0
+    assert not torch.allclose(contrast[0, 2:7], other["teacher_topk_log_probs"][0, 2:7])
+
+
+def test_a_rank_without_contrast_rows_still_returns_the_contrast_output(single_process_group, cpu_ops, monkeypatch):
+    """Another rank holding contrast sub-rows makes this rank's loss report the same metric keys: its
+    contrast output is zeros, at no hinted position."""
+    real = dist.all_reduce
+
+    def other_rank_has_contrast(tensor, op=None, group=None):
+        real(tensor, op=op, group=group)
+        if tensor.shape == (2,):  # the (calls, has contrast) pair
+            tensor[1] = 1
+
+    monkeypatch.setattr(dist, "all_reduce", other_rank_has_contrast)
+    result = _score(make_batch(include_hinted=False, include_unhinted=True), torch.zeros(1, 9, TOPK, dtype=torch.long))
+    assert result["contrast_topk_log_probs"].shape == (1, 9, TOPK)
+    assert result["contrast_topk_log_probs"].abs().sum() == 0
+    assert result["teacher_topk_log_probs"][0, 0].abs().sum() > 0
+
+
+def test_the_update_trains_toward_the_difference_of_the_two_teachers(single_process_group, cpu_ops):
+    """A contrast identical to the hint leaves the student where it is (no loss, no gradient) while the
+    metrics show how far the hint teacher alone would have moved it; a different one trains."""
+    torch.manual_seed(0)
+    same_engine, same = run_update(make_batch(contrast="same"), alpha=1.0)
+    torch.manual_seed(0)
+    other_engine, other = run_update(make_batch(contrast="other"), alpha=1.0)
+
+    assert abs(_pg_loss(same)) < 1e-6
+    assert all(torch.isfinite(g).all() for g in _grads(same_engine))
+    assert sum(g.abs().sum() for g in _grads(same_engine)) < 1e-5
+    assert all(torch.isfinite(g).all() for g in _grads(other_engine))
+    assert sum(g.abs().sum() for g in _grads(other_engine)) > 1e-3
+
+    tokens = other["metrics"]["self_distillation/supervised_tokens__sum"].aggregate()
+    assert tokens == 5
+    for outputs in (same, other):
+        assert outputs["metrics"]["self_distillation/contrast_bins__sum"].aggregate() == tokens * (TOPK + 1)
+    kl_hint = same["metrics"]["self_distillation/kl_hint__sum"].aggregate()
+    assert kl_hint > 0 and other["metrics"]["self_distillation/kl_hint__sum"].aggregate() == pytest.approx(kl_hint)
+    assert same["metrics"]["self_distillation/kl_target__sum"].aggregate() == pytest.approx(0.0, abs=1e-5)
+    assert other["metrics"]["self_distillation/kl_target__sum"].aggregate() > 1e-4
+
+    summed = finalize_ratio_metrics({k: v.aggregate() for k, v in other["metrics"].items() if k.endswith("__sum")})
+    for name in ("kl_hint", "kl_target", "contrast_floor_masked"):
+        assert f"self_distillation/{name}" in summed
+    assert not any(key.endswith("__sum") for key in summed)
 
 
 def test_per_span_export_names_its_span_and_matches_the_batch_metrics(single_process_group, cpu_ops):

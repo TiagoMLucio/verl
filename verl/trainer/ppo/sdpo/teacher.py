@@ -30,10 +30,12 @@ class SDPOTeacher(ABC):
     the dataset's ``apply_chat_template_kwargs`` and ``success_reward_threshold``; a teacher's
     own options are keyword-only parameters of its subclass, so an unknown yaml key fails at
     construction with a TypeError naming it. The trainer reads ``needs_prompts`` (whether
-    :class:`TeacherInputs` must carry the student's prompt tokens).
+    :class:`TeacherInputs` must carry the student's prompt tokens) and ``contrasts`` (whether its
+    rows carry a contrast teacher's sub-rows, which only top-k distillation reads).
     """
 
     needs_prompts = False
+    contrasts = False
 
     def __init__(
         self,
@@ -85,4 +87,6 @@ def make_teacher(cfg, tokenizer, max_prefix_len: int, apply_chat_template_kwargs
         raise exc.__cause__ from exc
     if not isinstance(teacher, SDPOTeacher):
         raise TypeError(f"self_distillation.teacher._target_ must build an SDPOTeacher, got {type(teacher).__name__}")
+    if teacher.contrasts and not (cfg.full_logit_distillation and cfg.distillation_topk is not None):
+        raise ValueError("a contrast teacher needs full_logit_distillation with distillation_topk set")
     return teacher

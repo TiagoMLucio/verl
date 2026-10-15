@@ -1399,6 +1399,13 @@ SDPO_RATIO_METRICS = (
         "self_distillation/supervised_tokens__sum",
         "self_distillation/response_tokens__sum",
     ),
+    ("self_distillation/kl_hint", "self_distillation/kl_hint__sum", "self_distillation/supervised_tokens__sum"),
+    ("self_distillation/kl_target", "self_distillation/kl_target__sum", "self_distillation/supervised_tokens__sum"),
+    (
+        "self_distillation/contrast_floor_masked",
+        "self_distillation/contrast_floor_masked_bins__sum",
+        "self_distillation/contrast_bins__sum",
+    ),
 )
 
 
@@ -1424,6 +1431,40 @@ def finalize_ratio_metrics(metrics: dict, prefix: str = "") -> dict:
     return out
 
 
+# a bin neither the student nor the hint teacher gives this much probability keeps the student's own value
+CONTRAST_FLOOR = 0.01
+
+
+def contrastive_target_log_probs(
+    student: torch.Tensor, hint: torch.Tensor, contrast: torch.Tensor, floor: float = CONTRAST_FLOOR
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The stop-gradient target ``softmax(student + hint - contrast)`` over the bins (each argument a
+    log-distribution over them), and the mask of bins the shift reached."""
+    reached = torch.maximum(student, hint).exp() >= floor
+    shift = torch.where(reached, hint - contrast, torch.zeros_like(hint))
+    return torch.log_softmax(student.detach() + shift, dim=-1), reached
+
+
+@torch.no_grad()
+def _contrast_metrics(
+    student: torch.Tensor, hint: torch.Tensor, target: torch.Tensor, reached: torch.Tensor, loss_mask: torch.Tensor
+) -> dict[str, float]:
+    """Summable pairs on the supervised tokens: reverse KL of the student to the hint teacher and to the
+    target, and the bins the floor left at the student's value."""
+    sel = loss_mask.bool()
+    student, hint, target, reached = student[sel], hint[sel], target[sel], reached[sel]
+
+    def reverse_kl(other: torch.Tensor) -> float:
+        return torch.nan_to_num((student.exp() * (student - other)).sum(-1), 0.0, 0.0, 0.0).sum().item()
+
+    return {
+        "self_distillation/kl_hint__sum": reverse_kl(hint),
+        "self_distillation/kl_target__sum": reverse_kl(target),
+        "self_distillation/contrast_floor_masked_bins__sum": float((~reached).sum()),
+        "self_distillation/contrast_bins__sum": float(reached.numel()),
+    }
+
+
 def compute_self_distillation_loss(
     student_log_probs: torch.Tensor,
     teacher_log_probs: torch.Tensor,
@@ -1440,6 +1481,7 @@ def compute_self_distillation_loss(
     global_batch_info: Optional[dict[str, Any]] = None,
     seq_weights: Optional[torch.Tensor] = None,
     supervised_spans: Optional[list[tuple[int, int, int, int]]] = None,
+    contrast_topk_log_probs: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Compute the SDPO distillation loss for actor updates.
 
@@ -1460,6 +1502,8 @@ def compute_self_distillation_loss(
         global_batch_info: Optional dp_size / batch_num_tokens / global_batch_size dict passed through to agg_loss.
         seq_weights: Optional per-row weight (batch_size,), one row per condensation segment; see agg_loss.
         supervised_spans: Optional ``(row_id, row, start, end)`` per scored span, for the per-span export.
+        contrast_topk_log_probs: Optional contrast teacher's log-probabilities at the same indices as the
+            teacher's; the target becomes student + (teacher - contrast), see :func:`contrastive_target_log_probs`.
 
     Returns:
         tuple[torch.Tensor, dict[str, Any]]:
@@ -1475,6 +1519,11 @@ def compute_self_distillation_loss(
         if self_distillation_mask.dim() == 1:
             self_distillation_mask = self_distillation_mask.unsqueeze(1)
         loss_mask = loss_mask * self_distillation_mask
+
+    if contrast_topk_log_probs is not None and not (
+        self_distillation_config.full_logit_distillation and self_distillation_config.distillation_topk is not None
+    ):
+        raise ValueError("a contrast teacher needs full-logit top-k distillation (distillation_topk set).")
 
     distill_variant = "rkl_token"
     if self_distillation_config.full_logit_distillation:
@@ -1498,14 +1547,14 @@ def compute_self_distillation_loss(
                 logZ = torch.logsumexp(logp, dim=-1, keepdim=True)
                 return logp - logZ
 
-            student_distill_log_probs = student_topk_log_probs
-            teacher_distill_log_probs = teacher_topk_log_probs
-            if self_distillation_config.distillation_add_tail:
-                student_distill_log_probs = add_tail(student_distill_log_probs)
-                teacher_distill_log_probs = add_tail(teacher_distill_log_probs)
-            else:
-                student_distill_log_probs = renorm_topk_log_probs(student_distill_log_probs)
-                teacher_distill_log_probs = renorm_topk_log_probs(teacher_distill_log_probs)
+            to_bins = add_tail if self_distillation_config.distillation_add_tail else renorm_topk_log_probs
+            student_distill_log_probs = to_bins(student_topk_log_probs)
+            teacher_distill_log_probs = to_bins(teacher_topk_log_probs)
+            if contrast_topk_log_probs is not None:
+                hint_distill_log_probs = teacher_distill_log_probs
+                teacher_distill_log_probs, reached = contrastive_target_log_probs(
+                    student_distill_log_probs, hint_distill_log_probs, to_bins(contrast_topk_log_probs)
+                )
         else:
             if student_all_log_probs is None or teacher_all_log_probs is None:
                 raise ValueError("full_logit_distillation requires student_all_log_probs and teacher_all_log_probs.")
@@ -1577,6 +1626,12 @@ def compute_self_distillation_loss(
             loss_agg_mode=loss_agg_mode,
             batch_num_tokens=loss_mask.sum().clamp(min=1.0),
             seq_weights=seq_weights,
+        )
+    if contrast_topk_log_probs is not None:
+        metrics.update(
+            _contrast_metrics(
+                student_distill_log_probs, hint_distill_log_probs, teacher_distill_log_probs, reached, loss_mask
+            )
         )
     metrics.update(
         _distillation_signal_metrics(
