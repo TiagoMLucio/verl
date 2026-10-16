@@ -1319,7 +1319,52 @@ class FSDPEngineWithLMHead(FSDPEngine):
             model_inputs["distill_chunk_size"] = self.model_config.get("chunked_lm_head_size", 512)
             output_args["chunked_distill"] = True
 
+        # The SDPO teacher scores the ids the student chose at the kept positions of one row; the patched
+        # head does that chunk by chunk, so the span's (positions x vocab) logits never exist.
+        score_ids = micro_batch.get("logits_keep_topk_indices", None)
+        if (
+            score_ids is not None
+            and getattr(self, "_inference_module", None) is None
+            and (self.model_config.use_fused_kernels or self.model_config.get("use_chunked_lm_head", False))
+        ):
+            assert micro_batch.batch_size[0] == 1 and "logits_keep_idx" in output_args, (
+                "the chunked teacher head scores the kept positions of one row per call"
+            )
+            if "keep_union" in output_args:
+                assert torch.equal(output_args["keep_rows"][0], output_args["keep_union"]), (
+                    "the chunked teacher head reads the kept positions in ascending order"
+                )
+            model_inputs["distill_indices"] = score_ids.values()
+            model_inputs["distill_chunk_size"] = self.model_config.get("chunked_lm_head_size", 512)
+            if not _is_unit_temperature(temperature_item):
+                model_inputs["temperature"] = max(float(temperature[0]), 1e-8)
+            output_args["chunked_distill"] = True
+
         return model_inputs, output_args
+
+    @staticmethod
+    def _chunked_head_outputs(output, output_args, input_ids, model_output, needs_logits) -> torch.Tensor:
+        """Scatter what the chunked head reduced (it has no logits to read) onto the packed sequence
+        like the eager path, into ``model_output``; returns the packed label log-probs."""
+        if needs_logits:
+            raise NotImplementedError(
+                "the chunked head returns reductions, not logits, so entropy and "
+                "sum_pi_squared cannot be derived from it"
+            )
+        keep_idx = output_args.get("logits_keep_idx")
+        total_nnz = output_args.get("total_nnz")
+        log_probs = output.log_probs.squeeze(0)
+        reductions = {"topk_logps": output.topk_logps.squeeze(0)}
+        if output.topk_indices is not None:
+            reductions["topk_indices"] = output.topk_indices.squeeze(0)
+        if keep_idx is not None:
+            log_probs = log_probs.new_zeros(total_nnz).index_copy_(0, keep_idx, log_probs)
+        cu_seqlens = input_ids.offsets()
+        for name, value in reductions.items():
+            if keep_idx is not None:
+                value = value.new_zeros((total_nnz, *value.shape[1:])).index_copy_(0, keep_idx, value)
+            model_output[name] = torch.nested.nested_tensor_from_jagged(value, cu_seqlens)
+        return log_probs
 
     def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict, logits_processor_func):
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
@@ -1371,27 +1416,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
                                 v = gather_outputs_and_unpad(v, gather_dim=0, unpad_dim=0, padding_size=pad_size)
                             model_output[field_name] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
             elif output_args.get("chunked_distill"):
-                # the head already reduced each chunk, so there are no logits to read;
-                # scatter the reductions back onto the packed sequence like the eager path
-                if calculate_entropy or calculate_sum_pi_squared:
-                    raise NotImplementedError(
-                        "the chunked head returns reductions, not logits, so entropy and "
-                        "sum_pi_squared cannot be derived from it"
-                    )
-                keep_idx = output_args.get("logits_keep_idx")
-                total_nnz = output_args.get("total_nnz")
-                log_probs = output.log_probs.squeeze(0)
-                reductions = {
-                    "topk_logps": output.topk_logps.squeeze(0),
-                    "topk_indices": output.topk_indices.squeeze(0),
-                }
-                if keep_idx is not None:
-                    log_probs = log_probs.new_zeros(total_nnz).index_copy_(0, keep_idx, log_probs)
-                cu_seqlens = input_ids.offsets()
-                for name, value in reductions.items():
-                    if keep_idx is not None:
-                        value = value.new_zeros((total_nnz, *value.shape[1:])).index_copy_(0, keep_idx, value)
-                    model_output[name] = torch.nested.nested_tensor_from_jagged(value, cu_seqlens)
+                log_probs = self._chunked_head_outputs(
+                    output, output_args, input_ids, model_output, calculate_entropy or calculate_sum_pi_squared
+                )
 
             else:
                 keep_idx = output_args.get("logits_keep_idx")
@@ -1490,6 +1517,13 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     sum_pi_squared = torch.nested.nested_tensor_from_jagged(sum_pi_squared_rmpad, cu_seqlens)
             else:
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
+
+        elif output_args.get("chunked_distill") and output_args.get("logits_keep_idx") is not None:
+            assert pad_mode == DatasetPadMode.NO_PADDING, f"pad_mode {pad_mode} not implemented"
+            log_probs = self._chunked_head_outputs(
+                output, output_args, input_ids, model_output, calculate_entropy or calculate_sum_pi_squared
+            )
+            log_probs = torch.nested.nested_tensor_from_jagged(log_probs, input_ids.offsets())
 
         elif output_args.get("logits_keep_idx") is not None:
             # Span-only, padded path: the lm_head ran on the union of kept positions, so

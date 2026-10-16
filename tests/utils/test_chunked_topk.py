@@ -19,7 +19,11 @@ is not installed.
 
 import torch
 
-from verl.utils.experimental.chunked_topk import chunked_gather_logprobs, chunked_topk_logprobs
+from verl.utils.experimental.chunked_topk import (
+    chunked_distill_head,
+    chunked_gather_logprobs,
+    chunked_topk_logprobs,
+)
 
 K = 5
 VOCAB = 50
@@ -116,17 +120,84 @@ def test_per_position_temperature():
 
 
 def test_gather_matches_reference():
-    """The teacher path: log-probabilities at indices the student chose."""
+    """The teacher path: log-probabilities at indices the student chose, and at the realised token."""
     torch.manual_seed(5)
     hidden = torch.randn(19, HIDDEN, dtype=torch.float64)
     weight = torch.randn(VOCAB, HIDDEN, dtype=torch.float64)
     indices = torch.randint(0, VOCAB, (19, K))
+    labels = torch.randint(0, VOCAB, (19,))
 
-    got = chunked_gather_logprobs(hidden, weight, indices, chunk_size=6)
+    got, got_labels = chunked_gather_logprobs(hidden, weight, indices, labels=labels, chunk_size=6)
 
     logits = hidden @ weight.t()
+    logsumexp = logits.logsumexp(dim=-1, keepdim=True)
+    torch.testing.assert_close(got, torch.gather(logits, -1, indices) - logsumexp)
+    torch.testing.assert_close(got_labels, (logits.gather(-1, labels.unsqueeze(-1)) - logsumexp).squeeze(-1))
+    assert chunked_gather_logprobs(hidden, weight, indices, chunk_size=6)[1] is None
+
+
+def test_gather_chunking_does_not_change_the_result():
+    torch.manual_seed(9)
+    hidden = torch.randn(64, HIDDEN, dtype=torch.float64)
+    weight = torch.randn(VOCAB, HIDDEN, dtype=torch.float64)
+    indices = torch.randint(0, VOCAB, (64, K))
+    labels = torch.randint(0, VOCAB, (64,))
+
+    baseline = chunked_gather_logprobs(hidden, weight, indices, labels=labels, chunk_size=64)
+    for chunk_size in (1, 3, 7, 16, 1024):
+        other = chunked_gather_logprobs(hidden, weight, indices, labels=labels, chunk_size=chunk_size)
+        for got, want in zip(other, baseline, strict=True):
+            torch.testing.assert_close(got, want, rtol=1e-12, atol=1e-12)
+
+
+def test_gather_at_the_topk_ids_returns_the_topk_head_values():
+    """The two heads agree: scoring the ids the top-k head chose gives back what it returned."""
+    torch.manual_seed(10)
+    hidden = torch.randn(23, HIDDEN, dtype=torch.float64)
+    weight = torch.randn(VOCAB, HIDDEN, dtype=torch.float64)
+    labels = torch.randint(0, VOCAB, (23,))
+
+    topk_logps, topk_indices, topk_labels = chunked_topk_logprobs(hidden, weight, K, labels=labels, chunk_size=5)
+    gathered, _, gathered_labels = chunked_distill_head(
+        hidden, weight, None, labels, None, 8, indices=topk_indices
+    )
+
+    torch.testing.assert_close(gathered, topk_logps)
+    torch.testing.assert_close(gathered_labels, topk_labels)
+    assert chunked_distill_head(hidden, weight, K, labels, None, 8)[1] is not None
+
+
+def test_gather_per_position_temperature():
+    torch.manual_seed(11)
+    hidden = torch.randn(9, HIDDEN, dtype=torch.float64)
+    weight = torch.randn(VOCAB, HIDDEN, dtype=torch.float64)
+    indices = torch.randint(0, VOCAB, (9, K))
+    labels = torch.randint(0, VOCAB, (9,))
+    temperature = torch.rand(9, 1, dtype=torch.float64) + 0.5
+
+    got, got_labels = chunked_gather_logprobs(hidden, weight, indices, labels, temperature, chunk_size=2)
+    logits = hidden @ weight.t() / temperature
+    logsumexp = logits.logsumexp(dim=-1, keepdim=True)
+    torch.testing.assert_close(got, torch.gather(logits, -1, indices) - logsumexp)
+    torch.testing.assert_close(got_labels, (logits.gather(-1, labels.unsqueeze(-1)) - logsumexp).squeeze(-1))
+
+    scalar, _ = chunked_gather_logprobs(hidden, weight, indices, temperature=0.7, chunk_size=4)
+    scaled = hidden @ weight.t() / 0.7
+    torch.testing.assert_close(scalar, torch.gather(scaled, -1, indices) - scaled.logsumexp(dim=-1, keepdim=True))
+
+
+def test_gather_accumulates_half_precision_in_fp32_and_needs_no_graph():
+    torch.manual_seed(12)
+    hidden = torch.randn(13, HIDDEN, dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(VOCAB, HIDDEN, dtype=torch.bfloat16)
+    indices = torch.randint(0, VOCAB, (13, K))
+
+    got, _ = chunked_gather_logprobs(hidden, weight, indices, chunk_size=4)
+
+    logits = (hidden @ weight.t()).float()
     want = torch.gather(logits, -1, indices) - logits.logsumexp(dim=-1, keepdim=True)
-    torch.testing.assert_close(got, want)
+    assert got.dtype == torch.float32 and not got.requires_grad
+    torch.testing.assert_close(got, want.detach())
 
 
 def test_label_logprobs_match_reference():
@@ -174,6 +245,22 @@ def test_label_inside_topk_is_counted_once_per_source():
         return topk.sum() + label.sum()
 
     assert torch.autograd.gradcheck(fn, (hidden, weight), eps=1e-6, atol=1e-8)
+
+
+def test_gather_peak_memory_is_bounded_by_chunk_size():
+    if not torch.cuda.is_available():
+        return
+    weight = torch.randn(4096, 128, device="cuda", dtype=torch.bfloat16)
+
+    peaks = []
+    for num_positions in (512, 4096):
+        hidden = torch.randn(num_positions, 128, device="cuda", dtype=torch.bfloat16)
+        indices = torch.randint(0, 4096, (num_positions, K), device="cuda")
+        torch.cuda.reset_peak_memory_stats()
+        chunked_gather_logprobs(hidden, weight, indices, chunk_size=256)
+        peaks.append(torch.cuda.max_memory_allocated())
+
+    assert peaks[1] < peaks[0] * 3, f"peak scaled with positions: {peaks}"
 
 
 def test_peak_memory_is_bounded_by_chunk_size():

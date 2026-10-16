@@ -35,6 +35,7 @@ import verl.workers.utils.padding as padding_mod
 from verl.trainer.ppo.core_algos import SDPO_SPAN_ROWS_KEY, finalize_ratio_metrics
 from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META, SubRow, pack
 from verl.utils import tensordict_utils as tu
+from verl.utils.experimental.chunked_topk import chunked_gather_logprobs
 from verl.utils.metric import Metric
 from verl.utils.torch_functional import allgather_dict_into_dict
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
@@ -100,7 +101,35 @@ class ToyLM(nn.Module):
         return SimpleNamespace(logits=self.head(hidden))
 
 
-def make_engine(module):
+class ToyChunkedLM(ToyLM):
+    """ToyLM with the patched head's teacher mode: it scores the ids it is handed a chunk at a time
+    and has no logits to give back."""
+
+    def __init__(self, seed):
+        super().__init__(seed)
+        self.scored = []
+
+    def forward(
+        self,
+        input_ids=None,
+        logits_to_keep=None,
+        distill_indices=None,
+        distill_chunk_size=512,
+        temperature=1.0,
+        **kwargs,
+    ):
+        if distill_indices is None:
+            return super().forward(input_ids=input_ids, logits_to_keep=logits_to_keep, **kwargs)
+        kept = self.emb(input_ids)[:, logits_to_keep, :].squeeze(0)
+        labels = torch.roll(input_ids, shifts=-1, dims=-1).squeeze(0)[logits_to_keep]
+        logps, label_logps = chunked_gather_logprobs(
+            kept, self.head.weight, distill_indices, labels, temperature, distill_chunk_size
+        )
+        self.scored.append((tuple(distill_indices.shape), distill_chunk_size, temperature))
+        return SimpleNamespace(log_probs=label_logps.unsqueeze(0), topk_logps=logps.unsqueeze(0), topk_indices=None)
+
+
+def make_engine(module, patched_head=False, chunked_flag=False, inference_module=None):
     eng = object.__new__(FSDPEngineWithLMHead)
     eng.module = module
     eng.engine_config = SimpleNamespace(
@@ -111,7 +140,10 @@ def make_engine(module):
         use_torch_compile=False,
         entropy_checkpointing=False,
     )
-    eng.model_config = SimpleNamespace(use_fused_kernels=False, get=lambda key, default=None: default)
+    flags = {"use_chunked_lm_head": chunked_flag}
+    eng.model_config = SimpleNamespace(
+        use_fused_kernels=patched_head, get=lambda key, default=None: flags.get(key, default)
+    )
     eng.ulysses_device_mesh = None
     eng.ulysses_parallel_group = None
     eng.ulysses_sequence_parallel_size = 1
@@ -121,9 +153,14 @@ def make_engine(module):
     eng._is_offload_optimizer = False
     eng._autocast_dtype = torch.float32
     eng.scaler = None
-    eng._inference_module = None
+    eng._inference_module = inference_module
     eng.mode = None
     return eng
+
+
+def teacher_module(chunked_teacher):
+    """The teacher's model and whether its engine runs the patched head; the same weights either way."""
+    return (ToyChunkedLM(seed=1), True) if chunked_teacher else (ToyLM(seed=1), False)
 
 
 def make_batch(
@@ -210,14 +247,14 @@ def make_batch(
     return tu.get_tensordict(tensor_dict=tensor_dict, non_tensor_dict=non_tensor_dict)
 
 
-def run_update(data, loss_agg_mode="token-mean", dp_size=None, alpha=0.5):
+def run_update(data, loss_agg_mode="token-mean", dp_size=None, alpha=0.5, chunked_teacher=False):
     """Mirror ActorRolloutRefWorker.update_actor minus Ray/FSDP/TQ; ``dp_size`` fakes the rank count the
     loss is told, as if every rank held this same batch."""
     student_engine = make_engine(ToyLM(seed=0))
     student_engine.engine_config.forward_only = False
     if dp_size is not None:
         student_engine.get_data_parallel_size = lambda: dp_size
-    teacher_engine = make_engine(ToyLM(seed=1))
+    teacher_engine = make_engine(*teacher_module(chunked_teacher))
 
     worker = SimpleNamespace(
         ref=SimpleNamespace(
@@ -364,8 +401,8 @@ def test_all_unhinted_micro_still_runs_teacher(single_process_group, cpu_ops):
     assert result["teacher_topk_log_probs"].shape == (1, 9, TOPK)
 
 
-def _score(data, topk_indices):
-    teacher_engine = make_engine(ToyLM(seed=1))
+def _score(data, topk_indices, chunked_teacher=False):
+    teacher_engine = make_engine(*teacher_module(chunked_teacher))
     worker = SimpleNamespace(
         ref=SimpleNamespace(
             engine=teacher_engine,
@@ -374,9 +411,11 @@ def _score(data, topk_indices):
         )
     )
     tu.assign_non_tensor(data, dp_size=1)
-    return ActorRolloutRefWorker._compute_sdpo_teacher_logps_for_loss(
+    result = ActorRolloutRefWorker._compute_sdpo_teacher_logps_for_loss(
         worker, data=data, student_topk_indices=topk_indices, return_all_logps=False
     )
+    _score.module = teacher_engine.module
+    return result
 
 
 def test_the_contrast_subrow_is_scored_at_the_students_indices_apart_from_the_hint_one(single_process_group, cpu_ops):
@@ -415,6 +454,88 @@ def test_a_rank_without_contrast_rows_still_returns_the_contrast_output(single_p
     assert result["contrast_topk_log_probs"].shape == (1, 9, TOPK)
     assert result["contrast_topk_log_probs"].abs().sum() == 0
     assert result["teacher_topk_log_probs"][0, 0].abs().sum() > 0
+
+
+@pytest.mark.parametrize("remove_padding", [True, False], ids=["rmpad", "padded"])
+@pytest.mark.parametrize("contrast", [None, "other"])
+@pytest.mark.parametrize("temperature", [1.0, 0.7])
+def test_the_chunked_teacher_head_scores_what_the_logits_path_scores(
+    single_process_group, cpu_ops, remove_padding, contrast, temperature
+):
+    """Same teacher weights, same spliced sub-rows, same student ids: the head that never builds the span's
+    logits returns the label and top-k log-probs the extractor reads off them, on both layouts."""
+    topk = torch.randint(0, VOCAB, (2, 12, TOPK), generator=torch.Generator().manual_seed(0))
+
+    def score(chunked):
+        data = make_batch(contrast=contrast)
+        tu.assign_non_tensor(data, use_remove_padding=remove_padding, temperature=temperature)
+        return _score(data, topk, chunked_teacher=chunked), _score.module
+
+    eager, eager_module = score(False)
+    chunked, chunked_module = score(True)
+
+    assert not isinstance(eager_module, ToyChunkedLM) and chunked_module.scored
+    # one call per sub-row (the hinted turn, its contrast, the stub), each scoring its span's ids
+    assert [shape for shape, _, _ in chunked_module.scored] == [(5, TOPK)] * (2 if contrast else 1) + [(1, TOPK)]
+    assert {chunk for _, chunk, _ in chunked_module.scored} == {512}
+    assert all(t == pytest.approx(temperature) for _, _, t in chunked_module.scored)
+    for key in ("teacher_log_probs", "teacher_topk_log_probs") + (("contrast_topk_log_probs",) if contrast else ()):
+        torch.testing.assert_close(chunked[key], eager[key], atol=1e-5, rtol=1e-5)
+    assert chunked["teacher_topk_log_probs"][0, 2:7].abs().sum() > 0
+
+
+@pytest.mark.parametrize(
+    ("engine_flags", "scores_by_chunks"),
+    [
+        (dict(patched_head=False), False),
+        (dict(patched_head=True), True),
+        (dict(chunked_flag=True), True),
+        (dict(patched_head=True, inference_module=True), False),
+    ],
+    ids=["stock forward", "fused head", "chunked head", "inference module"],
+)
+def test_the_chunked_teacher_head_is_only_used_where_the_head_is_patched(
+    single_process_group, cpu_ops, engine_flags, scores_by_chunks
+):
+    """Without the patched forward, or behind an inference module that mixes logits, the model would be
+    handed a keyword it does not know: the teacher reads the logits instead."""
+    topk = torch.randint(0, VOCAB, (2, 12, TOPK), generator=torch.Generator().manual_seed(0))
+    flags = {**engine_flags, "inference_module": ToyLM(seed=1) if engine_flags.get("inference_module") else None}
+    teacher_engine = make_engine(ToyChunkedLM(seed=1), **flags)
+    worker = SimpleNamespace(
+        ref=SimpleNamespace(
+            engine=teacher_engine,
+            model_config={"use_remove_padding": True},
+            engine_config=SimpleNamespace(use_fused_kernels=False),
+        )
+    )
+    data = make_batch()
+    tu.assign_non_tensor(data, dp_size=1)
+    result = ActorRolloutRefWorker._compute_sdpo_teacher_logps_for_loss(
+        worker, data=data, student_topk_indices=topk, return_all_logps=False
+    )
+    assert bool(teacher_engine.module.scored) == scores_by_chunks
+    assert result["teacher_topk_log_probs"][0, 2:7].abs().sum() > 0
+
+
+@pytest.mark.parametrize("remove_padding", [True, False], ids=["rmpad", "padded"])
+def test_the_update_is_the_same_with_the_chunked_teacher_head(single_process_group, cpu_ops, remove_padding):
+    """Through the student's loss and backward: the contrast teacher's target, its loss and the student's
+    gradient do not change with the head the teacher scores through."""
+
+    def update(chunked):
+        torch.manual_seed(0)
+        data = make_batch(contrast="other")
+        tu.assign_non_tensor(data, use_remove_padding=remove_padding)
+        return run_update(data, alpha=1.0, chunked_teacher=chunked)
+
+    eager_engine, eager = update(False)
+    chunked_engine, chunked = update(True)
+
+    assert _pg_loss(chunked) == pytest.approx(_pg_loss(eager), rel=1e-4)
+    assert sum(g.abs().sum() for g in _grads(chunked_engine)) > 1e-3
+    for g_chunked, g_eager in zip(_grads(chunked_engine), _grads(eager_engine), strict=True):
+        torch.testing.assert_close(g_chunked, g_eager, atol=1e-5, rtol=1e-4)
 
 
 def test_the_update_trains_toward_the_difference_of_the_two_teachers(single_process_group, cpu_ops):

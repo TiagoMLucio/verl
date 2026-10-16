@@ -89,6 +89,7 @@ def forward_with_torch_backend(
     use_fused_kernels: bool = True,
     distill_topk: Optional[int] = None,
     distill_chunk_size: int = 512,
+    distill_indices: Optional[torch.Tensor] = None,
     **loss_kwargs,
 ) -> tuple | CausalLMOutputForPPO:
     from verl.utils.experimental.torch_functional import FusedLinearForPPO
@@ -111,7 +112,7 @@ def forward_with_torch_backend(
     # The patch is installed on the model class, so every caller shares it. Callers that
     # need real logits (SDPO reads top-k and a logsumexp off them) opt out per call, while
     # a log-prob-only pass keeps the fused path and never widens hidden states to vocab.
-    if not use_fused_kernels and distill_topk is None:
+    if not use_fused_kernels and distill_topk is None and distill_indices is None:
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         return CausalLMOutputWithPast(
@@ -138,26 +139,28 @@ def forward_with_torch_backend(
     # reshards lm_head.weight as soon as this forward returns, so a caller downstream
     # would see a shard. Each chunk is projected, reduced to its top-k, the realised
     # token's log-probability and a logsumexp, then freed, so the peak follows
-    # distill_chunk_size rather than the number of scored positions.
-    if distill_topk is not None:
-        from verl.utils.experimental.chunked_topk import chunked_topk_logprobs
+    # distill_chunk_size rather than the number of scored positions. The teacher passes the
+    # student's ids as distill_indices and scores those instead of taking a top-k.
+    if distill_topk is not None or distill_indices is not None:
+        from verl.utils.experimental.chunked_topk import chunked_distill_head
 
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         kept_hidden = hidden_states[:, slice_indices, :].squeeze(0)
         labels = rolled_labels.squeeze(0) if rolled_labels.dim() > 1 else rolled_labels
         labels = labels[slice_indices]
-        topk_logps, topk_indices, label_logps = chunked_topk_logprobs(
+        topk_logps, topk_indices, label_logps = chunked_distill_head(
             kept_hidden,
             self.lm_head.weight,
             distill_topk,
-            labels=labels,
-            temperature=temperature,
-            chunk_size=distill_chunk_size,
+            labels,
+            temperature,
+            distill_chunk_size,
+            indices=distill_indices,
         )
         return CausalLMOutputForPPO(
             log_probs=label_logps.unsqueeze(0),
             topk_logps=topk_logps.unsqueeze(0),
-            topk_indices=topk_indices.unsqueeze(0),
+            topk_indices=None if topk_indices is None else topk_indices.unsqueeze(0),
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
@@ -202,6 +205,7 @@ def forward_with_triton_backend(
     use_fused_kernels: bool = True,
     distill_topk: Optional[int] = None,
     distill_chunk_size: int = 512,
+    distill_indices: Optional[torch.Tensor] = None,
     **loss_kwargs,
 ) -> tuple | CausalLMOutputForPPO:
     from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
@@ -225,7 +229,7 @@ def forward_with_triton_backend(
     # The patch is installed on the model class, so every caller shares it. Callers that
     # need real logits (SDPO reads top-k and a logsumexp off them) opt out per call, while
     # a log-prob-only pass keeps the fused path and never widens hidden states to vocab.
-    if not use_fused_kernels and distill_topk is None:
+    if not use_fused_kernels and distill_topk is None and distill_indices is None:
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         return CausalLMOutputWithPast(
@@ -250,26 +254,28 @@ def forward_with_triton_backend(
     # reshards lm_head.weight as soon as this forward returns, so a caller downstream
     # would see a shard. Each chunk is projected, reduced to its top-k, the realised
     # token's log-probability and a logsumexp, then freed, so the peak follows
-    # distill_chunk_size rather than the number of scored positions.
-    if distill_topk is not None:
-        from verl.utils.experimental.chunked_topk import chunked_topk_logprobs
+    # distill_chunk_size rather than the number of scored positions. The teacher passes the
+    # student's ids as distill_indices and scores those instead of taking a top-k.
+    if distill_topk is not None or distill_indices is not None:
+        from verl.utils.experimental.chunked_topk import chunked_distill_head
 
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         kept_hidden = hidden_states[:, slice_indices, :].squeeze(0)
         labels = rolled_labels.squeeze(0) if rolled_labels.dim() > 1 else rolled_labels
         labels = labels[slice_indices]
-        topk_logps, topk_indices, label_logps = chunked_topk_logprobs(
+        topk_logps, topk_indices, label_logps = chunked_distill_head(
             kept_hidden,
             self.lm_head.weight,
             distill_topk,
-            labels=labels,
-            temperature=temperature,
-            chunk_size=distill_chunk_size,
+            labels,
+            temperature,
+            distill_chunk_size,
+            indices=distill_indices,
         )
         return CausalLMOutputForPPO(
             log_probs=label_logps.unsqueeze(0),
             topk_logps=topk_logps.unsqueeze(0),
-            topk_indices=topk_indices.unsqueeze(0),
+            topk_indices=None if topk_indices is None else topk_indices.unsqueeze(0),
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,

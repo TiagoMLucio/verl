@@ -938,6 +938,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # Span-only lm_head: only the supervised-span positions are ever consumed from spliced teacher rows.
         keep_positions = turn_keep_positions(sub_seqs, sub_resps, sub_spans).unbind() if sub_spans is not None else None
+        # the ids the student chose at those positions, for the head to score a chunk at a time
+        keep_ids = None
+        if keep_positions is not None and student_topk_indices is not None:
+            keep_ids = [student_topk_indices[j, body] for j, _, body, _ in body_slices(sub_spans)]
 
         # When full-logit distillation is on (top-k or all-vocab), run the teacher
         # extractor as the engine's logits processor; otherwise only plain log_probs
@@ -976,6 +980,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 if keep_positions is not None:
                     teacher_td["logits_keep_positions"] = torch.nested.nested_tensor(
                         list(keep_positions[rows]), layout=torch.jagged
+                    )
+                if keep_ids is not None:
+                    teacher_td["logits_keep_topk_indices"] = torch.nested.nested_tensor(
+                        keep_ids[rows], layout=torch.jagged
                     )
                 model_output = self.ref.engine.infer_batch(teacher_td, loss_function=loss_function)["model_output"]
                 if call < len(row_slices):

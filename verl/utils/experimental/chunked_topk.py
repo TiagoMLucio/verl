@@ -146,21 +146,52 @@ def chunked_topk_logprobs(
     return ChunkedTopkLogprobs.apply(hidden, weight, k, labels, temperature, chunk_size)
 
 
+@torch.no_grad()
 def chunked_gather_logprobs(
     hidden: torch.Tensor,
     weight: torch.Tensor,
     indices: torch.Tensor,
+    labels: Optional[torch.Tensor] = None,
     temperature: Optional[torch.Tensor] = None,
     chunk_size: int = 512,
-) -> torch.Tensor:
-    """Log-probabilities at ``indices``, chunked the same way. For the teacher, which scores
-    the student's chosen entries and never needs a gradient."""
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Log-probabilities at ``indices`` (and at ``labels`` when given), chunked the same way.
+    For the teacher, which scores the student's chosen entries and never needs a gradient.
+
+    Returns the (num_positions, k) log-probabilities at ``indices`` and the (num_positions,)
+    ones at ``labels``."""
     num_positions = hidden.shape[0]
-    out = hidden.new_empty((num_positions, indices.shape[-1]), dtype=_compute_dtype(hidden.dtype))
+    chunk_size = max(1, chunk_size)
+    compute_dtype = _compute_dtype(hidden.dtype)
+    gathered_logps = hidden.new_empty((num_positions, indices.shape[-1]), dtype=compute_dtype)
+    label_logps = None if labels is None else hidden.new_empty(num_positions, dtype=compute_dtype)
     for start in range(0, num_positions, chunk_size):
         end = min(start + chunk_size, num_positions)
-        temp = None if temperature is None else temperature[start:end]
-        logits = _chunk_logits(hidden[start:end], weight, temp)
-        gathered = torch.gather(logits, -1, indices[start:end])
-        out[start:end] = gathered - logits.logsumexp(dim=-1, keepdim=True)
-    return out
+        logits = _chunk_logits(hidden[start:end], weight, _slice_temperature(temperature, start, end))
+        logsumexp = logits.logsumexp(dim=-1, keepdim=True)
+        gathered_logps[start:end] = torch.gather(logits, -1, indices[start:end]) - logsumexp
+        if label_logps is not None:
+            label_logps[start:end] = (logits.gather(-1, labels[start:end].unsqueeze(-1)) - logsumexp).squeeze(-1)
+    return gathered_logps, label_logps
+
+
+def chunked_distill_head(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    topk: Optional[int],
+    labels: torch.Tensor,
+    temperature,
+    chunk_size: int,
+    indices: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    """The distillation head's reductions: the top-k entries of each position (the student) or,
+    given ``indices``, the entries at those vocabulary ids (the teacher, scoring the student's).
+    Returns the log-probabilities, their ids (None for ``indices``) and the labels' log-probabilities."""
+    if indices is None:
+        return chunked_topk_logprobs(
+            hidden, weight, topk, labels=labels, temperature=temperature, chunk_size=chunk_size
+        )
+    logps, label_logps = chunked_gather_logprobs(
+        hidden, weight, indices, labels=labels, temperature=temperature, chunk_size=chunk_size
+    )
+    return logps, None, label_logps

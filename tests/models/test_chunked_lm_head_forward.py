@@ -246,6 +246,169 @@ def test_k_larger_than_vocabulary():
     assert out.topk_logps.shape[-1] == VOCAB
 
 
+def _scoring_reference(model, input_ids, logits_to_keep, ids, temperature=None):
+    """What the teacher is owed: log-probs at the student's ids and at the realised token."""
+    with torch.no_grad():
+        hidden = model.model(input_ids=input_ids).last_hidden_state
+    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+    logits = model.lm_head(hidden[:, slice_indices, :]).squeeze(0).float()
+    if temperature is not None:
+        logits = logits / temperature
+    labels = torch.roll(input_ids, shifts=-1, dims=-1).squeeze(0)[slice_indices]
+    logsumexp = logits.logsumexp(dim=-1, keepdim=True)
+    return logits.gather(-1, ids) - logsumexp, (logits.gather(-1, labels.unsqueeze(-1)) - logsumexp).squeeze(-1)
+
+
+def _score(model, input_ids, logits_to_keep, ids, temperature=None, chunk_size=4):
+    kwargs = {} if temperature is None else {"temperature": temperature}
+    with torch.no_grad():
+        return model(
+            input_ids=input_ids,
+            return_dict=True,
+            use_cache=False,
+            logits_to_keep=logits_to_keep,
+            use_fused_kernels=False,
+            distill_indices=ids,
+            distill_chunk_size=chunk_size,
+            **kwargs,
+        )
+
+
+def _assert_scores(model, input_ids, logits_to_keep, temperature=None, chunk_size=4):
+    n_keep = len(logits_to_keep) if isinstance(logits_to_keep, torch.Tensor) else input_ids.shape[1]
+    ids = torch.randint(0, VOCAB, (n_keep, K))
+    out = _score(model, input_ids, logits_to_keep, ids, temperature, chunk_size)
+    want_ids, want_label = _scoring_reference(model, input_ids, logits_to_keep, ids, temperature)
+    torch.testing.assert_close(out.topk_logps.squeeze(0), want_ids, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(out.log_probs.squeeze(0), want_label, rtol=1e-5, atol=1e-5)
+    assert out.topk_indices is None and out.logits is None
+
+
+def test_scoring_the_students_ids_matches_the_eager_logits():
+    """The teacher's head: the span's (positions x vocab) logits are never built, and what it
+    returns is what the eager logits give at those ids and at the labels."""
+    model = _tiny_model()
+    input_ids = torch.randint(0, VOCAB, (1, 40))
+    with _patched(model):
+        _assert_scores(model, input_ids, logits_to_keep=0)
+        _assert_scores(model, input_ids, logits_to_keep=torch.tensor([1, 2, 3, 17, 18, 30, 31, 32, 33]))
+        _assert_scores(model, input_ids, logits_to_keep=torch.tensor([7]))
+
+
+def test_scoring_chunk_boundaries_and_temperature():
+    model = _tiny_model()
+    input_ids = torch.randint(0, VOCAB, (1, 32))
+    keep = torch.arange(0, 13)
+    with _patched(model):
+        for chunk_size in (1, 3, 13, 64):
+            _assert_scores(model, input_ids, logits_to_keep=keep, chunk_size=chunk_size)
+        _assert_scores(model, input_ids, logits_to_keep=keep, temperature=0.7)
+
+
+def test_scoring_builds_no_graph():
+    model = _tiny_model()
+    input_ids = torch.randint(0, VOCAB, (1, 16))
+    ids = torch.randint(0, VOCAB, (6, K))
+    with _patched(model):
+        out = model(
+            input_ids=input_ids,
+            return_dict=True,
+            use_cache=False,
+            logits_to_keep=torch.arange(0, 6),
+            use_fused_kernels=False,
+            distill_indices=ids,
+            distill_chunk_size=2,
+        )
+    assert not out.topk_logps.requires_grad and not out.log_probs.requires_grad
+
+
+def _tiny_qwen35():
+    from transformers import Qwen3_5Config
+    from transformers.models.qwen3_5 import modeling_qwen3_5
+
+    torch.manual_seed(0)
+    config = Qwen3_5Config(
+        text_config=dict(
+            vocab_size=VOCAB,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            linear_num_value_heads=4,
+            linear_num_key_heads=2,
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_conv_kernel_dim=4,
+            max_position_embeddings=128,
+            layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+            tie_word_embeddings=True,
+        ),
+        vision_config=dict(
+            depth=1,
+            hidden_size=16,
+            intermediate_size=32,
+            num_heads=2,
+            out_hidden_size=32,
+            patch_size=4,
+            temporal_patch_size=1,
+            spatial_merge_size=2,
+            num_position_embeddings=16,
+        ),
+    )
+    return modeling_qwen3_5.Qwen3_5ForConditionalGeneration(config).to(torch.float32).eval()
+
+
+def _qwen35_reference(model, input_ids, keep, ids):
+    with torch.no_grad():
+        hidden = model.model(input_ids=input_ids).last_hidden_state
+    logits = model.lm_head(hidden[:, keep, :]).squeeze(0).float()
+    labels = torch.roll(input_ids, shifts=-1, dims=-1).squeeze(0)[keep]
+    logsumexp = logits.logsumexp(dim=-1, keepdim=True)
+    return logits.gather(-1, ids) - logsumexp, (logits.gather(-1, labels.unsqueeze(-1)) - logsumexp).squeeze(-1)
+
+
+def test_qwen35_head_scores_the_students_ids():
+    """The patched Qwen3.5 forward, both backends, on the model the runs train: the student's
+    top-k branch is unchanged and the teacher's scores match the logits the model would build."""
+    import sys
+    import types
+
+    from verl.models.transformers import qwen3_5
+
+    # the triton backend imports its kernel at call time; the gather branch returns before using it
+    stub = types.ModuleType("verl.utils.kernel.linear_cross_entropy")
+    stub.linear_cross_entropy = None
+    sys.modules.setdefault("verl.utils.kernel.linear_cross_entropy", stub)
+
+    model = _tiny_qwen35()
+    input_ids = torch.randint(0, VOCAB, (1, 36))
+    keep = torch.tensor([2, 3, 4, 5, 6, 20, 21])
+    ids = torch.randint(0, VOCAB, (len(keep), K))
+    want_ids, want_label = _qwen35_reference(model, input_ids, keep, ids)
+
+    for forward in (qwen3_5.forward_with_torch_backend, qwen3_5.forward_with_triton_backend):
+        with torch.no_grad():
+            out = forward(
+                model,
+                input_ids=input_ids,
+                logits_to_keep=keep,
+                use_fused_kernels=False,
+                distill_indices=ids,
+                distill_chunk_size=3,
+            )
+            plain = forward(model, input_ids=input_ids, logits_to_keep=keep, use_fused_kernels=False)
+            topk = forward(
+                model, input_ids=input_ids, logits_to_keep=keep, use_fused_kernels=False, distill_topk=K
+            )
+        torch.testing.assert_close(out.topk_logps.squeeze(0), want_ids, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(out.log_probs.squeeze(0), want_label, rtol=1e-5, atol=1e-5)
+        assert out.topk_indices is None and out.logits is None
+        assert plain.logits.shape == (1, len(keep), VOCAB)
+        assert topk.topk_indices.shape == (1, len(keep), K)
+
+
 if __name__ == "__main__":
     failures = 0
     for name, case in sorted(globals().items()):

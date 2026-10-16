@@ -219,6 +219,7 @@ def forward_with_torch_backend(
     use_fused_kernels: bool = True,
     distill_topk: Optional[int] = None,
     distill_chunk_size: int = 512,
+    distill_indices: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> "Qwen3_5CausalLMOutputForPPO":
     from verl.utils.experimental.torch_functional import FusedLinearForPPO
@@ -229,7 +230,7 @@ def forward_with_torch_backend(
     # See `dense_common.forward_with_torch_backend`: the patch is class-level, so a caller
     # that needs real logits (SDPO reads top-k and a logsumexp off them) opts out per call,
     # and `logits_to_keep` must be honoured here or the head widens the whole sequence.
-    if not use_fused_kernels and distill_topk is None:
+    if not use_fused_kernels and distill_topk is None and distill_indices is None:
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         return Qwen3_5CausalLMOutputForPPO(
@@ -249,9 +250,10 @@ def forward_with_torch_backend(
         raise RuntimeError("To use forward_with_torch_backend, either labels or input_ids must be provided.")
 
     # Chunked distillation head: see `dense_common.forward_with_torch_backend`. It has to
-    # run here because FSDP reshards lm_head.weight as soon as this forward returns.
-    if distill_topk is not None:
-        from verl.utils.experimental.chunked_topk import chunked_topk_logprobs
+    # run here because FSDP reshards lm_head.weight as soon as this forward returns. The teacher
+    # passes the student's ids as distill_indices and scores those instead of taking a top-k.
+    if distill_topk is not None or distill_indices is not None:
+        from verl.utils.experimental.chunked_topk import chunked_distill_head
 
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         kept_hidden = hidden_states[:, slice_indices, :].squeeze(0)
@@ -260,18 +262,19 @@ def forward_with_torch_backend(
         vocab_weights = self.lm_head.weight
         if isinstance(vocab_weights, DTensor):
             vocab_weights = vocab_weights.full_tensor()
-        topk_logps, topk_indices, label_logps = chunked_topk_logprobs(
+        topk_logps, topk_indices, label_logps = chunked_distill_head(
             kept_hidden,
             vocab_weights,
             distill_topk,
-            labels=chunk_labels,
-            temperature=temperature,
-            chunk_size=distill_chunk_size,
+            chunk_labels,
+            temperature,
+            distill_chunk_size,
+            indices=distill_indices,
         )
         return Qwen3_5CausalLMOutputForPPO(
             log_probs=label_logps.unsqueeze(0),
             topk_logps=topk_logps.unsqueeze(0),
-            topk_indices=topk_indices.unsqueeze(0),
+            topk_indices=None if topk_indices is None else topk_indices.unsqueeze(0),
             hidden_states=outputs.hidden_states,
         )
 
@@ -309,6 +312,7 @@ def forward_with_triton_backend(
     use_fused_kernels: bool = True,
     distill_topk: Optional[int] = None,
     distill_chunk_size: int = 512,
+    distill_indices: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> "Qwen3_5CausalLMOutputForPPO":
     from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
@@ -316,7 +320,7 @@ def forward_with_triton_backend(
     outputs = self.model(input_ids, **kwargs)
     hidden_states = outputs[0]
 
-    if not use_fused_kernels and distill_topk is None:
+    if not use_fused_kernels and distill_topk is None and distill_indices is None:
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         return Qwen3_5CausalLMOutputForPPO(
@@ -340,8 +344,8 @@ def forward_with_triton_backend(
             rolled_labels, position_ids_rmpad=None, sp_size=ulysses_sequence_parallel_size
         )
 
-    if distill_topk is not None:
-        from verl.utils.experimental.chunked_topk import chunked_topk_logprobs
+    if distill_topk is not None or distill_indices is not None:
+        from verl.utils.experimental.chunked_topk import chunked_distill_head
 
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         kept_hidden = hidden_states[:, slice_indices, :].squeeze(0)
@@ -350,18 +354,19 @@ def forward_with_triton_backend(
         weights = self.lm_head.weight
         if isinstance(weights, DTensor):
             weights = weights.full_tensor()
-        topk_logps, topk_indices, label_logps = chunked_topk_logprobs(
+        topk_logps, topk_indices, label_logps = chunked_distill_head(
             kept_hidden,
             weights,
             distill_topk,
-            labels=chunk_labels,
-            temperature=temperature,
-            chunk_size=distill_chunk_size,
+            chunk_labels,
+            temperature,
+            distill_chunk_size,
+            indices=distill_indices,
         )
         return Qwen3_5CausalLMOutputForPPO(
             log_probs=label_logps.unsqueeze(0),
             topk_logps=topk_logps.unsqueeze(0),
-            topk_indices=topk_indices.unsqueeze(0),
+            topk_indices=None if topk_indices is None else topk_indices.unsqueeze(0),
             hidden_states=outputs.hidden_states,
         )
 
