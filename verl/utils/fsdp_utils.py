@@ -532,17 +532,21 @@ def maybe_patch_fsdp_module(model):
         fully_shard_module.FSDPModule = orig_fsdp_module
 
 
-def _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap):
+def _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap, lm_head_in_root=False):
     """Select modules to wrap individually with fully_shard in FSDP2.
 
     Matches transformer layers by class name, and embed_tokens/lm_head by name
     (with isinstance fallback). Name-based matching is needed because peft wraps
     embed_tokens in ModulesToSaveWrapper, breaking isinstance(module, nn.Embedding).
     When tie_word_embeddings is True, embed_tokens and lm_head share weights and
-    must not be wrapped separately.
+    must not be wrapped separately. ``lm_head_in_root`` leaves an untied lm_head in
+    the root unit, for heads that read ``lm_head.weight`` without calling lm_head.
     """
     _tie = getattr(model.config, "tie_word_embeddings", False)
-    _wrap_by_name = set() if _tie else {"embed_tokens", "lm_head"}
+    if _tie:
+        _wrap_by_name = set()
+    else:
+        _wrap_by_name = {"embed_tokens"} if lm_head_in_root else {"embed_tokens", "lm_head"}
 
     modules = []
     for name, module in model.named_modules():
@@ -556,7 +560,7 @@ def _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap):
     return modules
 
 
-def apply_fsdp2(model, fsdp_kwargs, config):
+def apply_fsdp2(model, fsdp_kwargs, config, lm_head_in_root=False):
     """model: AutoModelForCausalLM"""
     assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
 
@@ -572,7 +576,7 @@ def apply_fsdp2(model, fsdp_kwargs, config):
         fsdp_transformer_layer_cls_to_wrap = list(fsdp_transformer_layer_cls_to_wrap)
     assert len(fsdp_transformer_layer_cls_to_wrap) > 0 and fsdp_transformer_layer_cls_to_wrap[0] is not None
 
-    modules = _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap)
+    modules = _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap, lm_head_in_root)
 
     for idx, module in enumerate(modules):
         # if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:

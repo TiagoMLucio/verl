@@ -98,6 +98,14 @@ class TestFSDP2PeftWrapping(unittest.TestCase):
         self.assertIn("lm_head", names)
         self.assertTrue(any("layers.0" in n for n in names))
 
+    def test_lm_head_in_root_keeps_untied_lm_head_unwrapped(self):
+        """An untied lm_head stays in the root unit when the head reads its weight directly."""
+        model = MockCausalLM(tie_word_embeddings=False)
+        targets = _select_fsdp2_wrap_targets(model, ["MockDecoderLayer"], lm_head_in_root=True)
+        names = {name for name, m in model.named_modules() if any(m is t for t in targets)}
+        self.assertIn("model.embed_tokens", names)
+        self.assertNotIn("lm_head", names)
+
     def test_tied_embeddings_skips_name_based_wrapping(self):
         """With tie_word_embeddings=True, embed_tokens/lm_head are NOT wrapped separately."""
         model = MockCausalLM(tie_word_embeddings=True)
