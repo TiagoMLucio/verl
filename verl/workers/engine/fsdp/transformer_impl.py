@@ -1319,8 +1319,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
             model_inputs["distill_chunk_size"] = self.model_config.get("chunked_lm_head_size", 512)
             output_args["chunked_distill"] = True
 
-        # The SDPO teacher scores the ids the student chose at the kept positions of one row; the patched
-        # head does that chunk by chunk, so the span's (positions x vocab) logits never exist.
+        # the SDPO teacher scores the student's ids chunk by chunk, so a span's (positions x vocab) logits never exist
         score_ids = micro_batch.get("logits_keep_topk_indices", None)
         if (
             score_ids is not None
@@ -1344,8 +1343,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
     @staticmethod
     def _chunked_head_outputs(output, output_args, input_ids, model_output, needs_logits) -> torch.Tensor:
-        """Scatter what the chunked head reduced (it has no logits to read) onto the packed sequence
-        like the eager path, into ``model_output``; returns the packed label log-probs."""
+        """Put the chunked head's reductions on the packed sequence in ``model_output``; returns the label log-probs."""
         if needs_logits:
             raise NotImplementedError(
                 "the chunked head returns reductions, not logits, so entropy and "

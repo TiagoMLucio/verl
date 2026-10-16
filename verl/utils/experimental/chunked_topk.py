@@ -155,11 +155,8 @@ def chunked_gather_logprobs(
     temperature: Optional[torch.Tensor] = None,
     chunk_size: int = 512,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Log-probabilities at ``indices`` (and at ``labels`` when given), chunked the same way.
-    For the teacher, which scores the student's chosen entries and never needs a gradient.
-
-    Returns the (num_positions, k) log-probabilities at ``indices`` and the (num_positions,)
-    ones at ``labels``."""
+    """Log-probabilities at ``indices`` and, given ``labels``, at the labels, chunked the same way. For the teacher,
+    which scores the student's chosen entries and never needs a gradient."""
     num_positions = hidden.shape[0]
     chunk_size = max(1, chunk_size)
     compute_dtype = _compute_dtype(hidden.dtype)
@@ -184,9 +181,8 @@ def chunked_distill_head(
     chunk_size: int,
     indices: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-    """The distillation head's reductions: the top-k entries of each position (the student) or,
-    given ``indices``, the entries at those vocabulary ids (the teacher, scoring the student's).
-    Returns the log-probabilities, their ids (None for ``indices``) and the labels' log-probabilities."""
+    """The head's reductions per position: its top-k (the student) or the entries at ``indices`` (the teacher, scoring
+    the student's); the returned ids are None for ``indices``."""
     if indices is None:
         return chunked_topk_logprobs(
             hidden, weight, topk, labels=labels, temperature=temperature, chunk_size=chunk_size

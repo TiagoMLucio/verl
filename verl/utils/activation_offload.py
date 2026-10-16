@@ -531,8 +531,7 @@ def enable_activation_offloading(model, strategy, enable_ckpt=False):
                     wrapped_module = child._fsdp_wrapped_module
                 # In some cases, torch.nn.Embedding is wrapped with FSDP alone. However, the activation
                 # size of torch.nn.Embedding is small, so it's not necessary to offload it.
-                # A layer with nothing trainable (a frozen vision tower fed constants) records no backward, so
-                # its group commit would never be undone and the group counter would drift past the window map.
+                # nothing trainable (a frozen vision tower) records no backward, so the layer's commit is never undone
                 if not isinstance(wrapped_module, torch.nn.Embedding) and any(
                     p.requires_grad for p in wrapped_module.parameters()
                 ):
