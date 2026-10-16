@@ -170,9 +170,10 @@ class SynchronizedGroupOffloadHandler(OffloadHandler):
         assert self.current_group >= 0
 
     @staticmethod
-    def offload(src_tensor, pin_memory=True):
+    def offload(src_tensor, pin_memory=False):
         """Offload."""
 
+        # pageable: pinned blocks are rounded up to a power of two and cached for good, which outgrows host RAM
         cpu_backup = torch.empty(
             src_tensor.size(),
             dtype=src_tensor.dtype,

@@ -165,3 +165,12 @@ def test_every_micro_batch_returns_the_counters_to_zero_and_trains_the_same(sing
     assert want.keys() == got.keys() and want
     for name in want:
         torch.testing.assert_close(got[name], want[name], atol=1e-6, rtol=1e-5, msg=lambda m, name=name: f"{name}: {m}")
+
+
+def test_offloaded_copies_are_pageable():
+    """A pinned host block is rounded up to a power of two and the allocator keeps it, so the copies of a long row
+    outgrow the node; pinned memory does not exist on this CPU-only run, so the default has to be pageable."""
+    source = torch.randn(4, HIDDEN, dtype=torch.bfloat16)
+    state = activation_offload.SynchronizedGroupOffloadHandler.offload(source)
+    assert not state[1].is_pinned()
+    torch.testing.assert_close(activation_offload.SynchronizedGroupOffloadHandler.reload(state), source, rtol=0, atol=0)
