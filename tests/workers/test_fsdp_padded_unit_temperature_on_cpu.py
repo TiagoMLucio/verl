@@ -103,8 +103,11 @@ def span_only_forward(temperature):
 
 
 def fed_from(student_logits):
-    """The op that produced the processor's (n_keep, vocab) logits, under the unsqueeze(0)."""
-    return type(student_logits.grad_fn.next_functions[0][0]).__name__
+    """The op that produced the processor's (n_keep, vocab) logits, under the unsqueeze(0) and the chunk's slice."""
+    node = student_logits.grad_fn.next_functions[0][0]
+    if type(node).__name__ == "SliceBackward0":
+        node = node.next_functions[0][0]
+    return type(node).__name__
 
 
 @pytest.mark.parametrize("temperature", [1, 1.0, torch.ones(2), torch.ones(2, dtype=torch.bfloat16)])

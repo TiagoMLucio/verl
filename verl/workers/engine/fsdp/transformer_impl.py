@@ -1364,6 +1364,43 @@ class FSDPEngineWithLMHead(FSDPEngine):
             model_output[name] = torch.nested.nested_tensor_from_jagged(value, cu_seqlens)
         return log_probs
 
+    def _span_heads(self, logits, labels, keep_idx, micro_batch, processor, calculate_entropy, use_topk):
+        """Label log-probs, entropy and the distillation processor's outputs over (kept positions, vocab) logits.
+        Under autograd they run a chunk of positions at a time and each chunk is recomputed in the backward, so a long
+        hinted span never holds its float32 (positions x vocab) intermediates at once."""
+        names = []
+
+        def heads(logits_piece, labels_piece, keep_piece):
+            pieces = [logprobs_from_logits(logits=logits_piece, labels=labels_piece, inplace_backward=False)]
+            if calculate_entropy:
+                pieces.append(self.compute_entropy_from_logits(logits_piece))
+            if use_topk:
+                outputs = processor(
+                    student_logits=logits_piece.unsqueeze(0), data=micro_batch, logits_keep_idx=keep_piece
+                )
+                names[:] = list(outputs)
+                pieces.extend(outputs[name].squeeze(0) for name in names)
+            return tuple(pieces)
+
+        if torch.is_grad_enabled() and logits.requires_grad:
+            size = max(1, self.model_config.get("chunked_lm_head_size", 512))
+            pieces = [
+                torch.utils.checkpoint.checkpoint(
+                    heads,
+                    logits[start : start + size],
+                    labels[start : start + size],
+                    keep_idx[start : start + size],
+                    use_reentrant=False,
+                )
+                for start in range(0, logits.shape[0], size)
+            ]
+            merged = [torch.cat(column) for column in zip(*pieces, strict=True)]
+        else:
+            merged = list(heads(logits, labels, keep_idx))
+        log_probs = merged.pop(0)
+        entropy = merged.pop(0) if calculate_entropy else None
+        return log_probs, entropy, dict(zip(names, merged, strict=True))
+
     def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict, logits_processor_func):
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
@@ -1538,14 +1575,17 @@ class FSDPEngineWithLMHead(FSDPEngine):
             cu_seqlens = input_ids.offsets()
 
             logits_union = output.logits  # (bsz, |union|, vocab)
-            # row-major concat, matching how keep_idx was built from keep_positions.values()
-            logits_rmpad = torch.cat(
-                [
-                    logits_union[i].index_select(0, torch.searchsorted(keep_union, row))
-                    for i, row in enumerate(keep_rows)
-                ],
-                dim=0,
-            )  # (n_keep_total, vocab)
+            if len(keep_rows) == 1 and torch.equal(keep_rows[0], keep_union):
+                logits_rmpad = logits_union[0]  # the row is the union: nothing to select, nothing to copy
+            else:
+                # row-major concat, matching how keep_idx was built from keep_positions.values()
+                logits_rmpad = torch.cat(
+                    [
+                        logits_union[i].index_select(0, torch.searchsorted(keep_union, row))
+                        for i, row in enumerate(keep_rows)
+                    ],
+                    dim=0,
+                )  # (n_keep_total, vocab)
 
             # per-position temperature, restricted to the kept positions
             if not output_args.get("temperature_is_one", False):
@@ -1553,31 +1593,24 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 logits_rmpad = logits_rmpad / temperature_keep.clamp(min=1e-8).unsqueeze(-1).to(logits_rmpad.dtype)
 
             labels_keep = output_args["input_ids_rmpad_rolled"][keep_idx]
-            log_probs = logprobs_from_logits(
-                logits=logits_rmpad,
-                labels=labels_keep,
-                inplace_backward=not calculate_entropy,
+            log_probs, entropy_keep, outputs = self._span_heads(
+                logits_rmpad,
+                labels_keep,
+                keep_idx,
+                micro_batch,
+                logits_processor_func,
+                calculate_entropy,
+                distillation_use_topk,
             )
             log_probs = log_probs.new_zeros(total_nnz).index_copy_(0, keep_idx, log_probs)
 
             if calculate_entropy:
-                if not self.engine_config.entropy_checkpointing:
-                    entropy_keep = self.compute_entropy_from_logits(logits_rmpad)
-                else:
-                    entropy_keep = torch.utils.checkpoint.checkpoint(self.compute_entropy_from_logits, logits_rmpad)
                 entropy = entropy_keep.new_zeros(total_nnz).index_copy_(0, keep_idx, entropy_keep)
 
-            if distillation_use_topk:
-                outputs = logits_processor_func(
-                    student_logits=logits_rmpad.unsqueeze(0), data=micro_batch, logits_keep_idx=keep_idx
-                )
-                for k, v in outputs.items():
-                    v = v.squeeze(0)
-                    v = v.new_zeros((total_nnz, *v.shape[1:])).index_copy_(0, keep_idx, v)
-                    assert v.shape[0] == log_probs.shape[0], (
-                        f"log_probs shape: {log_probs.shape}, {k} shape: {v.shape}"
-                    )
-                    model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
+            for k, v in outputs.items():
+                v = v.new_zeros((total_nnz, *v.shape[1:])).index_copy_(0, keep_idx, v)
+                assert v.shape[0] == log_probs.shape[0], f"log_probs shape: {log_probs.shape}, {k} shape: {v.shape}"
+                model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
 
             log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
             if calculate_entropy:
