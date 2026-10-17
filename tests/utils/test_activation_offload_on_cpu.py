@@ -167,10 +167,73 @@ def test_every_micro_batch_returns_the_counters_to_zero_and_trains_the_same(sing
         torch.testing.assert_close(got[name], want[name], atol=1e-6, rtol=1e-5, msg=lambda m, name=name: f"{name}: {m}")
 
 
-def test_offloaded_copies_are_pageable():
-    """A pinned host block is rounded up to a power of two and the allocator keeps it, so the copies of a long row
-    outgrow the node; pinned memory does not exist on this CPU-only run, so the default has to be pageable."""
+class _LooksCuda(torch.Tensor):
+    """A CPU tensor that claims to be on the GPU, since the registration itself needs one."""
+
+    @property
+    def is_cuda(self):
+        return True
+
+
+@pytest.fixture
+def registrations(monkeypatch):
+    """What the offload pins and unpins, as (what, address, bytes); cudaHostRegister itself needs a GPU."""
+    log = []
+
+    def register(tensor):
+        log.append(("register", tensor.data_ptr(), tensor.numel() * tensor.element_size()))
+
+    def unregister(tensor):
+        log.append(("unregister", tensor.data_ptr(), None))
+
+    monkeypatch.setattr(activation_offload, "_register_host", register)
+    monkeypatch.setattr(activation_offload, "_unregister_host", unregister)
+    return log
+
+
+def test_a_gpu_activation_is_pinned_in_place_at_its_exact_size_and_unpinned_on_reload(registrations):
+    """The pinned allocator rounds every block up to a power of two and keeps it (a 1.25 GiB activation takes 2 GiB for
+    good), and pageable memory takes about half its size in device memory on a GH200: the copy is pinned in place."""
+    handler = activation_offload.SynchronizedGroupOffloadHandler
+    source = torch.randn(5, 7, dtype=torch.bfloat16)
+    state = handler.offload(source.as_subclass(_LooksCuda))
+    address = state[1].data_ptr()
+    assert registrations == [("register", address, 5 * 7 * 2)]
+
+    torch.testing.assert_close(handler.reload(state), source, rtol=0, atol=0)
+    assert registrations == [("register", address, 70), ("unregister", address, None)]
+
+
+def test_a_cpu_activation_is_not_registered(registrations):
+    handler = activation_offload.SynchronizedGroupOffloadHandler
     source = torch.randn(4, HIDDEN, dtype=torch.bfloat16)
-    state = activation_offload.SynchronizedGroupOffloadHandler.offload(source)
-    assert not state[1].is_pinned()
-    torch.testing.assert_close(activation_offload.SynchronizedGroupOffloadHandler.reload(state), source, rtol=0, atol=0)
+    state = handler.offload(source)
+    torch.testing.assert_close(handler.reload(state), source, rtol=0, atol=0)
+    assert registrations == []
+
+
+def test_the_driver_gets_the_buffer_whole_and_its_error_is_raised(monkeypatch):
+    """A registration that fails would leave the copy pageable and bring the device memory growth back unseen."""
+    calls = []
+
+    class Cudart:
+        def cudaHostRegister(self, address, size, flags):
+            calls.append(("register", address, size, flags))
+            return "no memory"
+
+        def cudaHostUnregister(self, address):
+            calls.append(("unregister", address))
+            return "no memory"
+
+    def check_error(result):
+        if result != "ok":
+            raise RuntimeError(result)
+
+    monkeypatch.setattr(torch.cuda, "cudart", Cudart)
+    monkeypatch.setattr(torch.cuda, "check_error", check_error)
+    buffer = torch.empty(3, 5, dtype=torch.bfloat16)
+    for call in (activation_offload._register_host, activation_offload._unregister_host):
+        with pytest.raises(RuntimeError, match="no memory"):
+            call(buffer)
+    address = buffer.data_ptr()
+    assert calls == [("register", address, 30, 0), ("unregister", address)]

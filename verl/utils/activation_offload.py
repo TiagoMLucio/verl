@@ -37,6 +37,15 @@ def _get_unique_tensor_key(tensor):
     return key
 
 
+def _register_host(tensor):
+    cudart = torch.cuda.cudart()
+    torch.cuda.check_error(cudart.cudaHostRegister(tensor.data_ptr(), tensor.numel() * tensor.element_size(), 0))
+
+
+def _unregister_host(tensor):
+    torch.cuda.check_error(torch.cuda.cudart().cudaHostUnregister(tensor.data_ptr()))
+
+
 class FSDPParameterFilter:
     def __init__(self):
         self.model_parameters_storage = set()
@@ -170,17 +179,19 @@ class SynchronizedGroupOffloadHandler(OffloadHandler):
         assert self.current_group >= 0
 
     @staticmethod
-    def offload(src_tensor, pin_memory=False):
+    def offload(src_tensor, pin_memory=True):
         """Offload."""
 
-        # pageable: pinned blocks are rounded up to a power of two and cached for good, which outgrows host RAM
         cpu_backup = torch.empty(
             src_tensor.size(),
             dtype=src_tensor.dtype,
             layout=src_tensor.layout,
             device="cpu",
-            pin_memory=pin_memory,
         )
+        # pinned in place: the pinned allocator rounds blocks to a power of two, pageable ones take GH200 device memory
+        cpu_backup.host_registered = pin_memory and src_tensor.is_cuda
+        if cpu_backup.host_registered:
+            _register_host(cpu_backup)
         cpu_backup.copy_(src_tensor, non_blocking=True)
         state = (src_tensor.device, cpu_backup)
         return state
@@ -189,9 +200,14 @@ class SynchronizedGroupOffloadHandler(OffloadHandler):
     def reload(state, non_blocking=None):
         """Reload."""
         dev, cpu_backup = state
+        registered = getattr(cpu_backup, "host_registered", False)
         if non_blocking is None:
-            non_blocking = cpu_backup.is_pinned()
-        return cpu_backup.to(dev, non_blocking=non_blocking)
+            # a registered buffer is unpinned right after the copy, which must have finished by then
+            non_blocking = cpu_backup.is_pinned() and not registered
+        tensor = cpu_backup.to(dev, non_blocking=non_blocking)
+        if registered:
+            _unregister_host(cpu_backup)
+        return tensor
 
     def tensor_push(self, tensor: torch.Tensor, **kwargs):
         """Tensor push."""
