@@ -351,3 +351,27 @@ def run_peak_bytes(group=None) -> tuple[int, int]:
         torch.distributed.all_reduce(peaks, op=torch.distributed.ReduceOp.MAX, group=group)
         allocated, reserved = (int(x) for x in peaks.tolist())
     return allocated, reserved
+
+
+def retry_triton_module_loads() -> None:
+    """Triton loads a kernel's module with a driver call PyTorch's free-and-retry never sees, so once its cache holds
+    the device the first launch of an unseen specialization dies: retry it once after emptying the cache."""
+    try:
+        from triton.compiler.compiler import CompiledKernel
+    except ImportError:
+        return
+    original = CompiledKernel._init_handles
+    if getattr(original, "empties_cache", False):
+        return
+
+    def init_handles(self):
+        try:
+            return original(self)
+        except RuntimeError as err:
+            if "out of memory" not in str(err):
+                raise
+            get_torch_device().empty_cache()
+            return original(self)
+
+    init_handles.empties_cache = True
+    CompiledKernel._init_handles = init_handles

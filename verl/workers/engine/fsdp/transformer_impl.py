@@ -40,7 +40,7 @@ from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
-from verl.utils.device import get_device_id, get_device_name
+from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     FSDPModule,
@@ -61,7 +61,7 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_optimizer,
     replace_lora_wrapper,
 )
-from verl.utils.memory_utils import take_peak
+from verl.utils.memory_utils import retry_triton_module_loads, take_peak
 from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.torch_functional import logprobs_from_logits
@@ -184,6 +184,7 @@ class FSDPEngine(BaseEngine):
             if self.engine_config.use_torch_compile  #  use torch compile by default
             else entropy_from_logits
         )
+        retry_triton_module_loads()
 
     @property
     def is_param_offload_enabled(self) -> bool:
@@ -715,6 +716,7 @@ class FSDPEngine(BaseEngine):
                     "update/micro_batch", mb_start, time.time(),
                     **_micro_batch_args(micro_idx, micro_batch),
                     **_gb_args("fwd_peak", fwd_peak), **_gb_args("bwd_peak", bwd_peak),
+                    dev_used_gb=_device_used_gb(),
                 )
             output_lst.append(meta_info)
 
@@ -1057,6 +1059,12 @@ def _micro_batch_args(micro_idx, micro_batch) -> dict:
 def _gb_args(prefix: str, peak: tuple) -> dict:
     allocated, reserved = peak
     return {f"{prefix}_alloc_gb": round(allocated / 2**30, 3), f"{prefix}_resv_gb": round(reserved / 2**30, 3)}
+
+
+def _device_used_gb() -> float:
+    """What the device holds, the memory PyTorch's own counters leave out included."""
+    free, total = get_torch_device().mem_get_info()
+    return round((total - free) / 2**30, 3)
 
 
 def _trace_lm_head(logits_rmpad, keep_idx, output_args, input_ids) -> None:
