@@ -2160,6 +2160,8 @@ class PPOTrainer:
             extra_info["mini_batch_size"] = len(batch.keys)
             if self._outcome_term_on():
                 extra_info["outcome_trajectories"] = outcome_trajectories
+            if sdpo_enabled and self.config.actor_rollout_ref.actor.get("use_kl_loss", False):
+                extra_info["kl_trajectories"] = supervised_trajectories + outcome_trajectories
         batch.extra_info.update(extra_info)
 
         output: TensorDict = self.actor_rollout_wg.update_actor(batch)
@@ -2518,6 +2520,27 @@ class PPOTrainer:
         return batch
 
 
+def check_sdpo_kl(config) -> None:
+    """Refuse a KL setting an SDPO run cannot honour: the SDPO loss reads no advantages, and its KL reference
+    is the ref module, which is also the teacher."""
+    if config.algorithm.get("use_kl_in_reward", False):
+        raise ValueError(
+            "SDPO never reads the advantages a reward-side KL shapes; use actor_rollout_ref.actor.use_kl_loss."
+        )
+    actor, model = config.actor_rollout_ref.actor, config.actor_rollout_ref.model
+    if not actor.get("use_kl_loss", False):
+        return
+    if actor.self_distillation.get("teacher_regularization", "ema") == "trust_region":
+        raise ValueError("SDPO with use_kl_loss: a trust-region teacher mixes the student into the reference.")
+    if actor.get("loss_agg_mode") != "traj-mean-token-mean":
+        raise ValueError("SDPO with use_kl_loss needs loss_agg_mode=traj-mean-token-mean.")
+    if not model.get("use_fused_kernels", False) or model.get("use_chunked_lm_head", False):
+        raise ValueError(
+            "SDPO with use_kl_loss reads every position's log-prob off the fused kernel: "
+            "it needs model.use_fused_kernels=true and model.use_chunked_lm_head off."
+        )
+
+
 @ray.remote
 class TaskRunner:
     def __init__(self) -> None:
@@ -2532,8 +2555,8 @@ class TaskRunner:
         self_distillation_cfg = config.actor_rollout_ref.actor.get("self_distillation", None)
         loss_mode = config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
         self_distillation_needs_ref = self_distillation_cfg is not None and loss_mode == "sdpo"
-        if self_distillation_needs_ref and need_reference_policy(config):
-            raise ValueError("SDPO cannot share the reference policy with KL regularization.")
+        if self_distillation_needs_ref:
+            check_sdpo_kl(config)
         if self_distillation_needs_ref and config.actor_rollout_ref.actor.strategy not in {"fsdp", "fsdp2"}:
             raise ValueError("SDPO currently supports FSDP/FSDP2 actor strategy only.")
 

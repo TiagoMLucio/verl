@@ -1347,6 +1347,22 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 model_inputs["temperature"] = max(float(temperature[0]), 1e-8)
             output_args["chunked_distill"] = True
 
+        # the realised token's log-prob at every position, off the fused kernel, next to the kept positions' logits
+        if tu.get_non_tensor_data(data=micro_batch, key="all_label_log_probs", default=False):
+            if "logits_keep_idx" not in output_args or use_fused_kernels or output_args.get("chunked_distill"):
+                raise NotImplementedError(
+                    "all_label_log_probs rides the span-only logits pass: it needs logits_keep_positions, "
+                    "use_fused_kernels=False on the call and no chunked head"
+                )
+            if not self.model_config.use_fused_kernels:
+                raise ValueError("all_label_log_probs needs the patched forward: set model.use_fused_kernels=True")
+            if isinstance(temperature_item, torch.Tensor):
+                raise NotImplementedError("all_label_log_probs does not support per sample temperature yet")
+            model_inputs["all_label_log_probs"] = True
+            model_inputs["temperature"] = temperature_item
+            if use_remove_padding:
+                model_inputs["shift_labels"] = output_args["input_ids_rmpad_rolled"].unsqueeze(0)
+
         return model_inputs, output_args
 
     @staticmethod
@@ -1720,6 +1736,16 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         sum_pi_squared = torch.nested.nested_tensor_from_jagged(sum_pi_squared_rmpad, cu_seqlens)
                 else:
                     raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
+
+        if tu.get_non_tensor_data(data=micro_batch, key="all_label_log_probs", default=False):
+            cu_seqlens = input_ids.offsets()
+            if use_remove_padding:
+                label_log_probs = output.log_probs.reshape(-1)
+            else:
+                label_log_probs = torch.cat(
+                    [row[:n] for row, n in zip(output.log_probs, cu_seqlens.diff().tolist(), strict=True)]
+                )
+            model_output["all_label_log_probs"] = torch.nested.nested_tensor_from_jagged(label_log_probs, cu_seqlens)
 
         model_output["log_probs"] = log_probs
         if calculate_entropy:

@@ -220,6 +220,7 @@ def forward_with_torch_backend(
     distill_topk: Optional[int] = None,
     distill_chunk_size: int = 512,
     distill_indices: Optional[torch.Tensor] = None,
+    all_label_log_probs: bool = False,
     **kwargs,
 ) -> "Qwen3_5CausalLMOutputForPPO":
     from verl.utils.experimental.torch_functional import FusedLinearForPPO
@@ -233,8 +234,20 @@ def forward_with_torch_backend(
     if not use_fused_kernels and distill_topk is None and distill_indices is None:
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
+        log_probs = None
+        if all_label_log_probs:
+            vocab_weights = self.lm_head.weight
+            if isinstance(vocab_weights, DTensor):
+                vocab_weights = vocab_weights.full_tensor()
+            log_probs, _ = FusedLinearForPPO().forward(
+                hidden_states=hidden_states.to(vocab_weights.dtype),
+                vocab_weights=vocab_weights,
+                input_ids=shift_labels if shift_labels is not None else torch.roll(input_ids, shifts=-1, dims=-1),
+                temperature=temperature,
+            )
         return Qwen3_5CausalLMOutputForPPO(
             logits=logits,
+            log_probs=log_probs,
             hidden_states=outputs.hidden_states,
         )
 
@@ -313,6 +326,7 @@ def forward_with_triton_backend(
     distill_topk: Optional[int] = None,
     distill_chunk_size: int = 512,
     distill_indices: Optional[torch.Tensor] = None,
+    all_label_log_probs: bool = False,
     **kwargs,
 ) -> "Qwen3_5CausalLMOutputForPPO":
     from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
@@ -323,8 +337,21 @@ def forward_with_triton_backend(
     if not use_fused_kernels and distill_topk is None and distill_indices is None:
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
+        log_probs = None
+        if all_label_log_probs:
+            vocab_weights = self.lm_head.weight
+            if isinstance(vocab_weights, DTensor):
+                vocab_weights = vocab_weights.full_tensor()
+            log_probs, _ = linear_cross_entropy(
+                hidden_states.to(vocab_weights.dtype),
+                vocab_weights,
+                shift_labels if shift_labels is not None else torch.roll(input_ids, shifts=-1, dims=-1),
+                temperature,
+                "none",
+            )
         return Qwen3_5CausalLMOutputForPPO(
             logits=logits,
+            log_probs=log_probs,
             hidden_states=outputs.hidden_states,
         )
 

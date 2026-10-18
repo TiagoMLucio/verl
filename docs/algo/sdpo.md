@@ -41,7 +41,7 @@ The trainer builds the teacher with `make_teacher` (`hydra.utils.instantiate` on
 ## Current Constraints in verl
 
 - SDPO requires `fsdp` / `fsdp2` actor strategy.
-- SDPO cannot be combined with a separate KL reference policy (`use_kl_in_reward` or `use_kl_loss` reference path).
+- SDPO ignores advantages, so `use_kl_in_reward` is refused. `use_kl_loss` (sync trainer) adds a KL to the ref module, the same module the teacher runs on, on every response token the update keeps; it needs `traj-mean-token-mean`, `model.use_fused_kernels=true` and no trust-region teacher.
 - Distillation with multimodal actor inputs is currently not supported.
 - Trust-region teacher regularization requires `actor_rollout_ref.actor.use_fused_kernels=false`.
 

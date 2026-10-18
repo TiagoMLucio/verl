@@ -806,6 +806,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # bound them -- 43.8k tokens x 248320 x bf16 is a 20.26 GiB allocation.
         if self.sdpo_enabled:
             tu.assign_non_tensor(data, use_fused_kernels=False)
+            if self.config.actor.use_kl_loss:
+                # the KL term reads every kept position, the distillation only the hinted spans
+                tu.assign_non_tensor(data, all_label_log_probs=True)
         if self._chunked_distill_topk() is not None:
             tu.assign_non_tensor(data, chunked_distill_topk=self._chunked_distill_topk())
 

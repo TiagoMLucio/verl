@@ -90,6 +90,7 @@ def forward_with_torch_backend(
     distill_topk: Optional[int] = None,
     distill_chunk_size: int = 512,
     distill_indices: Optional[torch.Tensor] = None,
+    all_label_log_probs: bool = False,
     **loss_kwargs,
 ) -> tuple | CausalLMOutputForPPO:
     from verl.utils.experimental.torch_functional import FusedLinearForPPO
@@ -115,8 +116,17 @@ def forward_with_torch_backend(
     if not use_fused_kernels and distill_topk is None and distill_indices is None:
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-        return CausalLMOutputWithPast(
+        log_probs = None
+        if all_label_log_probs:
+            log_probs, _ = FusedLinearForPPO().forward(
+                hidden_states=hidden_states,
+                vocab_weights=self.lm_head.weight,
+                input_ids=shift_labels if shift_labels is not None else torch.roll(input_ids, shifts=-1, dims=-1),
+                temperature=temperature,
+            )
+        return CausalLMOutputForPPO(
             logits=logits,
+            log_probs=log_probs,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
@@ -206,6 +216,7 @@ def forward_with_triton_backend(
     distill_topk: Optional[int] = None,
     distill_chunk_size: int = 512,
     distill_indices: Optional[torch.Tensor] = None,
+    all_label_log_probs: bool = False,
     **loss_kwargs,
 ) -> tuple | CausalLMOutputForPPO:
     from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
@@ -232,8 +243,18 @@ def forward_with_triton_backend(
     if not use_fused_kernels and distill_topk is None and distill_indices is None:
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-        return CausalLMOutputWithPast(
+        log_probs = None
+        if all_label_log_probs:
+            log_probs, _ = linear_cross_entropy(
+                hidden_states,
+                self.lm_head.weight,
+                shift_labels if shift_labels is not None else torch.roll(input_ids, shifts=-1, dims=-1),
+                temperature,
+                "none",
+            )
+        return CausalLMOutputForPPO(
             logits=logits,
+            log_probs=log_probs,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,

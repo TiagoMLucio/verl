@@ -236,3 +236,59 @@ def test_entropy_chunking_runs_on_the_padded_logits_branch(single_process_group,
     chunked_lp, chunked_ent = old_log_prob(model, False, micro_batch_size_per_gpu, entropy_chunking=True)
     assert_rows_match(chunked_lp, raw_lp, drop_last=False)
     assert_rows_match(chunked_ent, raw_ent, drop_last=False)
+
+
+def span_only_batch(micro_batch_size_per_gpu, temperature):
+    """make_batch on the SDPO update's call: span-only logits over one hinted span per row, and every
+    position's label log-prob asked for next to them."""
+    data = make_batch(False, micro_batch_size_per_gpu, temperature)
+    data["logits_keep_positions"] = njt([torch.arange(n - 300, n - 250) for n in ROW_LENGTHS])
+    tu.assign_non_tensor(data, all_label_log_probs=True)
+    return data
+
+
+@pytest.mark.parametrize("micro_batch_size_per_gpu", [1, 2], ids=["unpadded", "padded-rows"])
+@pytest.mark.parametrize("temperature", [1.0, 0.7])
+def test_the_span_only_pass_also_returns_every_positions_label_log_prob(
+    single_process_group, cpu_ops, micro_batch_size_per_gpu, temperature
+):
+    model = tiny_qwen3_5()
+    with fused_forward(model):
+        fused_lp, _ = old_log_prob(model, True, micro_batch_size_per_gpu, temperature)
+        data = span_only_batch(micro_batch_size_per_gpu, temperature)
+        model_output = make_engine(model).forward_backward_batch(data, None, forward_only=True)["model_output"]
+
+    every = list(model_output["all_label_log_probs"].unbind())
+    assert [t.shape[0] for t in every] == list(ROW_LENGTHS)
+    assert_rows_match(every, fused_lp, drop_last=True)
+    # the kept positions' own log-probs still come off the span-only logits
+    for kept, full, n in zip(model_output["log_probs"].unbind(), fused_lp, ROW_LENGTHS, strict=True):
+        torch.testing.assert_close(kept[n - 300 : n - 250], full[n - 300 : n - 250].float(), atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("micro_batch_size_per_gpu", [1, 2], ids=["unpadded", "padded-rows"])
+def test_the_label_log_probs_carry_the_gradient_of_the_logits_they_come_from(
+    single_process_group, cpu_ops, micro_batch_size_per_gpu
+):
+    """Backward through the fused kernel beside the span-only head gives the gradient autograd gives through
+    full logits."""
+    model = tiny_qwen3_5()
+
+    def summed_label_log_probs(model_output, data, dp_group=None):
+        rows = model_output["all_label_log_probs"].unbind()
+        return torch.cat([row[:-1] for row in rows]).sum(), {}
+
+    with fused_forward(model):
+        engine = make_engine(model)
+        engine.engine_config.forward_only = False
+        engine.forward_backward_batch(span_only_batch(micro_batch_size_per_gpu, 1.0), summed_label_log_probs)
+    fused = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
+    model.zero_grad()
+
+    for ids in make_batch(False, 1, 1.0)["input_ids"].unbind():
+        log_probs = torch.log_softmax(model(input_ids=ids.unsqueeze(0), use_cache=False).logits[0], -1)
+        log_probs[:-1].gather(-1, ids[1:].unsqueeze(-1)).sum().backward()
+    reference = {name: p.grad for name, p in model.named_parameters() if p.grad is not None}
+    assert fused.keys() == reference.keys() and "lm_head.weight" in fused
+    for name, grad in reference.items():
+        torch.testing.assert_close(fused[name], grad, atol=1e-4, rtol=1e-3, msg=name)

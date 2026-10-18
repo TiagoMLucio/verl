@@ -105,7 +105,16 @@ def _row(weight, traj, seq_len, outcome=None):
     )
 
 
-def _trainer(monkeypatch, n_tasks, n_rows, supervised_rows, micro=None, outcome_rows=None, success_nll_coef=0.0):
+def _trainer(
+    monkeypatch,
+    n_tasks,
+    n_rows,
+    supervised_rows,
+    micro=None,
+    outcome_rows=None,
+    success_nll_coef=0.0,
+    use_kl_loss=False,
+):
     """``n_rows - n_tasks`` tasks condensed into two segments; the first ``supervised_rows``
     rows carry weight, and with ``outcome_rows`` every row carries the outcome fields, the next
     ``outcome_rows`` with weight. Returns the trainer, the balanced batch, the captured update calls and the KV."""
@@ -138,6 +147,7 @@ def _trainer(monkeypatch, n_tasks, n_rows, supervised_rows, micro=None, outcome_
                     "ppo_epochs": 1,
                     "drop_unsupervised_rows": True,
                     "loss_agg_mode": "traj-mean-token-mean",
+                    "use_kl_loss": use_kl_loss,
                     "policy_loss": {"loss_mode": "sdpo"},
                     "self_distillation": {"full_logit_distillation": False, "success_nll_coef": success_nll_coef},
                     "calculate_entropy": False,
@@ -231,6 +241,20 @@ def test_the_drop_keeps_the_outcome_rows_only_under_the_outcome_term(monkeypatch
     assert metrics["self_distillation/dropped_unsupervised_rows"] == 128 - kept
     assert update_batch.extra_info["global_batch_size"] == 90
     assert update_batch.extra_info.get("outcome_trajectories") == (20 if coef else None)
+
+
+@pytest.mark.parametrize("coef, trajectories", [(0.0, 90), (0.3, 110)])
+def test_the_kl_term_averages_over_every_trajectory_the_update_reads(monkeypatch, coef, trajectories):
+    """90 hinted rows and 20 solved: the KL term reads the outcome rows too when the outcome term keeps them."""
+    trainer, batch, _, _ = _trainer(monkeypatch, 128, 128, 90, outcome_rows=20, success_nll_coef=coef, use_kl_loss=True)
+    update_batch = _update(trainer, batch, {})
+    assert update_batch.extra_info["kl_trajectories"] == trajectories
+    assert update_batch.extra_info["global_batch_size"] == 90
+
+
+def test_no_kl_count_ships_without_the_kl_term(monkeypatch):
+    trainer, batch, _, _ = _trainer(monkeypatch, 128, 128, 90)
+    assert "kl_trajectories" not in _update(trainer, batch, {}).extra_info
 
 
 def test_an_outcome_only_batch_steps_under_the_outcome_term(monkeypatch):

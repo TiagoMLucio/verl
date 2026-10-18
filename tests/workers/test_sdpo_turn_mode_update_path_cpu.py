@@ -37,6 +37,7 @@ from verl.trainer.ppo.core_algos import SDPO_SPAN_ROWS_KEY, finalize_ratio_metri
 from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META, SubRow, pack
 from verl.utils import tensordict_utils as tu
 from verl.utils.experimental.chunked_topk import chunked_gather_logprobs
+from verl.utils.experimental.torch_functional import FusedLinearForPPO
 from verl.utils.metric import Metric
 from verl.utils.torch_functional import allgather_dict_into_dict
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
@@ -128,6 +129,21 @@ class ToyChunkedLM(ToyLM):
         )
         self.scored.append((tuple(distill_indices.shape), distill_chunk_size, temperature))
         return SimpleNamespace(log_probs=label_logps.unsqueeze(0), topk_logps=logps.unsqueeze(0), topk_indices=None)
+
+
+class ToyFusedLM(ToyLM):
+    """ToyLM with the patched head's ``all_label_log_probs``: every position's label log-prob off the fused
+    kernel, next to the kept positions' logits."""
+
+    def forward(self, input_ids=None, logits_to_keep=None, all_label_log_probs=False, shift_labels=None, **kwargs):
+        temperature = kwargs.pop("temperature", 1.0)
+        output = super().forward(input_ids=input_ids, logits_to_keep=logits_to_keep, **kwargs)
+        if all_label_log_probs:
+            labels = shift_labels if shift_labels is not None else torch.roll(input_ids, shifts=-1, dims=-1)
+            output.log_probs, _ = FusedLinearForPPO().forward(
+                self.emb(input_ids), self.head.weight, labels, temperature
+            )
+        return output
 
 
 def make_engine(module, patched_head=False, chunked_flag=False, inference_module=None):
@@ -266,11 +282,19 @@ def make_batch(
 
 
 def run_update(
-    data, loss_agg_mode="token-mean", dp_size=None, alpha=0.5, chunked_teacher=False, success_nll_coef=0.0
+    data,
+    loss_agg_mode="token-mean",
+    dp_size=None,
+    alpha=0.5,
+    chunked_teacher=False,
+    success_nll_coef=0.0,
+    kl_loss_coef=None,
+    fused_student=False,
 ):
     """Mirror ActorRolloutRefWorker.update_actor minus Ray/FSDP/TQ; ``dp_size`` fakes the rank count the
-    loss is told, as if every rank held this same batch."""
-    student_engine = make_engine(ToyLM(seed=0))
+    loss is told, as if every rank held this same batch. ``kl_loss_coef`` turns use_kl_loss on (low_var_kl);
+    ``fused_student`` runs the student on the patched head."""
+    student_engine = make_engine(ToyFusedLM(seed=0) if fused_student else ToyLM(seed=0), patched_head=fused_student)
     student_engine.engine_config.forward_only = False
     if dp_size is not None:
         student_engine.get_data_parallel_size = lambda: dp_size
@@ -286,8 +310,16 @@ def run_update(
     teacher_fn = partial(ActorRolloutRefWorker._compute_sdpo_teacher_logps_for_loss, worker)
 
     actor_config = SimpleNamespace(
-        global_batch_info={}, loss_scale_factor=None, loss_agg_mode=loss_agg_mode, entropy_coeff=0.0
+        global_batch_info={},
+        loss_scale_factor=None,
+        loss_agg_mode=loss_agg_mode,
+        entropy_coeff=0.0,
+        use_kl_loss=kl_loss_coef is not None,
+        kl_loss_coef=kl_loss_coef or 0.0,
+        kl_loss_type="low_var_kl",
     )
+    if kl_loss_coef is not None:
+        tu.assign_non_tensor(data, all_label_log_probs=True)
     sdpo_config = SimpleNamespace(
         full_logit_distillation=True,
         distillation_topk=TOPK,
@@ -672,6 +704,124 @@ def test_the_outcome_term_adds_its_nll_to_the_distillation_loss(single_process_g
     for key in ("outcome/grad_proxy_nll", "self_distillation/grad_proxy_sd"):
         assert ratios[key] > 0
     assert metrics["outcome/grad_proxy_nll_term"] > 0 and metrics["self_distillation/grad_proxy_sd_term"] > 0
+
+
+def with_reference(data, shift=0.0, kl_trajectories=1):
+    """The toy student's own log-prob of each response token as the reference, moved by ``shift``; the trainer's
+    count of the trajectories the KL term reads (None ships none)."""
+    student = ToyLM(seed=0)
+    rows = []
+    with torch.no_grad():
+        for ids, prompt in zip(data["input_ids"].unbind(), data["prompts"].unbind(), strict=True):
+            log_probs = torch.log_softmax(student(ids.unsqueeze(0)).logits[0], -1)
+            per_position = log_probs[:-1].gather(-1, ids[1:].unsqueeze(-1)).squeeze(-1)
+            rows.append(per_position[prompt.shape[0] - 1 :] + shift)
+    data["ref_log_prob"] = njt(rows)
+    if kl_trajectories is not None:
+        tu.assign_non_tensor(data, kl_trajectories=kl_trajectories)
+    return data
+
+
+def _kl_update(kl_loss_coef, shift=0.0, outcome=False):
+    torch.manual_seed(0)
+    data = with_reference(
+        make_batch(loss_agg_mode="traj-mean-token-mean", outcome=outcome), shift, kl_trajectories=2 if outcome else 1
+    )
+    return run_update(
+        data,
+        loss_agg_mode="traj-mean-token-mean",
+        alpha=1.0,
+        success_nll_coef=0.3 if outcome else 0.0,
+        kl_loss_coef=kl_loss_coef,
+        fused_student=True,
+    )
+
+
+def _summed(outputs):
+    return {k: v.aggregate() for k, v in outputs["metrics"].items() if hasattr(v, "aggregate")}
+
+
+def test_a_kl_off_update_is_todays_bit_for_bit(single_process_group, cpu_ops):
+    """The patched student and a reference in the batch change nothing while use_kl_loss is off."""
+    torch.manual_seed(0)
+    today_engine, today = run_update(
+        make_batch(loss_agg_mode="traj-mean-token-mean"), loss_agg_mode="traj-mean-token-mean", alpha=1.0
+    )
+    off_engine, off = _kl_update(None)
+    for a, b in zip(_grads(today_engine), _grads(off_engine), strict=True):
+        assert torch.equal(a, b)
+    assert _pg_loss(today) == _pg_loss(off)
+    assert set(today["metrics"]) == set(off["metrics"])
+
+
+def test_the_kl_term_is_zero_where_the_student_is_the_reference(single_process_group, cpu_ops):
+    off_engine, _ = _kl_update(None)
+    on_engine, on = _kl_update(0.5)
+    assert _summed(on)["kl_loss"] == pytest.approx(0.0, abs=1e-6)
+    for a, b in zip(_grads(off_engine), _grads(on_engine), strict=True):
+        torch.testing.assert_close(a, b, atol=1e-6, rtol=0)
+
+
+def test_the_kl_term_pulls_the_sampled_tokens_toward_the_reference(single_process_group, cpu_ops):
+    """A reference one nat below the student on every sampled token: a step against the term's gradient lowers the
+    hinted row's log-probs, and only its rows' tokens are read."""
+    off_engine, _ = _kl_update(None, shift=-1.0)
+    on_engine, on = _kl_update(0.5, shift=-1.0)
+    kl_grads = [b - a for a, b in zip(_grads(off_engine), _grads(on_engine), strict=True)]
+
+    student = ToyLM(seed=0)
+    data = make_batch(loss_agg_mode="traj-mean-token-mean")
+    ids, prompt, mask = (data[key].unbind()[0] for key in ("input_ids", "prompts", "response_mask"))
+    log_probs = torch.log_softmax(student(ids.unsqueeze(0)).logits[0], -1)[:-1]
+    log_probs = log_probs.gather(-1, ids[1:].unsqueeze(-1)).squeeze(-1)[prompt.shape[0] - 1 :]
+    (log_probs * mask).sum().backward()
+    assert sum((g * p.grad).sum() for g, p in zip(kl_grads, student.parameters(), strict=True)) > 0
+    assert _summed(on)["kl_loss"] > 0
+
+
+def test_the_kl_term_adds_linearly_with_its_coefficient(single_process_group, cpu_ops):
+    base_engine, _ = _kl_update(None, shift=-0.5)
+    one_engine, _ = _kl_update(0.2, shift=-0.5)
+    two_engine, _ = _kl_update(0.4, shift=-0.5)
+    base, g1, g2 = _grads(base_engine), _grads(one_engine), _grads(two_engine)
+    assert sum((a - b).abs().sum() for a, b in zip(g1, base, strict=True)) > 1e-4
+    for b, a1, a2 in zip(base, g1, g2, strict=True):
+        torch.testing.assert_close(a2 - b, 2 * (a1 - b), atol=1e-6, rtol=1e-4)
+
+
+def test_the_kl_term_reads_every_response_token_of_the_rows_it_weighs(single_process_group, cpu_ops):
+    _, on = _kl_update(0.3, shift=-0.5)
+    metrics = _summed(on)
+    # the hinted row's 12 response tokens but the masked first one; the un-hinted row carries no weight
+    assert metrics["self_distillation/kl_tokens__sum"] == 11
+    assert metrics["self_distillation/supervised_tokens__sum"] == 5
+    ratios = finalize_ratio_metrics({k: v for k, v in metrics.items() if k.endswith("__sum")})
+    assert ratios["self_distillation/kl_tokens"] == 11 and ratios["self_distillation/grad_proxy_kl"] > 0
+    assert metrics["self_distillation/grad_proxy_kl_term"] > 0 and metrics["self_distillation/grad_proxy_sd_term"] > 0
+    coef = on["metrics"]["kl_coef"]
+    assert set(coef if isinstance(coef, list) else [coef]) == {0.3}, "one per micro-batch, averaged downstream"
+
+
+def test_the_kl_term_reads_the_outcome_rows_too(single_process_group, cpu_ops):
+    _, on = _kl_update(0.3, shift=-0.5, outcome=True)
+    metrics = _summed(on)
+    assert metrics["self_distillation/kl_tokens__sum"] == 11 + 9
+    assert metrics["outcome/tokens__sum"] == 9 and metrics["outcome/grad_proxy_nll_term"] > 0
+    assert metrics["kl_loss"] > 0
+
+
+def test_a_kl_update_without_its_inputs_is_refused(single_process_group, cpu_ops):
+    def update(data, fused_student=True):
+        return run_update(
+            data, loss_agg_mode="traj-mean-token-mean", alpha=1.0, kl_loss_coef=0.1, fused_student=fused_student
+        )
+
+    with pytest.raises(ValueError, match="ref_log_prob"):
+        update(make_batch(loss_agg_mode="traj-mean-token-mean"))
+    with pytest.raises(ValueError, match="kl_trajectories"):
+        update(with_reference(make_batch(loss_agg_mode="traj-mean-token-mean"), kl_trajectories=None))
+    with pytest.raises(ValueError, match="use_fused_kernels"):
+        update(with_reference(make_batch(loss_agg_mode="traj-mean-token-mean")), fused_student=False)
 
 
 def test_per_span_export_names_its_span_and_matches_the_batch_metrics(single_process_group, cpu_ops):

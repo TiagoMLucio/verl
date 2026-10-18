@@ -23,6 +23,7 @@ __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 import warnings
 from collections import defaultdict
 from enum import Enum
+from functools import partial
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -1423,6 +1424,7 @@ SDPO_RATIO_METRICS = (
     ),
     ("outcome/grad_proxy_nll", "outcome/grad_proxy_nll__sum", "outcome/tokens__sum"),
     ("outcome/nll_per_token", "outcome/nll__sum", "outcome/tokens__sum"),
+    ("self_distillation/grad_proxy_kl", "self_distillation/grad_proxy_kl__sum", "self_distillation/kl_tokens__sum"),
 )
 
 
@@ -1439,9 +1441,10 @@ def finalize_ratio_metrics(metrics: dict, prefix: str = "") -> dict:
         counts = [float(count) for count in counts]
         out[prefix + "self_distillation/loss_p50"] = _hist_quantile(counts, 0.5)
         out[prefix + "self_distillation/loss_p90"] = _hist_quantile(counts, 0.9)
-    tokens = out.get(prefix + "self_distillation/supervised_tokens__sum")
-    if tokens is not None:
-        out[prefix + "self_distillation/supervised_tokens"] = float(tokens)
+    for name in ("supervised_tokens", "kl_tokens"):
+        tokens = out.get(prefix + f"self_distillation/{name}__sum")
+        if tokens is not None:
+            out[prefix + f"self_distillation/{name}"] = float(tokens)
     for _, num_key, den_key in SDPO_RATIO_METRICS:  # denominators are shared, so drop them last
         out.pop(prefix + num_key, None)
         out.pop(prefix + den_key, None)
@@ -1576,6 +1579,52 @@ def compute_outcome_nll_loss(
             "outcome/nll__sum": float(torch.nan_to_num(nll.detach()[sel], 0.0, 0.0, 0.0).sum()),
             "outcome/grad_proxy_nll__sum": float(push[sel].sum()),
             "outcome/grad_proxy_nll_term": term,
+        }
+    return loss, metrics
+
+
+def compute_reference_kl_loss(
+    log_probs: torch.Tensor,
+    ref_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    kl_penalty_type: str,
+    row_weights: torch.Tensor,
+    loss_agg_mode: str,
+    dp_size: int,
+    global_batch_size: int,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """The KL term of an SDPO update: ``kl_penalty`` of the student's log-prob against the reference's on every
+    response token the update keeps, each row's token-mean weighted by ``row_weights`` (its share of its
+    trajectory) and averaged over the ``global_batch_size`` trajectories the update reads, as
+    traj-mean-token-mean averages the distillation rows over theirs.
+
+    Also returns summable pairs: the term's tokens and the size of the push each token gets,
+    ``|d kl / d log p| * (1 - p)``, read off the realised token alone (the whole ``||onehot(y) - p||`` is at
+    most sqrt(2) times that).
+    """
+    if loss_agg_mode != "traj-mean-token-mean":
+        raise ValueError(f"the SDPO KL term needs loss_agg_mode=traj-mean-token-mean, got {loss_agg_mode!r}")
+    weights = row_weights.reshape(-1).to(log_probs.dtype)
+    aggregate = partial(
+        agg_loss,
+        loss_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        dp_size=dp_size,
+        global_batch_size=max(int(global_batch_size), 1),
+        seq_weights=weights,
+    )
+    loss = aggregate(loss_mat=kl_penalty(logprob=log_probs, ref_logprob=ref_log_probs, kl_penalty=kl_penalty_type))
+    with torch.enable_grad():
+        detached = log_probs.detach().requires_grad_(True)
+        penalty = kl_penalty(logprob=detached, ref_logprob=ref_log_probs.detach(), kl_penalty=kl_penalty_type)
+        (slope,) = torch.autograd.grad(penalty.sum(), detached)
+    with torch.no_grad():
+        push = torch.nan_to_num(slope.abs() * (1.0 - detached.detach().exp()).clamp(min=0.0), 0.0, 0.0, 0.0)
+        sel = response_mask.bool() & (weights > 0).unsqueeze(-1)
+        metrics = {
+            "self_distillation/kl_tokens__sum": float(sel.sum()),
+            "self_distillation/grad_proxy_kl__sum": float(push[sel].sum()),
+            "self_distillation/grad_proxy_kl_term": aggregate(loss_mat=push),
         }
     return loss, metrics
 

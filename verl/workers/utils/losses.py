@@ -22,6 +22,7 @@ from verl.trainer.ppo.core_algos import (
     SDPO_SPAN_ROWS_KEY,
     agg_loss,
     compute_outcome_nll_loss,
+    compute_reference_kl_loss,
     compute_self_distillation_loss,
     compute_value_loss,
     get_policy_loss_fn,
@@ -269,10 +270,14 @@ def sdpo_ppo_loss(
     # calls and the teacher_logprob_fn).
     outcome_coef = float(getattr(sdpo_config, "success_nll_coef", 0.0) or 0.0)
     outcome_on = outcome_coef > 0 and "outcome_mask" in data and "outcome_weight" in data
+    kl_on = bool(getattr(config, "use_kl_loss", False))
+    if kl_on and "ref_log_prob" not in data:
+        raise ValueError("SDPO with use_kl_loss: the update batch carries no ref_log_prob.")
     pad_fields = [
         field
         for field in ("response_mask", "self_distillation_mask", "old_log_probs", "rollout_is_weights")
         + (("outcome_mask", "responses") if outcome_on else ())
+        + (("ref_log_prob",) if kl_on else ())
         if field in data
     ]
 
@@ -355,7 +360,7 @@ def sdpo_ppo_loss(
         supervised_spans=supervised_spans(data),
         contrast_topk_log_probs=contrast_topk_logps,
         anchor_topk_log_probs=anchor_topk_logps,
-        grad_proxies=outcome_on,
+        grad_proxies=outcome_on or kl_on,
     )
     metrics["self_distillation/empty_target_batch"] = (
         self_distillation_mask.sum().item() == 0 if self_distillation_mask is not None else False
@@ -385,6 +390,32 @@ def sdpo_ppo_loss(
         loss_like["outcome/grad_proxy_nll_term"] = outcome_coef * outcome_term
         policy_loss = policy_loss + outcome_coef * outcome_loss
 
+    if kl_on:
+        if "all_label_log_probs" not in model_output:
+            raise ValueError("SDPO with use_kl_loss: the update's forward returned no all_label_log_probs.")
+        if trace_weight is None:
+            raise ValueError("SDPO with use_kl_loss: the batch carries no trace_weight to weigh its rows by.")
+        kl_trajectories = tu.get_non_tensor_data(data=data, key="kl_trajectories", default=None)
+        if kl_trajectories is None:
+            raise ValueError("SDPO with use_kl_loss: the batch carries no kl_trajectories to average its rows over.")
+        # the rows the update reads: the hinted ones, and the outcome term's when it is on
+        kl_weights = trace_weight + row_weights("outcome_weight") if outcome_on else trace_weight
+        kl_loss, kl_metrics = compute_reference_kl_loss(
+            log_probs=no_padding_2_padding(model_output["all_label_log_probs"], data),
+            ref_log_probs=padded["ref_log_prob"],
+            response_mask=response_mask,
+            kl_penalty_type=config.kl_loss_type,
+            row_weights=kl_weights,
+            loss_agg_mode=config.loss_agg_mode,
+            dp_size=data["dp_size"],
+            global_batch_size=kl_trajectories,
+        )
+        kl_term = kl_metrics.pop("self_distillation/grad_proxy_kl_term")
+        metrics.update(kl_metrics)
+        loss_like["kl_loss"] = kl_loss.detach()
+        loss_like["self_distillation/grad_proxy_kl_term"] = config.kl_loss_coef * kl_term
+        policy_loss = policy_loss + config.kl_loss_coef * kl_loss
+
     # records, not a scalar: they ride the metrics dict out of the update untouched
     span_rows = metrics.pop(SDPO_SPAN_ROWS_KEY, None)
     # '__sum' pairs must add across micro-batches; everything else is a per-micro-batch mean.
@@ -399,6 +430,8 @@ def sdpo_ppo_loss(
     metrics["actor/pg_loss"] = Metric(value=loss, aggregation=metric_aggregation)
     for key, value in loss_like.items():
         metrics[key] = Metric(value=value, aggregation=metric_aggregation)
+    if kl_on:
+        metrics["kl_coef"] = config.kl_loss_coef
 
     entropy = model_output.get("entropy", None)
     if entropy is not None:

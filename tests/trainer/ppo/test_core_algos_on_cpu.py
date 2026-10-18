@@ -27,6 +27,7 @@ from verl.trainer.ppo.core_algos import (
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
     compute_outcome_nll_loss,
+    compute_reference_kl_loss,
     compute_rloo_outcome_advantage,
     compute_rloo_vectorized_outcome_advantage,
     compute_self_distillation_loss,
@@ -787,6 +788,76 @@ def test_the_nll_grad_proxy_is_the_distance_from_the_one_hot_label():
     )
     assert metrics["outcome/grad_proxy_nll__sum"] == pytest.approx(float(exact.sum()), rel=1e-5)
     assert float(metrics["outcome/grad_proxy_nll_term"]) == pytest.approx(float(exact.mean()), rel=1e-5)
+
+
+def _reference_kl(log_probs, ref_log_probs, mask, weights, **kwargs):
+    return compute_reference_kl_loss(
+        log_probs=log_probs,
+        ref_log_probs=ref_log_probs,
+        response_mask=mask,
+        kl_penalty_type=kwargs.pop("kl_penalty_type", "low_var_kl"),
+        row_weights=weights,
+        loss_agg_mode=kwargs.pop("loss_agg_mode", "traj-mean-token-mean"),
+        dp_size=1,
+        global_batch_size=kwargs.pop("global_batch_size", 1),
+    )
+
+
+@pytest.mark.parametrize("kl_penalty_type", ["low_var_kl", "mse", "k3+"])
+def test_the_reference_kl_is_zero_with_no_gradient_where_the_student_is_the_reference(kl_penalty_type):
+    log_probs = torch.log(torch.tensor([[0.5, 0.25, 0.9], [0.1, 0.2, 0.4]])).requires_grad_(True)
+    loss, metrics = _reference_kl(
+        log_probs,
+        log_probs.detach().clone(),
+        torch.ones(2, 3),
+        torch.ones(2),
+        global_batch_size=2,
+        kl_penalty_type=kl_penalty_type,
+    )
+    loss.backward()
+    assert float(loss.detach()) == 0.0
+    assert torch.count_nonzero(log_probs.grad) == 0
+    assert metrics["self_distillation/grad_proxy_kl__sum"] == 0.0
+
+
+def test_the_reference_kl_pulls_each_sampled_token_toward_the_reference():
+    ref = torch.log(torch.tensor([[0.4, 0.4, 0.4]]))
+    log_probs = torch.log(torch.tensor([[0.8, 0.2, 0.4]])).requires_grad_(True)
+    loss, _ = _reference_kl(log_probs, ref, torch.ones(1, 3), torch.ones(1))
+    loss.backward()
+    assert float(loss.detach()) > 0
+    # descent lowers the log-prob the student holds above the reference, raises the one below, leaves the equal one
+    assert log_probs.grad[0, 0] > 0 and log_probs.grad[0, 1] < 0 and log_probs.grad[0, 2] == 0
+
+
+def test_the_reference_kl_is_the_mean_over_trajectories_of_their_token_mean():
+    log_probs = torch.log(torch.tensor([[0.5, 0.25, 0.5, 0.9], [0.1, 0.2, 0.4, 0.8], [0.3, 0.6, 0.3, 0.3]]))
+    ref = torch.log(torch.full((3, 4), 0.3))
+    mask = torch.tensor([[1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]])
+    # one trajectory in two segments (shares 0.5 each) and a padding row of weight 0
+    weights = torch.tensor([0.5, 0.5, 0.0])
+    loss, metrics = _reference_kl(log_probs, ref, mask, weights)
+    per_token = kl_penalty(log_probs, ref, "low_var_kl")
+    torch.testing.assert_close(loss, 0.5 * per_token[0, :2].mean() + 0.5 * per_token[1].mean())
+    assert metrics["self_distillation/kl_tokens__sum"] == 6, "a row of weight 0 holds none of the term's tokens"
+
+    halved, _ = _reference_kl(log_probs, ref, mask, weights, global_batch_size=2)
+    torch.testing.assert_close(halved, loss / 2)
+    with pytest.raises(ValueError, match="traj-mean-token-mean"):
+        _reference_kl(log_probs, ref, mask, weights, loss_agg_mode="seq-mean-token-mean")
+
+
+def test_the_reference_kl_grad_proxy_is_its_log_prob_slope_times_one_minus_p():
+    log_probs = torch.log(torch.tensor([[0.8, 0.2, 0.5]]))
+    ref = torch.log(torch.tensor([[0.4, 0.4, 0.5]]))
+    _, metrics = _reference_kl(log_probs, ref, torch.ones(1, 3), torch.ones(1))
+    p, q = log_probs.exp(), ref.exp()
+    push = (1 - q / p).abs() * (1 - p)
+    assert metrics["self_distillation/grad_proxy_kl__sum"] == pytest.approx(float(push.sum()), rel=1e-5)
+    assert float(metrics["self_distillation/grad_proxy_kl_term"]) == pytest.approx(float(push.mean()), rel=1e-5)
+    ratios = finalize_ratio_metrics({k: v for k, v in metrics.items() if k.endswith("__sum")})
+    assert ratios["self_distillation/kl_tokens"] == 3
+    assert ratios["self_distillation/grad_proxy_kl"] == pytest.approx(float(push.mean()), rel=1e-5)
 
 
 def test_compute_self_distillation_loss_optional_is_clip():
