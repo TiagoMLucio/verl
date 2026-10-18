@@ -956,7 +956,9 @@ class vLLMHttpServer:
         """
         # lora only update adapter weights, so set sleep level to 1
         # vllm_ascend not support sleep_level now. Enabling EP during training may lead to accuracy issues.
-        if self.lora_as_adapter or is_torch_npu_available(check_device=False):
+        # The MTP draft head is not in the synced weights either: level 2 would wake it uninitialized.
+        mtp_rollout = self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout
+        if self.lora_as_adapter or mtp_rollout or is_torch_npu_available(check_device=False):
             sleep_level = 1
         else:
             sleep_level = 2
