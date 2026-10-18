@@ -49,6 +49,7 @@ def test_every_row_an_infra_failure_aborts(monkeypatch):
         "d_0_0": {"traj_exit_reason": "generation_timeout"},
         "d_1_0": {"traj_exit_reason": "episode_timeout"},
         "e_0_0": {"traj_exit_reason": "build_failed"},
+        "f_0_0": {"traj_exit_reason": "unknown_error"},
     }
     with pytest.raises(RuntimeError, match=r"global_steps=7: .*'setup_timeout': 2"):
         _step(monkeypatch, rows)

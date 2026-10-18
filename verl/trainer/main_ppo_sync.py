@@ -234,7 +234,15 @@ def _keep_items(items: list[dict]) -> list[dict]:
 
 #: Exits where the harness, not the policy, ended the rollout.
 INFRA_FAILURE_REASONS = frozenset(
-    {"agent_loop_failed", "setup_timeout", "terminal_dead", "generation_timeout", "episode_timeout", "build_failed"}
+    {
+        "agent_loop_failed",
+        "setup_timeout",
+        "terminal_dead",
+        "generation_timeout",
+        "episode_timeout",
+        "build_failed",
+        "unknown_error",
+    }
 )
 
 

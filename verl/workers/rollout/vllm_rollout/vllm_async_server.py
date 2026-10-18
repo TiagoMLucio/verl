@@ -591,13 +591,17 @@ class vLLMHttpServer:
         num_cached_tokens = getattr(final_res, "num_cached_tokens", None)
 
         # Re-key backend spec-decoding stats to the rollout-common names.
-        if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
-            if final_res.metrics is None or final_res.metrics.request_spec_decode_stats is None:
-                raise RuntimeError("vLLM MTP rollout requires request_spec_decode_stats; set disable_log_stats=False.")
+        # vLLM before per-request spec-decode stats (0.19) reports acceptance only per iteration, in its own log.
+        mtp_rollout = self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout
+        if mtp_rollout and hasattr(final_res.metrics, "request_spec_decode_stats"):
             spec_decode_stats = final_res.metrics.request_spec_decode_stats
+            if spec_decode_stats is None:
+                raise RuntimeError("vLLM MTP rollout requires request_spec_decode_stats; set disable_log_stats=False.")
             extra_fields["spec_num_draft_tokens"] = spec_decode_stats.num_draft_tokens
             extra_fields["spec_num_accepted_tokens"] = spec_decode_stats.num_accepted_tokens
             extra_fields["spec_num_verify_steps"] = spec_decode_stats.num_verify_steps
+        elif mtp_rollout and final_res.metrics is None:
+            raise RuntimeError("vLLM MTP rollout requires request metrics; set disable_log_stats=False.")
         return TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
