@@ -24,7 +24,7 @@ import torch
 from tensordict import TensorDict
 
 from verl.trainer.ppo.padding_utils import construct_minimal_padding_template
-from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META, SubRow, pack
+from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META, SubRow, pack, unpack
 from verl.utils import tensordict_utils as tu
 from verl.workers.utils.sdpo import explode_turn_teacher_rows, scatter_turn_teacher_outputs
 
@@ -33,22 +33,30 @@ def njt(rows):
     return torch.nested.nested_tensor(rows, layout=torch.jagged)
 
 
-def make_hinted_sample(resp_len=9000, prompt_len=50, contrast=False):
+def make_hinted_sample(resp_len=9000, prompt_len=50, contrast=False, anchor=False):
     """A spliced teacher row as the turn-hint teacher ships it: one sub-row per hinted turn
     (here [100, 2600) and [2600, resp_len)), each the prompt, the history, the hint and the
-    scored span; with ``contrast`` the same sub-rows again after them, a contrast text in place of the hint."""
+    scored span; with ``contrast`` the same sub-rows again after them, a contrast text in place of the hint,
+    and with ``anchor`` too the same turns once more with no note spliced."""
     response_ids = torch.arange(resp_len, dtype=torch.long)
     prompt_ids = torch.full((prompt_len,), 7, dtype=torch.long)
     hint_ids = [torch.full((20,), 5, dtype=torch.long), torch.full((30,), 6, dtype=torch.long)]
-    pieces, sub_rows, contrast_pieces, contrast_rows = [], [], [], []
+    pieces, sub_rows, contrast_pieces, contrast_rows, anchor_pieces, anchor_rows = [], [], [], [], [], []
     for (start, end), hint in zip([(100, 2600), (2600, resp_len)], hint_ids, strict=True):
-        for pieces_out, rows_out, text in ((pieces, sub_rows, hint), (contrast_pieces, contrast_rows, hint[:10] + 3)):
+        for pieces_out, rows_out, text in (
+            (pieces, sub_rows, hint),
+            (contrast_pieces, contrast_rows, hint[:10] + 3),
+            (anchor_pieces, anchor_rows, hint[:0]),
+        ):
             body = torch.cat([response_ids[:start], text, response_ids[start:end]])
             pieces_out.append(torch.cat([prompt_ids, body]))
             rows_out.append(SubRow(prompt_len + body.shape[0], body.shape[0], start + text.shape[0], start, end))
     if not contrast:
         contrast_pieces, contrast_rows = [], []
-    seq, meta = torch.cat(pieces + contrast_pieces), pack(sub_rows, contrast_rows)
+    if not anchor:
+        anchor_pieces, anchor_rows = [], []
+    seq = torch.cat(pieces + contrast_pieces + anchor_pieces)
+    meta = pack(sub_rows, contrast_rows, anchor_rows)
     return {
         "responses": response_ids,
         "response_mask": torch.ones(resp_len),
@@ -118,6 +126,51 @@ def test_contrast_subrows_scatter_apart_from_the_hint_ones():
     assert hint[0, 100:2600].eq(1).all() and hint[0, 2600:].eq(2).all() and hint[0, :100].eq(0).all()
     assert contrast[0, 100:2600].eq(3).all() and contrast[0, 2600:].eq(4).all() and contrast[0, :100].eq(0).all()
     assert hint[1, 0] == 5 and contrast[1].eq(0).all(), "the un-hinted row's stub has no contrast sub-row"
+
+
+def test_anchor_subrows_scatter_apart_from_the_hint_and_contrast_ones():
+    stub = {
+        "responses": torch.tensor([11], dtype=torch.long),
+        "response_mask": torch.zeros(1),
+        "teacher_input_ids": torch.tensor([8, 11], dtype=torch.long),
+        "teacher_seq_meta": torch.tensor(DEGENERATE_META, dtype=torch.int64),
+    }
+    micro = to_td([make_hinted_sample(contrast=True, anchor=True), stub])
+    _, sub_resps, _, sub_spans = explode_turn_teacher_rows(
+        teacher_input_ids=micro["teacher_input_ids"],
+        teacher_seq_meta=micro["teacher_seq_meta"],
+        responses=micro["responses"],
+        mask_dtype=micro["response_mask"].dtype,
+    )
+    assert [(span.parent, span.contrast, span.anchor) for span in sub_spans] == [
+        (0, False, False), (0, False, False), (0, True, False), (0, True, False),
+        (0, False, True), (0, False, True), (1, False, False),
+    ]
+    max_body = max(r.shape[0] for r in sub_resps.unbind())
+    outputs = torch.arange(1.0, 8.0).reshape(7, 1).expand(7, max_body).clone()  # sub-row j is all j + 1
+
+    hint = scatter_turn_teacher_outputs(outputs, sub_spans, 2, 9000)
+    contrast = scatter_turn_teacher_outputs(outputs, sub_spans, 2, 9000, contrast=True)
+    anchor = scatter_turn_teacher_outputs(outputs, sub_spans, 2, 9000, anchor=True)
+    assert hint[0, 100:2600].eq(1).all() and hint[0, 2600:].eq(2).all()
+    assert contrast[0, 100:2600].eq(3).all() and contrast[0, 2600:].eq(4).all()
+    assert anchor[0, 100:2600].eq(5).all() and anchor[0, 2600:].eq(6).all() and anchor[0, :100].eq(0).all()
+    assert hint[1, 0] == 7 and anchor[1].eq(0).all(), "the un-hinted row's stub has no anchor sub-row"
+
+
+def test_the_meta_packs_and_unpacks_three_groups():
+    rows = [SubRow(10, 8, 2, 2, 8), SubRow(20, 16, 3, 10, 16)]
+    contrast = [SubRow(12, 10, 4, 2, 8), SubRow(22, 18, 5, 10, 16)]
+    anchor = [SubRow(8, 6, 0, 2, 8), SubRow(18, 14, 1, 10, 16)]
+    flat = pack(rows, contrast, anchor)
+    assert flat[0] == 2 and len(flat) == 1 + 3 * 2 * 5
+    assert unpack(flat) == rows and unpack(flat, contrast=True) == contrast and unpack(flat, anchor=True) == anchor
+    two = pack(rows, contrast)
+    assert unpack(two, contrast=True) == contrast and unpack(two, anchor=True) == []
+    with pytest.raises(AssertionError, match="anchor"):
+        pack(rows, (), anchor)
+    with pytest.raises(AssertionError, match="one group"):
+        unpack(flat, contrast=True, anchor=True)
 
 
 def test_corrupt_spans_are_caught():

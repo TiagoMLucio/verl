@@ -137,8 +137,9 @@ def construct_minimal_padding_template(
         template_sample["teacher_input_ids"] = input_ids.clone()
     if "teacher_seq_meta" in template_sample:
         template_sample["teacher_seq_meta"] = torch.tensor(DEGENERATE_META, dtype=torch.int64)
-    if "trace_weight" in template_sample:
-        template_sample["trace_weight"] = torch.zeros_like(template_sample["trace_weight"])
+    for weight in ("trace_weight", "outcome_weight"):
+        if weight in template_sample:
+            template_sample[weight] = torch.zeros_like(template_sample[weight])
     if "traj_id" in template_sample:
         # sentinel: a synthetic row belongs to no trajectory, and inheriting the template's
         # id would fold it into a real trajectory's group

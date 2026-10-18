@@ -113,6 +113,23 @@ def test_meta_without_sub_rows_keeps_a_dummy_student_position():
     assert keep.unbind()[0].tolist() == [0]
 
 
+def test_student_keep_positions_add_the_outcome_positions():
+    """The outcome term's positions join the supervised spans' once each, on the same -1 shift."""
+    hinted, stub = make_rows()
+    input_ids = njt([torch.arange(250, dtype=torch.long), torch.arange(2, dtype=torch.long)])  # prompt 50 / 1
+    responses = njt([hinted["responses"], stub["responses"]])
+    meta = njt([hinted["teacher_seq_meta"], stub["teacher_seq_meta"]])
+    outcome = [torch.zeros(200), torch.ones(1)]
+    outcome[0][[5, 20, 45, 150]] = 1.0  # 20 and 150 are already in a span
+
+    keep = response_keep_positions(input_ids, responses, meta, njt(outcome))
+    expected = sorted({50 + p - 1 for p in [*range(10, 40), *range(120, 200), 5, 45]})
+    assert sorted(keep.unbind()[0].tolist()) == expected and len(keep.unbind()[0]) == len(expected)
+    assert keep.unbind()[1].tolist() == [0]
+    plain = response_keep_positions(input_ids, responses, meta, njt([torch.zeros(200), torch.zeros(1)]))
+    assert torch.equal(plain.values(), response_keep_positions(input_ids, responses, meta).values())
+
+
 def test_student_keep_positions_cover_masked_grid():
     hinted, stub = make_rows()
     input_ids = njt([torch.arange(250, dtype=torch.long), torch.arange(2, dtype=torch.long)])  # prompt 50 / 1

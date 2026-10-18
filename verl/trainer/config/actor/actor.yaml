@@ -295,6 +295,9 @@ self_distillation:
   # Whether to include environment feedback (from reward_extra_infos["feedback"])
   include_environment_feedback: true
 
+  # Weight of the token-mean NLL on the student's own successful, un-hinted trajectories (0 = off)
+  success_nll_coef: 0.0
+
   # The teacher block (config group sdpo_teacher, selected in the trainer defaults) is built by
   # verl.trainer.ppo.sdpo.make_teacher with the tokenizer, not by hydra with the actor config
   _recursive_: false

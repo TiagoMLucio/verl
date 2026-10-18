@@ -135,6 +135,7 @@ actor_rollout_ref:
       teacher_update_rate: 0.05
       is_clip: 2
       include_environment_feedback: true
+      success_nll_coef: 0.0
       _recursive_: false
       teacher:
         _target_: verl.trainer.ppo.sdpo.RepromptTeacher

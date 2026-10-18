@@ -16,6 +16,7 @@ spliced rows into sub-rows, mark the span-only logits positions, scatter the tea
 back to the response grid, and mix the trust-region teacher."""
 
 from types import SimpleNamespace
+from typing import Optional
 
 import torch
 
@@ -98,8 +99,9 @@ def explode_turn_teacher_rows(
     every span from the context built for it. Rows without supervised spans ship a
     degenerate 2-token sub-row: the teacher forward must run on every rank every micro-batch
     so its dp-group collectives stay in lockstep. A sample's contrast sub-rows follow its own,
-    flagged ``contrast`` in their span. Returns nested sequences / bodies / all-ones
-    body presence masks (``mask_dtype``) plus one :class:`SubRowSpan` per sub-row.
+    flagged ``contrast`` in their span, and its no-note sub-rows follow those, flagged ``anchor``.
+    Returns nested sequences / bodies / all-ones body presence masks (``mask_dtype``) plus one
+    :class:`SubRowSpan` per sub-row.
     """
     seq_list = teacher_input_ids.unbind()
     meta_list = teacher_seq_meta.unbind()
@@ -112,9 +114,10 @@ def explode_turn_teacher_rows(
     for i, (seq, meta) in enumerate(zip(seq_list, meta_list, strict=True)):
         offset = 0
         flat = meta.tolist()
-        sub_rows = [(row, False) for row in unpack(flat, sample=i)]
-        sub_rows += [(row, True) for row in unpack(flat, sample=i, contrast=True)]
-        for j, (sub_row, contrast) in enumerate(sub_rows):
+        sub_rows = [(row, False, False) for row in unpack(flat, sample=i)]
+        sub_rows += [(row, True, False) for row in unpack(flat, sample=i, contrast=True)]
+        sub_rows += [(row, False, True) for row in unpack(flat, sample=i, anchor=True)]
+        for j, (sub_row, contrast, anchor) in enumerate(sub_rows):
             assert 0 < sub_row.body_len <= sub_row.total_len and offset + sub_row.total_len <= seq.shape[0], (
                 f"teacher_seq_meta malformed for sample {i} sub-row {j}: total {sub_row.total_len}, "
                 f"body {sub_row.body_len}, offset {offset}, seq len {seq.shape[0]}"
@@ -127,7 +130,7 @@ def explode_turn_teacher_rows(
             sub_seqs.append(sub)
             sub_resps.append(sub[-sub_row.body_len :])
             sub_masks.append(torch.ones(sub_row.body_len, dtype=mask_dtype, device=sub.device))
-            sub_spans.append(SubRowSpan(i, sub_row.body_start, sub_row.start, sub_row.end, contrast))
+            sub_spans.append(SubRowSpan(i, sub_row.body_start, sub_row.start, sub_row.end, contrast, anchor))
             offset += sub_row.total_len
 
     return (
@@ -164,15 +167,27 @@ def turn_keep_positions(sub_seqs: torch.Tensor, sub_resps: torch.Tensor, sub_spa
 
 
 def response_keep_positions(
-    input_ids: torch.Tensor, responses: torch.Tensor, teacher_seq_meta: torch.Tensor
+    input_ids: torch.Tensor,
+    responses: torch.Tensor,
+    teacher_seq_meta: torch.Tensor,
+    outcome_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Logits positions scoring the supervised spans on the student's own prompt+response rows."""
+    """Logits positions scoring the supervised spans on the student's own prompt+response rows, and
+    with ``outcome_mask`` the outcome term's positions too."""
     prefix_lens = input_ids.offsets().diff() - responses.offsets().diff()
     # the student scores every supervised span in one pass, so it keeps their union
     spans = [
         [(sub_row.start, sub_row.end - sub_row.start) for sub_row in unpack(meta.tolist())]
         for meta in teacher_seq_meta.unbind()
     ]
+    if outcome_mask is not None:
+        for i, row in enumerate(outcome_mask.unbind()):
+            extra = torch.nonzero(row).flatten()
+            if extra.numel():
+                positions = torch.unique(torch.cat([extra, *(torch.arange(s, s + n) for s, n in spans[i])]))
+                cuts = (torch.nonzero(positions.diff() != 1).flatten() + 1).tolist()
+                bounds = list(zip([0, *cuts], [*cuts, positions.numel()], strict=True))
+                spans[i] = [(int(positions[a]), b - a) for a, b in bounds]
     return _keep_positions(prefix_lens, spans)
 
 
@@ -198,13 +213,16 @@ def attach_response_keep_positions(data) -> None:
     """Mark the SDPO update pass for span-only logits when spliced teacher meta is present."""
     turn_meta = data.get("teacher_seq_meta", None)
     if turn_meta is not None and turn_meta.is_nested:
-        data["logits_keep_positions"] = response_keep_positions(data["input_ids"], data["responses"], turn_meta)
+        outcome_mask = data.get("outcome_mask", None)
+        data["logits_keep_positions"] = response_keep_positions(
+            data["input_ids"], data["responses"], turn_meta, outcome_mask if torch.is_tensor(outcome_mask) else None
+        )
 
 
 # Fields off the response grid that a student-row cut must leave whole: the prompt, the spliced
-# teacher rows (every sub-row already ends at its own scored span) and the per-row supervised-token
-# count the trajectory mean divides by.
-_TRUNCATION_EXEMPT = frozenset({"prompts", "teacher_input_ids", "teacher_seq_meta", "trace_weight"})
+# teacher rows (every sub-row already ends at its own scored span) and the per-row weights the
+# trajectory means divide by.
+_TRUNCATION_EXEMPT = frozenset({"prompts", "teacher_input_ids", "teacher_seq_meta", "trace_weight", "outcome_weight"})
 
 
 def _raise_if_partly_on_the_grid(data, key, lens, resp_lens, seq_lens) -> None:
@@ -300,15 +318,16 @@ def scatter_turn_teacher_outputs(
     batch_size: int,
     response_length: int,
     contrast: bool = False,
+    anchor: bool = False,
 ) -> torch.Tensor:
-    """Scatter padded spliced-body teacher outputs back onto the (batch, response) grid, the
-    contrast teacher's sub-rows or the others.
+    """Scatter padded spliced-body teacher outputs back onto the (batch, response) grid: the hint
+    sub-rows, or with ``contrast`` the contrast teacher's, or with ``anchor`` the no-note ones.
 
     Positions outside the scored spans stay zero; the per-token distillation mask excludes them.
     """
     full = sub_outputs.new_zeros((batch_size, response_length, *sub_outputs.shape[2:]))
     for j, parent, body_slice, response_slice in body_slices(sub_spans):
-        if sub_spans[j].contrast != contrast:
+        if (sub_spans[j].contrast, sub_spans[j].anchor) != (contrast, anchor):
             continue
         if parent >= batch_size or response_slice.stop > response_length or sub_outputs.dim() < 2:
             raise RuntimeError(

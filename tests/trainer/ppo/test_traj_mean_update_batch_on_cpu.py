@@ -78,8 +78,14 @@ class KV:
             self.store.pop(k, None)
 
 
-def _row(weight, traj, seq_len):
+def _row(weight, traj, seq_len, outcome=None):
+    outcome_fields = {}
+    if outcome is not None:
+        outcome_fields = dict(
+            outcome_weight=torch.tensor([outcome]), outcome_mask=torch.full((seq_len - 2,), outcome)
+        )
     return dict(
+        **outcome_fields,
         prompts=torch.tensor([1, 2]),
         responses=torch.arange(3, 3 + seq_len - 2),
         input_ids=torch.arange(1, 1 + seq_len),
@@ -99,9 +105,10 @@ def _row(weight, traj, seq_len):
     )
 
 
-def _trainer(monkeypatch, n_tasks, n_rows, supervised_rows, micro=None):
+def _trainer(monkeypatch, n_tasks, n_rows, supervised_rows, micro=None, outcome_rows=None, success_nll_coef=0.0):
     """``n_rows - n_tasks`` tasks condensed into two segments; the first ``supervised_rows``
-    rows carry weight. Returns the trainer, the balanced batch, the captured update calls and the KV."""
+    rows carry weight, and with ``outcome_rows`` every row carries the outcome fields, the next
+    ``outcome_rows`` with weight. Returns the trainer, the balanced batch, the captured update calls and the KV."""
     monkeypatch.setattr(main_ppo_sync, "KVBatchMeta", KVBatchMeta)
     monkeypatch.setattr(padding_utils, "KVBatchMeta", KVBatchMeta)
     kv = KV()
@@ -116,7 +123,10 @@ def _trainer(monkeypatch, n_tasks, n_rows, supervised_rows, micro=None):
             tags.append({"seq_len": 8 + (t % 5)})
             traj.append(t)
     for i, k in enumerate(keys):
-        kv.store[k] = _row(1.0 if i < supervised_rows else 0.0, traj[i], tags[i]["seq_len"])
+        outcome = None
+        if outcome_rows is not None:
+            outcome = 1.0 if supervised_rows <= i < supervised_rows + outcome_rows else 0.0
+        kv.store[k] = _row(1.0 if i < supervised_rows else 0.0, traj[i], tags[i]["seq_len"], outcome)
 
     trainer = object.__new__(main_ppo_sync.PPOTrainer)
     trainer.config = OmegaConf.create(
@@ -129,7 +139,7 @@ def _trainer(monkeypatch, n_tasks, n_rows, supervised_rows, micro=None):
                     "drop_unsupervised_rows": True,
                     "loss_agg_mode": "traj-mean-token-mean",
                     "policy_loss": {"loss_mode": "sdpo"},
-                    "self_distillation": {"full_logit_distillation": False},
+                    "self_distillation": {"full_logit_distillation": False, "success_nll_coef": success_nll_coef},
                     "calculate_entropy": False,
                     "entropy_coeff": 0.0,
                     "data_loader_seed": 1,
@@ -207,6 +217,36 @@ def test_traj_mean_skips_the_update_without_supervision(monkeypatch, n_tasks, n_
     assert _update(trainer, batch, metrics) is batch, "nothing to keep: the batch goes through whole"
     assert sent == []
     assert metrics["actor/skipped_update"] == 1.0
+
+
+@pytest.mark.parametrize("coef, kept", [(0.0, 90), (0.3, 110)])
+def test_the_drop_keeps_the_outcome_rows_only_under_the_outcome_term(monkeypatch, coef, kept):
+    """90 hinted rows and 20 rows of solved trajectories: the drop keeps the latter only when the outcome
+    term reads them, and the distillation rows' trajectory count is the same either way."""
+    trainer, batch, sent, _ = _trainer(monkeypatch, 128, 128, 90, outcome_rows=20, success_nll_coef=coef)
+    metrics = {}
+    update_batch = _update(trainer, batch, metrics)
+    real = [t for t in update_batch.tags if not t.get("is_padding", False)]
+    assert len(real) == kept and len(update_batch) == -(-kept // DP) * DP
+    assert metrics["self_distillation/dropped_unsupervised_rows"] == 128 - kept
+    assert update_batch.extra_info["global_batch_size"] == 90
+    assert update_batch.extra_info.get("outcome_trajectories") == (20 if coef else None)
+
+
+def test_an_outcome_only_batch_steps_under_the_outcome_term(monkeypatch):
+    trainer, batch, sent, _ = _trainer(monkeypatch, 128, 128, 0, outcome_rows=20, success_nll_coef=0.3)
+    metrics = {}
+    update_batch = _update(trainer, batch, metrics)
+    assert sent == [update_batch] and "actor/skipped_update" not in metrics
+    assert update_batch.extra_info["global_batch_size"] == 1
+    assert update_batch.extra_info["outcome_trajectories"] == 20
+
+
+def test_a_padding_row_carries_no_outcome_weight():
+    source = _row(0.0, 3, 10, outcome=1.0)
+    template, tag = padding_utils.construct_minimal_padding_template(source, {"seq_len": 10}, eos_token_id=0)
+    assert template["outcome_weight"].tolist() == [0.0] and template["trace_weight"].tolist() == [0.0]
+    assert template["outcome_mask"].tolist() == [0.0] and tag["is_padding"]
 
 
 def test_dropped_batch_is_length_balanced_across_dp(monkeypatch):

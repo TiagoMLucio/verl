@@ -461,7 +461,7 @@ class TQRoundTrip(TQStub):
         self.data.update({k: fields[k] for k in fields.keys()})
 
 
-def _traj_mean_trainer(monkeypatch, ppo_mini_batch_size=4, ppo_epochs=1):
+def _traj_mean_trainer(monkeypatch, ppo_mini_batch_size=4, ppo_epochs=1, success_nll_coef=0.0):
     """A two-segment failed trajectory, a solved one and a single-segment failed one, built the
     way the trainer does under loss_agg_mode=traj-mean-token-mean."""
     short = RESPONSE[: len(TURN0)].clone()
@@ -494,6 +494,7 @@ def _traj_mean_trainer(monkeypatch, ppo_mini_batch_size=4, ppo_epochs=1):
     sd = OmegaConf.create(asdict(SelfDistillationConfig(
         success_reward_threshold=0.5,
         include_environment_feedback=True,
+        success_nll_coef=success_nll_coef,
         teacher=dict(_target_=REPROMPT_TARGET, dont_reprompt_on_self_success=True),
     )))
     tok = ToyTokenizer()
@@ -557,6 +558,44 @@ def test_trainer_traj_mean_skips_the_update_without_supervision(monkeypatch):
     assert trainer._update_actor(batch, metrics) is batch
     assert sent == [], "no forward, no optimizer step"
     assert metrics == {"actor/skipped_update": 1.0}
+
+
+def test_trainer_outcome_rows_are_the_solved_trajectorys_and_counted_apart(monkeypatch):
+    """Under success_nll_coef the solved, unsupervised trajectory is the outcome term's whole, and the
+    distillation rows keep their own trajectory count."""
+    metrics = {}
+    trainer, stub, batch, sent = _traj_mean_trainer(monkeypatch, success_nll_coef=0.3)
+    _, fields = stub.put
+    assert fields["outcome_weight"].squeeze(-1).tolist() == [0.0, 0.0, 1.0, 0.0]
+    masks = fields["outcome_mask"].unbind()
+    torch.testing.assert_close(masks[2], stub.data["response_mask"].unbind()[2].float())
+    assert all(mask.sum() == 0 for i, mask in enumerate(masks) if i != 2)
+
+    trainer._update_actor(batch, metrics)
+    (update_batch,) = sent
+    assert update_batch.extra_info["global_batch_size"] == 2
+    assert update_batch.extra_info["outcome_trajectories"] == 1
+    assert "actor/skipped_update" not in metrics
+
+
+def test_trainer_without_the_outcome_term_ships_no_outcome_field(monkeypatch):
+    trainer, stub, batch, sent = _traj_mean_trainer(monkeypatch)
+    _, fields = stub.put
+    assert "outcome_weight" not in fields.keys() and "outcome_mask" not in fields.keys()
+    trainer._update_actor(batch, {})
+    (update_batch,) = sent
+    assert "outcome_trajectories" not in update_batch.extra_info
+
+
+def test_trainer_an_update_with_only_outcome_rows_still_steps(monkeypatch):
+    trainer, stub, batch, sent = _traj_mean_trainer(monkeypatch, success_nll_coef=0.3)
+    stub.data["trace_weight"] = torch.zeros_like(stub.data["trace_weight"])
+    metrics = {}
+    trainer._update_actor(batch, metrics)
+    (update_batch,) = sent
+    assert update_batch.extra_info["global_batch_size"] == 1, "an all-zero distillation term, divided by 1"
+    assert update_batch.extra_info["outcome_trajectories"] == 1
+    assert "actor/skipped_update" not in metrics
 
 
 def test_trainer_seq_mean_keeps_the_rescaled_weights_and_row_denominator(monkeypatch):

@@ -1406,6 +1406,23 @@ SDPO_RATIO_METRICS = (
         "self_distillation/contrast_floor_masked_bins__sum",
         "self_distillation/contrast_bins__sum",
     ),
+    (
+        "self_distillation/target_entropy_minus_student",
+        "self_distillation/target_entropy_minus_student__sum",
+        "self_distillation/supervised_tokens__sum",
+    ),
+    (
+        "self_distillation/target_entropy_minus_anchor",
+        "self_distillation/target_entropy_minus_anchor__sum",
+        "self_distillation/supervised_tokens__sum",
+    ),
+    (
+        "self_distillation/grad_proxy_sd",
+        "self_distillation/grad_proxy_sd__sum",
+        "self_distillation/supervised_tokens__sum",
+    ),
+    ("outcome/grad_proxy_nll", "outcome/grad_proxy_nll__sum", "outcome/tokens__sum"),
+    ("outcome/nll_per_token", "outcome/nll__sum", "outcome/tokens__sum"),
 )
 
 
@@ -1433,36 +1450,144 @@ def finalize_ratio_metrics(metrics: dict, prefix: str = "") -> dict:
 
 # a bin neither the student nor the hint teacher gives this much probability keeps the student's own value
 CONTRAST_FLOOR = 0.01
+# the anchored shift is soft-clipped per bin to +-this many nats: two teachers far apart on one bin cannot dominate
+CONTRAST_CLIP = 10.0
 
 
 def contrastive_target_log_probs(
-    student: torch.Tensor, hint: torch.Tensor, contrast: torch.Tensor, floor: float = CONTRAST_FLOOR
+    student: torch.Tensor,
+    hint: torch.Tensor,
+    contrast: torch.Tensor,
+    floor: float = CONTRAST_FLOOR,
+    anchor: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The stop-gradient target ``softmax(student + hint - contrast)`` over the bins (each argument a
-    log-distribution over them), and the mask of bins the shift reached."""
-    reached = torch.maximum(student, hint).exp() >= floor
-    shift = torch.where(reached, hint - contrast, torch.zeros_like(hint))
-    return torch.log_softmax(student.detach() + shift, dim=-1), reached
+    """The stop-gradient target over the bins (each argument a log-distribution over them) and the mask
+    of bins the shift reached.
+
+    Without ``anchor`` it is ``softmax(student + hint - contrast)``, rebuilt from the student at every
+    update, so the push is the same however far the student has already moved. With ``anchor`` (the
+    teacher's distribution on the same turn with no note) it is
+    ``softmax(anchor + softclip(hint - contrast))``: it stays put while the student moves, so the push
+    stops once the student carries the hint's own shift.
+    """
+    base = student.detach() if anchor is None else anchor
+    reached = torch.maximum(base, hint).exp() >= floor
+    shift = hint - contrast
+    if anchor is not None:
+        shift = CONTRAST_CLIP * torch.tanh(shift / CONTRAST_CLIP)
+    shift = torch.where(reached, shift, torch.zeros_like(hint))
+    return torch.log_softmax(base + shift, dim=-1), reached
+
+
+def _bin_entropy(log_probs: torch.Tensor) -> torch.Tensor:
+    return -torch.nan_to_num(log_probs.exp() * log_probs, 0.0, 0.0, 0.0).sum(-1)
 
 
 @torch.no_grad()
 def _contrast_metrics(
-    student: torch.Tensor, hint: torch.Tensor, target: torch.Tensor, reached: torch.Tensor, loss_mask: torch.Tensor
+    student: torch.Tensor,
+    hint: torch.Tensor,
+    target: torch.Tensor,
+    reached: torch.Tensor,
+    loss_mask: torch.Tensor,
+    anchor: Optional[torch.Tensor] = None,
 ) -> dict[str, float]:
     """Summable pairs on the supervised tokens: reverse KL of the student to the hint teacher and to the
-    target, and the bins the floor left at the student's value."""
+    target, the bins the floor left at the student's value, and how much flatter the target is than the
+    student (and than the anchor, when there is one)."""
     sel = loss_mask.bool()
     student, hint, target, reached = student[sel], hint[sel], target[sel], reached[sel]
 
     def reverse_kl(other: torch.Tensor) -> float:
         return torch.nan_to_num((student.exp() * (student - other)).sum(-1), 0.0, 0.0, 0.0).sum().item()
 
-    return {
+    target_entropy = _bin_entropy(target)
+    out = {
         "self_distillation/kl_hint__sum": reverse_kl(hint),
         "self_distillation/kl_target__sum": reverse_kl(target),
         "self_distillation/contrast_floor_masked_bins__sum": float((~reached).sum()),
         "self_distillation/contrast_bins__sum": float(reached.numel()),
+        "self_distillation/target_entropy_minus_student__sum": (target_entropy - _bin_entropy(student)).sum().item(),
     }
+    if anchor is not None:
+        out["self_distillation/target_entropy_minus_anchor__sum"] = (
+            (target_entropy - _bin_entropy(anchor[sel])).sum().item()
+        )
+    return out
+
+
+def compute_outcome_nll_loss(
+    student_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    outcome_mask: torch.Tensor,
+    outcome_weights: torch.Tensor,
+    loss_agg_mode: str,
+    dp_size: int,
+    global_batch_size: int,
+    student_topk_log_probs: Optional[torch.Tensor] = None,
+    student_topk_indices: Optional[torch.Tensor] = None,
+    labels: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """The outcome term: each row's token-mean of ``-log p`` over its ``outcome_mask`` positions,
+    weighted by ``outcome_weights`` (its share of its trajectory, 1 for a lone successful row; a signed
+    group-relative weight turns the same term into a policy gradient) and averaged over the
+    ``global_batch_size`` trajectories the term reads, as traj-mean-token-mean averages the
+    distillation rows over theirs.
+
+    Also returns summable pairs: the term's tokens and rows, its per-token NLL, and the size of the
+    push each token gets, ``||onehot(y) - p||`` with ``p`` read off the student's top-k bins (the tail's
+    many small probabilities add next to nothing to the square).
+    """
+    if loss_agg_mode != "traj-mean-token-mean":
+        raise ValueError(f"the outcome term needs loss_agg_mode=traj-mean-token-mean, got {loss_agg_mode!r}")
+    mask = response_mask * outcome_mask
+    weights = outcome_weights.reshape(-1).to(student_log_probs.dtype)
+    nll = -student_log_probs
+    loss = agg_loss(
+        loss_mat=nll,
+        loss_mask=mask,
+        loss_agg_mode=loss_agg_mode,
+        dp_size=dp_size,
+        global_batch_size=max(int(global_batch_size), 1),
+        seq_weights=weights,
+    )
+    with torch.no_grad():
+        p_label = student_log_probs.detach().exp()
+        square = (1.0 - p_label) ** 2
+        if student_topk_log_probs is not None:
+            p_top = student_topk_log_probs.detach().exp()
+            square = square + (p_top**2).sum(-1)
+            if student_topk_indices is not None and labels is not None:
+                in_top = (student_topk_indices == labels.unsqueeze(-1)).any(-1)
+                square = square - in_top.to(square.dtype) * p_label**2
+        push = torch.nan_to_num(square.clamp(min=0.0).sqrt(), 0.0, 0.0, 0.0)
+        sel = mask.bool()
+        term = agg_loss(
+            loss_mat=push,
+            loss_mask=mask,
+            loss_agg_mode=loss_agg_mode,
+            dp_size=dp_size,
+            global_batch_size=max(int(global_batch_size), 1),
+            seq_weights=weights,
+        )
+        metrics = {
+            "outcome/tokens__sum": float(sel.sum()),
+            "outcome/rows__sum": float(int((mask.sum(-1) > 0).sum())),
+            "outcome/nll__sum": float(torch.nan_to_num(nll.detach()[sel], 0.0, 0.0, 0.0).sum()),
+            "outcome/grad_proxy_nll__sum": float(push[sel].sum()),
+            "outcome/grad_proxy_nll_term": term,
+        }
+    return loss, metrics
+
+
+@torch.no_grad()
+def reverse_kl_logit_grad_norm(student: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Per token, the norm over the bins of d KL(student || target) / d student logits,
+    ``p * (log p - log q - KL)``: the size of the push distillation gives that token."""
+    p = student.exp()
+    log_ratio = torch.nan_to_num(student - target, 0.0, 0.0, 0.0)
+    kl = (p * log_ratio).sum(-1, keepdim=True)
+    return torch.linalg.vector_norm(p * (log_ratio - kl), dim=-1)
 
 
 def compute_self_distillation_loss(
@@ -1482,6 +1607,8 @@ def compute_self_distillation_loss(
     seq_weights: Optional[torch.Tensor] = None,
     supervised_spans: Optional[list[tuple[int, int, int, int]]] = None,
     contrast_topk_log_probs: Optional[torch.Tensor] = None,
+    anchor_topk_log_probs: Optional[torch.Tensor] = None,
+    grad_proxies: bool = False,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Compute the SDPO distillation loss for actor updates.
 
@@ -1504,6 +1631,10 @@ def compute_self_distillation_loss(
         supervised_spans: Optional ``(row_id, row, start, end)`` per scored span, for the per-span export.
         contrast_topk_log_probs: Optional contrast teacher's log-probabilities at the same indices as the
             teacher's; the target becomes student + (teacher - contrast), see :func:`contrastive_target_log_probs`.
+        anchor_topk_log_probs: Optional no-note teacher's log-probabilities at the same indices, for a
+            contrast only; the target becomes anchor + softclip(teacher - contrast) instead.
+        grad_proxies: Whether to also report the size of the push distillation gives each supervised
+            token (``self_distillation/grad_proxy_sd``) and its term-level aggregate.
 
     Returns:
         tuple[torch.Tensor, dict[str, Any]]:
@@ -1524,6 +1655,8 @@ def compute_self_distillation_loss(
         self_distillation_config.full_logit_distillation and self_distillation_config.distillation_topk is not None
     ):
         raise ValueError("a contrast teacher needs full-logit top-k distillation (distillation_topk set).")
+    if anchor_topk_log_probs is not None and contrast_topk_log_probs is None:
+        raise ValueError("an anchor teacher only anchors a contrast (contrast_topk_log_probs set).")
 
     distill_variant = "rkl_token"
     if self_distillation_config.full_logit_distillation:
@@ -1550,10 +1683,16 @@ def compute_self_distillation_loss(
             to_bins = add_tail if self_distillation_config.distillation_add_tail else renorm_topk_log_probs
             student_distill_log_probs = to_bins(student_topk_log_probs)
             teacher_distill_log_probs = to_bins(teacher_topk_log_probs)
+            anchor_distill_log_probs = None
             if contrast_topk_log_probs is not None:
                 hint_distill_log_probs = teacher_distill_log_probs
+                if anchor_topk_log_probs is not None:
+                    anchor_distill_log_probs = to_bins(anchor_topk_log_probs)
                 teacher_distill_log_probs, reached = contrastive_target_log_probs(
-                    student_distill_log_probs, hint_distill_log_probs, to_bins(contrast_topk_log_probs)
+                    student_distill_log_probs,
+                    hint_distill_log_probs,
+                    to_bins(contrast_topk_log_probs),
+                    anchor=anchor_distill_log_probs,
                 )
         else:
             if student_all_log_probs is None or teacher_all_log_probs is None:
@@ -1611,28 +1750,40 @@ def compute_self_distillation_loss(
         per_token_loss = per_token_loss * rollout_is_weights
 
     # truthiness: zero-supervised minis all-reduce batch_num_tokens to 0; the clamped fallback yields 0 loss, not NaN
-    if global_batch_info is not None and global_batch_info.get("batch_num_tokens"):
-        loss = agg_loss(
-            loss_mat=per_token_loss,
-            loss_mask=loss_mask,
-            loss_agg_mode=loss_agg_mode,
-            seq_weights=seq_weights,
-            **global_batch_info,
-        )
-    else:
-        loss = agg_loss(
-            loss_mat=per_token_loss,
+    def aggregate(loss_mat: torch.Tensor) -> torch.Tensor:
+        if global_batch_info is not None and global_batch_info.get("batch_num_tokens"):
+            return agg_loss(
+                loss_mat=loss_mat,
+                loss_mask=loss_mask,
+                loss_agg_mode=loss_agg_mode,
+                seq_weights=seq_weights,
+                **global_batch_info,
+            )
+        return agg_loss(
+            loss_mat=loss_mat,
             loss_mask=loss_mask,
             loss_agg_mode=loss_agg_mode,
             batch_num_tokens=loss_mask.sum().clamp(min=1.0),
             seq_weights=seq_weights,
         )
+
+    loss = aggregate(per_token_loss)
     if contrast_topk_log_probs is not None:
         metrics.update(
             _contrast_metrics(
-                student_distill_log_probs, hint_distill_log_probs, teacher_distill_log_probs, reached, loss_mask
+                student_distill_log_probs,
+                hint_distill_log_probs,
+                teacher_distill_log_probs,
+                reached,
+                loss_mask,
+                anchor=anchor_distill_log_probs,
             )
         )
+    if grad_proxies and self_distillation_config.full_logit_distillation:
+        push = reverse_kl_logit_grad_norm(student_distill_log_probs.detach(), teacher_distill_log_probs.detach())
+        push = torch.nan_to_num(push.float(), 0.0, 0.0, 0.0)
+        metrics["self_distillation/grad_proxy_sd__sum"] = float((push * loss_mask).sum())
+        metrics["self_distillation/grad_proxy_sd_term"] = aggregate(push).detach()
     metrics.update(
         _distillation_signal_metrics(
             per_token_loss=per_token_loss,

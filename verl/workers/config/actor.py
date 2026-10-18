@@ -72,6 +72,9 @@ class SelfDistillationConfig(BaseConfig):
         is_clip (Optional[float]): Clip value for distillation IS ratio; None disables IS weighting.
         include_environment_feedback (bool): Whether the reward's environment feedback is
             handed to the teacher for wrong attempts.
+        success_nll_coef (float): Weight of the outcome term, the token-mean NLL of the student's own
+            successful trajectories (reward >= success_reward_threshold, no hinted span) next to the
+            distillation loss; 0 turns it off and keeps those rows out of the update.
         teacher (dict): The teacher block: ``_target_`` plus the teacher's own options.
             ``verl.trainer.ppo.sdpo.RepromptTeacher`` is the paper's (a fresh prompt carrying a
             successful sibling's solution and the environment feedback); a project teacher
@@ -89,6 +92,7 @@ class SelfDistillationConfig(BaseConfig):
     distillation_add_tail: bool = True
     is_clip: Optional[float] = None
     include_environment_feedback: bool = False
+    success_nll_coef: float = 0.0
     teacher: dict[str, Any] = field(default_factory=lambda: {"_target_": "verl.trainer.ppo.sdpo.RepromptTeacher"})
     _recursive_: bool = False
 
@@ -117,6 +121,8 @@ class SelfDistillationConfig(BaseConfig):
             )
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
+        if self.success_nll_coef is None or self.success_nll_coef < 0:
+            raise ValueError(f"self_distillation.success_nll_coef must be >= 0, got {self.success_nll_coef}")
         if not self.teacher or "_target_" not in self.teacher:
             raise ValueError(
                 "self_distillation.teacher must carry a _target_ naming the teacher class "
@@ -318,6 +324,14 @@ class ActorConfig(BaseConfig):
                     f"ppo_mini_batch_size == data.train_batch_size (got {self.ppo_mini_batch_size} and "
                     f"{train_batch_size}) and ppo_epochs == 1 (got {self.ppo_epochs})"
                 )
+        if self.self_distillation.success_nll_coef > 0 and (
+            self.policy_loss.loss_mode != "sdpo" or self.loss_agg_mode != "traj-mean-token-mean"
+        ):
+            # under seq-mean the kept outcome rows would join the row count the distillation rows divide by
+            raise ValueError(
+                "self_distillation.success_nll_coef needs policy_loss.loss_mode=sdpo and "
+                f"loss_agg_mode=traj-mean-token-mean, got {self.policy_loss.loss_mode} and {self.loss_agg_mode}"
+            )
         if not self.use_dynamic_bsz:
             if train_batch_size < self.ppo_mini_batch_size:
                 raise ValueError(

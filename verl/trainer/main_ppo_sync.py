@@ -84,7 +84,7 @@ from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
 from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_advantage, compute_spec_decode_metrics
 from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
 from verl.trainer.ppo.sdpo import TeacherInputs, make_teacher
-from verl.trainer.ppo.sdpo.batch import trace_weights
+from verl.trainer.ppo.sdpo.batch import outcome_fields, trace_weights
 from verl.trainer.ppo.sdpo.reprompt import collect_feedback
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_teacher_policy
 from verl.utils import hf_processor, hf_tokenizer
@@ -1730,6 +1730,23 @@ class PPOTrainer:
         traj_mean = self.config.actor_rollout_ref.actor.get("loss_agg_mode") == "traj-mean-token-mean"
         weights = trace_weights(supervised_per_row, traj_of_row, rescale=not traj_mean)
         fields["trace_weight"] = torch.tensor(weights, dtype=torch.float32).unsqueeze(-1)
+        outcome_metrics = {}
+        if cfg.get("success_nll_coef", 0.0) > 0:
+            outcome_weight, outcome_mask = outcome_fields(
+                inputs.response_mask,
+                supervised_per_row,
+                seq_scores,
+                traj_of_row,
+                cfg.success_reward_threshold,
+            )
+            fields["outcome_weight"] = torch.tensor(outcome_weight, dtype=torch.float32).unsqueeze(-1)
+            fields["outcome_mask"] = torch.nested.nested_tensor(outcome_mask, layout=torch.jagged)
+            outcome_metrics = {
+                "self_distillation/outcome_rows": float(sum(w > 0 for w in outcome_weight)),
+                "self_distillation/outcome_trajectories": float(
+                    len({traj for traj, w in zip(traj_of_row, outcome_weight, strict=True) if w > 0})
+                ),
+            }
         # Row -> trajectory, as a plain int the update path can carry: mini-batches are cut
         # from shuffled rows, so a condensed trajectory's supervised segments land in
         # different optimizer steps even though their weights are a single trajectory's share.
@@ -1743,6 +1760,7 @@ class PPOTrainer:
             health.batch_metrics(supervised_per_row, supervised_rows, inputs.response_mask, traj_of_row, extra_fields)
         )
         metrics.update(teacher.metrics)
+        metrics.update(outcome_metrics)
         metrics.update(health.condensation_metrics(extra_fields, seq_scores, cfg.success_reward_threshold))
         metrics.update(health.trajectory_timing_metrics(extra_fields))
         metrics.update(health.sampled_entropy_metrics(extra_fields, traj_of_row))
@@ -2022,11 +2040,16 @@ class PPOTrainer:
         the same score: their advantage is zero on every token.
         """
         if self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla") == "sdpo":
-            weights = tq.kv_batch_get(
-                keys=batch.keys, partition_id=batch.partition_id, select_fields=["trace_weight"]
-            )["trace_weight"]
-            weights = (weights.to_padded_tensor(0.0) if weights.is_nested else weights).reshape(len(batch.keys), -1)
-            supervised = [bool(w.abs().sum() > 0) for w in weights.unbind()]
+            # an outcome row (a successful trajectory's, under success_nll_coef) is learned from too
+            weight_fields = ["trace_weight"] + (["outcome_weight"] if self._outcome_term_on() else [])
+            fields = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=weight_fields)
+            supervised = [False] * len(batch.keys)
+            for name in weight_fields:
+                weights = fields[name]
+                weights = (weights.to_padded_tensor(0.0) if weights.is_nested else weights).reshape(len(batch.keys), -1)
+                supervised = [
+                    keep or bool(w.abs().sum() > 0) for keep, w in zip(supervised, weights.unbind(), strict=True)
+                ]
             metric = "self_distillation/dropped_unsupervised_rows"
         else:
             supervised = self._rows_in_varied_groups(batch)
@@ -2077,13 +2100,19 @@ class PPOTrainer:
             tq.kv_clear(keys=stray, partition_id=batch.partition_id)
             self.replay_buffer.remove(batch.partition_id, stray)
 
-    def _supervised_trajectory_count(self, batch: KVBatchMeta) -> int:
+    def _outcome_term_on(self) -> bool:
+        cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
+        loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+        return cfg is not None and loss_mode == "sdpo" and cfg.get("success_nll_coef", 0.0) > 0
+
+    def _supervised_trajectory_count(self, batch: KVBatchMeta, weight_field: str = "trace_weight") -> int:
         """Denominator of traj-mean-token-mean: the trajectories with any supervised token in
-        the update batch (the padding rows carry traj_id -1 and weight 0)."""
+        the update batch (the padding rows carry traj_id -1 and weight 0); with ``outcome_weight``,
+        the trajectories the outcome term reads."""
         fields = tq.kv_batch_get(
-            keys=batch.keys, partition_id=batch.partition_id, select_fields=["trace_weight", "traj_id"]
+            keys=batch.keys, partition_id=batch.partition_id, select_fields=[weight_field, "traj_id"]
         )
-        weight, traj = fields["trace_weight"], fields["traj_id"]
+        weight, traj = fields[weight_field], fields["traj_id"]
         weight = (weight.to_padded_tensor(0.0) if weight.is_nested else weight).reshape(len(batch.keys), -1).sum(-1)
         traj = (traj.to_padded_tensor(-1) if traj.is_nested else traj).reshape(len(batch.keys), -1)[:, 0]
         supervised = {int(t) for t, w in zip(traj.tolist(), weight.tolist(), strict=True) if w > 0 and t >= 0}
@@ -2120,11 +2149,17 @@ class PPOTrainer:
             # one optimizer step over the whole update batch, whatever condensation and the
             # drop left of it (ActorConfig.validate pins mini == train batch and one epoch)
             supervised_trajectories = self._supervised_trajectory_count(batch)
-            if supervised_trajectories == 0:
+            outcome_trajectories = (
+                self._supervised_trajectory_count(batch, "outcome_weight") if self._outcome_term_on() else 0
+            )
+            if supervised_trajectories == 0 and outcome_trajectories == 0:
                 metrics["actor/skipped_update"] = 1.0
                 return batch
-            extra_info["global_batch_size"] = supervised_trajectories
+            # a batch with only outcome rows has an all-zero distillation term, whatever it is divided by
+            extra_info["global_batch_size"] = max(supervised_trajectories, 1)
             extra_info["mini_batch_size"] = len(batch.keys)
+            if self._outcome_term_on():
+                extra_info["outcome_trajectories"] = outcome_trajectories
         batch.extra_info.update(extra_info)
 
         output: TensorDict = self.actor_rollout_wg.update_actor(batch)

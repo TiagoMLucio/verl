@@ -23,6 +23,7 @@ from verl.workers.config import (
     OptimizerConfig,
     PolicyLossConfig,
 )
+from verl.workers.config.actor import SelfDistillationConfig
 
 
 class TestActorConfig(unittest.TestCase):
@@ -287,6 +288,34 @@ class TestActorConfig(unittest.TestCase):
 
         # the other modes keep the mini-batch free
         config(loss_agg_mode="seq-mean-token-mean", ppo_mini_batch_size=64).validate(n_gpus=4, train_batch_size=128)
+
+    def test_the_outcome_term_needs_sdpo_and_traj_mean(self):
+        """success_nll_coef divides by the solved trajectories, which only traj-mean-token-mean keeps apart
+        from the distillation rows' count; a negative coefficient is refused on its own."""
+
+        def config(coef, **overrides):
+            kwargs = dict(
+                strategy="fsdp",
+                loss_agg_mode="traj-mean-token-mean",
+                policy_loss=PolicyLossConfig(loss_mode="sdpo"),
+                ppo_mini_batch_size=128,
+                ppo_epochs=1,
+                ppo_micro_batch_size_per_gpu=1,
+                optim=OptimizerConfig(lr=0.1),
+                rollout_n=1,
+                self_distillation=SelfDistillationConfig(success_nll_coef=coef),
+            )
+            kwargs.update(overrides)
+            return ActorConfig(**kwargs)
+
+        config(0.3).validate(n_gpus=4, train_batch_size=128)
+        config(0.0, loss_agg_mode="token-mean").validate(n_gpus=4, train_batch_size=128)
+        with self.assertRaises(ValueError) as cm:
+            config(0.3, loss_agg_mode="seq-mean-token-mean").validate(n_gpus=4, train_batch_size=128)
+        self.assertIn("success_nll_coef needs", str(cm.exception))
+        with self.assertRaises(ValueError) as cm:
+            SelfDistillationConfig(success_nll_coef=-0.1)
+        self.assertIn("success_nll_coef must be >= 0", str(cm.exception))
 
 
 if __name__ == "__main__":

@@ -77,3 +77,41 @@ def trace_weights(supervised_per_row: list[float], traj_of_row: list, rescale: b
     total = sum(weights)
     scale = (n_supervised_rows / total) if total > 0 else 1.0
     return [w * scale for w in weights]
+
+
+# outcome positions per row, evenly spaced (a systematic sample of its token-mean): bounds the span-only head
+OUTCOME_MAX_POSITIONS = 2048
+
+
+def outcome_fields(
+    response_mask: list[torch.Tensor],
+    supervised_per_row: list[float],
+    seq_scores: list[float],
+    traj_of_row: list,
+    success_reward_threshold: float,
+    max_positions: int = OUTCOME_MAX_POSITIONS,
+) -> tuple[list[float], list[torch.Tensor]]:
+    """Per row, the outcome term's weight and its position mask on the response grid.
+
+    The rows of a successful trajectory (its best row reward reaches ``success_reward_threshold``; a
+    condensed trajectory's reward sits on its last segment) that carry no supervised token get their
+    share of the trajectory's generated tokens (raw, summing to one per trajectory, as
+    :func:`trace_weights` shares supervision for traj-mean-token-mean) and up to ``max_positions``
+    evenly spaced generated positions; every other row gets weight 0 and an empty mask.
+    """
+    best: dict = defaultdict(lambda: float("-inf"))
+    for traj, score in zip(traj_of_row, seq_scores, strict=True):
+        best[traj] = max(best[traj], score)
+    counts, masks = [], []
+    for mask, supervised, traj in zip(response_mask, supervised_per_row, traj_of_row, strict=True):
+        row_mask = torch.zeros(mask.shape[0], dtype=torch.float32)
+        positions = torch.nonzero(mask).flatten()
+        if supervised == 0 and best[traj] >= success_reward_threshold and positions.numel() > 0:
+            if positions.numel() > max_positions:
+                positions = positions[torch.linspace(0, positions.numel() - 1, max_positions).round().long()]
+            row_mask[positions] = 1.0
+            counts.append(float(mask.sum()))
+        else:
+            counts.append(0.0)
+        masks.append(row_mask)
+    return trace_weights(counts, traj_of_row, rescale=False), masks

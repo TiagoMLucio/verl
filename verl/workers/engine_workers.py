@@ -847,7 +847,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         teacher_input_ids = data["teacher_input_ids"]
         turn_meta = tu.get(data, "teacher_seq_meta", default=None)
         sub_spans = None
-        has_contrast = False
+        has_contrast = has_anchor = False
         if teacher_input_ids.is_nested and turn_meta is not None:
             # spliced teacher rows: score each sub-row's body, then scatter the span outputs
             # back to the response grid.
@@ -872,7 +872,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 pad_token_id=tu.get_non_tensor_data(data=data, key="pad_token_id", default=0),
             )
             has_contrast = any(span.contrast for span in sub_spans)
-            if has_contrast and student_topk_indices is None:
+            has_anchor = any(span.anchor for span in sub_spans)
+            if (has_contrast or has_anchor) and student_topk_indices is None:
                 raise ValueError("SDPO contrast sub-rows need top-k distillation (distillation_topk set).")
             if student_topk_indices is not None:
                 sub_indices = student_topk_indices.new_zeros(
@@ -960,13 +961,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if sub_spans is not None and torch.distributed.is_initialized():
             # each infer_batch runs FSDP all-gathers and an all-reduce, so every rank makes the same number of calls;
             # a rank with fewer sub-rows repeats its last one and drops the extra outputs; a rank whose rows are all
-            # un-hinted still returns the contrast output (zeros) when another rank has one, so every rank's loss
-            # reports the same metric keys
+            # un-hinted still returns the contrast and anchor outputs (zeros) when another rank has them, so every
+            # rank's loss reports the same metric keys
             group = self.ref.engine.get_data_parallel_group()
             device = "cpu" if torch.distributed.get_backend(group) == "gloo" else get_device_name()
-            count = torch.tensor([n_calls, int(has_contrast)], device=device)
+            count = torch.tensor([n_calls, int(has_contrast), int(has_anchor)], device=device)
             torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.MAX, group=group)
-            n_calls, has_contrast = int(count[0]), bool(count[1])
+            n_calls, has_contrast, has_anchor = int(count[0]), bool(count[1]), bool(count[2])
         parts = {key: [] for key in output_keys}
         with self.ref.engine.eval_mode(disable_auto_offload=False):
             for call in range(n_calls):
@@ -990,11 +991,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     for key in output_keys:
                         parts[key].append(no_padding_2_padding(model_output[key], teacher_td).float())
 
-        def to_response_grid(key: str, contrast: bool = False) -> torch.Tensor:
+        def to_response_grid(key: str, contrast: bool = False, anchor: bool = False) -> torch.Tensor:
             padded = torch.cat(parts[key])
             if sub_spans is None:
                 return padded
-            return scatter_turn_teacher_outputs(padded, sub_spans, batch_size, full_response_length, contrast)
+            return scatter_turn_teacher_outputs(padded, sub_spans, batch_size, full_response_length, contrast, anchor)
 
         result = {"teacher_log_probs": to_response_grid("log_probs")}
         if return_all_logps:
@@ -1003,6 +1004,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             result["teacher_topk_log_probs"] = to_response_grid("topk_logps")
             if has_contrast:
                 result["contrast_topk_log_probs"] = to_response_grid("topk_logps", contrast=True)
+            if has_anchor:
+                result["anchor_topk_log_probs"] = to_response_grid("topk_logps", anchor=True)
         return result
 
     def _ema_teacher_active(self) -> bool:

@@ -21,6 +21,7 @@ from tensordict import TensorDict
 from verl.trainer.ppo.core_algos import (
     SDPO_SPAN_ROWS_KEY,
     agg_loss,
+    compute_outcome_nll_loss,
     compute_self_distillation_loss,
     compute_value_loss,
     get_policy_loss_fn,
@@ -266,17 +267,25 @@ def sdpo_ppo_loss(
     # (e.g. the legacy worker path). Mirrors the ppo_loss convention above. The original
     # ``data`` is left untouched because it is still consumed below (student no_padding_2_padding
     # calls and the teacher_logprob_fn).
+    outcome_coef = float(getattr(sdpo_config, "success_nll_coef", 0.0) or 0.0)
+    outcome_on = outcome_coef > 0 and "outcome_mask" in data and "outcome_weight" in data
     pad_fields = [
         field
         for field in ("response_mask", "self_distillation_mask", "old_log_probs", "rollout_is_weights")
+        + (("outcome_mask", "responses") if outcome_on else ())
         if field in data
     ]
+
+    def row_weights(key: str) -> Optional[torch.Tensor]:
+        weight = tu.get(data, key, default=None)
+        if weight is not None:
+            if weight.is_nested:
+                weight = weight.to_padded_tensor(0.0)
+            weight = weight.reshape(-1).to(torch.float32)
+        return weight
+
     # one row per condensation segment: each row weighs its share of the trajectory's supervised tokens
-    trace_weight = tu.get(data, "trace_weight", default=None)
-    if trace_weight is not None:
-        if trace_weight.is_nested:
-            trace_weight = trace_weight.to_padded_tensor(0.0)
-        trace_weight = trace_weight.reshape(-1).to(torch.float32)
+    trace_weight = row_weights("trace_weight")
     padded = data.select(*pad_fields).to_padded_tensor()
     response_mask = padded["response_mask"]
     self_distillation_mask = tu.get(padded, "self_distillation_mask", default=None)
@@ -295,6 +304,7 @@ def sdpo_ppo_loss(
     teacher_topk_logps = None
     teacher_all_logps = None
     contrast_topk_logps = None
+    anchor_topk_logps = None
 
     if full_logit_distillation and distill_topk is not None:
         student_topk_logps = no_padding_2_padding(model_output["topk_logps"], data)
@@ -312,6 +322,7 @@ def sdpo_ppo_loss(
         teacher_topk_logps = teacher_outputs.get("teacher_topk_log_probs", teacher_topk_logps)
         teacher_all_logps = teacher_outputs.get("teacher_all_log_probs", teacher_all_logps)
         contrast_topk_logps = teacher_outputs.get("contrast_topk_log_probs")
+        anchor_topk_logps = teacher_outputs.get("anchor_topk_log_probs")
 
     if teacher_log_probs is None:
         raise ValueError("SDPO: teacher_log_probs missing and no teacher_logprob_fn produced it.")
@@ -343,11 +354,36 @@ def sdpo_ppo_loss(
         seq_weights=trace_weight,
         supervised_spans=supervised_spans(data),
         contrast_topk_log_probs=contrast_topk_logps,
+        anchor_topk_log_probs=anchor_topk_logps,
+        grad_proxies=outcome_on,
     )
     metrics["self_distillation/empty_target_batch"] = (
         self_distillation_mask.sum().item() == 0 if self_distillation_mask is not None else False
     )
     metric_aggregation = _loss_metric_aggregation(config, data)
+    # term-level values, normalised like the loss itself, so they add over micro-batches like pg_loss
+    loss_like = {key: metrics.pop(key) for key in ("self_distillation/grad_proxy_sd_term",) if key in metrics}
+
+    policy_loss = loss
+    if outcome_on:
+        outcome_batch_size = tu.get_non_tensor_data(data=data, key="outcome_trajectories", default=None)
+        outcome_loss, outcome_metrics = compute_outcome_nll_loss(
+            student_log_probs=student_log_probs,
+            response_mask=response_mask,
+            outcome_mask=padded["outcome_mask"],
+            outcome_weights=row_weights("outcome_weight"),
+            loss_agg_mode=config.loss_agg_mode,
+            dp_size=data["dp_size"],
+            global_batch_size=outcome_batch_size or 1,
+            student_topk_log_probs=student_topk_logps,
+            student_topk_indices=student_topk_indices,
+            labels=padded["responses"],
+        )
+        outcome_term = outcome_metrics.pop("outcome/grad_proxy_nll_term")
+        metrics.update(outcome_metrics)
+        loss_like["outcome/nll_loss"] = outcome_loss.detach()
+        loss_like["outcome/grad_proxy_nll_term"] = outcome_coef * outcome_term
+        policy_loss = policy_loss + outcome_coef * outcome_loss
 
     # records, not a scalar: they ride the metrics dict out of the update untouched
     span_rows = metrics.pop(SDPO_SPAN_ROWS_KEY, None)
@@ -361,7 +397,8 @@ def sdpo_ppo_loss(
     if span_rows:
         metrics[SDPO_SPAN_ROWS_KEY] = span_rows
     metrics["actor/pg_loss"] = Metric(value=loss, aggregation=metric_aggregation)
-    policy_loss = loss
+    for key, value in loss_like.items():
+        metrics[key] = Metric(value=value, aggregation=metric_aggregation)
 
     entropy = model_output.get("entropy", None)
     if entropy is not None:

@@ -26,6 +26,7 @@ from verl.trainer.ppo.core_algos import (
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
+    compute_outcome_nll_loss,
     compute_rloo_outcome_advantage,
     compute_rloo_vectorized_outcome_advantage,
     compute_self_distillation_loss,
@@ -34,6 +35,7 @@ from verl.trainer.ppo.core_algos import (
     get_adv_estimator_fn,
     kl_penalty,
     register_adv_est,
+    reverse_kl_logit_grad_norm,
 )
 
 
@@ -601,6 +603,190 @@ def test_a_contrast_needs_full_logit_top_k_distillation():
     for cfg in (_contrast_cfg(distillation_topk=None), _contrast_cfg(full_logit_distillation=False)):
         with pytest.raises(ValueError, match="distillation_topk"):
             _contrast_loss(student, hint, contrast, cfg=cfg)
+
+
+def test_the_anchored_target_is_todays_where_the_student_is_the_anchor(monkeypatch):
+    student = torch.log_softmax(torch.randn(2, 3, 101), dim=-1)
+    hint = torch.log_softmax(torch.randn(2, 3, 101) * 0.1, dim=-1)
+    contrast = torch.log_softmax(torch.randn(2, 3, 101) * 0.1, dim=-1)
+    today, today_reached = contrastive_target_log_probs(student, hint, contrast)
+    anchored, reached = contrastive_target_log_probs(student, hint, contrast, anchor=student)
+    assert torch.equal(reached, today_reached)
+    # the soft clip bends a shift of x nats by about x^3 / 300: nothing at these sizes (|x| < 1)
+    assert (hint - contrast).abs().max() < 1.0
+    torch.testing.assert_close(anchored, today, atol=1e-3, rtol=0)
+    monkeypatch.setattr(verl.trainer.ppo.core_algos, "CONTRAST_CLIP", 1e6)
+    unclipped, _ = contrastive_target_log_probs(student, hint, contrast, anchor=student)
+    torch.testing.assert_close(unclipped, today, atol=1e-6, rtol=0)
+
+
+def test_the_anchored_target_stays_put_while_the_student_drifts():
+    anchor = torch.log_softmax(torch.randn(2, 3, 101), dim=-1)
+    hint = torch.log_softmax(torch.randn(2, 3, 101), dim=-1)
+    contrast = torch.log_softmax(torch.randn(2, 3, 101), dim=-1)
+    drifted = torch.log_softmax(anchor + torch.randn(2, 3, 101), dim=-1)
+
+    at_anchor, _ = contrastive_target_log_probs(anchor, hint, contrast, anchor=anchor)
+    anchored, reached = contrastive_target_log_probs(drifted, hint, contrast, anchor=anchor)
+    torch.testing.assert_close(anchored, at_anchor, atol=0, rtol=0)
+    shift = torch.where(reached, 10.0 * torch.tanh((hint - contrast) / 10.0), torch.zeros_like(hint))
+    torch.testing.assert_close(anchored, torch.log_softmax(anchor + shift, dim=-1))
+
+    today, _ = contrastive_target_log_probs(drifted, hint, contrast)
+    today_at_anchor, _ = contrastive_target_log_probs(anchor, hint, contrast)
+    assert (today - today_at_anchor).abs().max() > 0.5, "the student-anchored target moves with the student"
+
+
+def test_the_anchored_shift_is_soft_clipped_per_bin():
+    anchor = torch.log_softmax(torch.zeros(5), dim=-1)
+    hint = torch.log_softmax(torch.tensor([30.0, 0.0, 0.0, 0.0, 0.0]), dim=-1)
+    contrast = torch.log_softmax(torch.zeros(5), dim=-1)
+    target, reached = contrastive_target_log_probs(anchor, hint, contrast, anchor=anchor)
+    assert reached.all()
+    shift = hint - contrast  # about +1.6 nats on the first bin and -28.4 on the others
+    moved = target - anchor
+    clipped = 10.0 * torch.tanh(shift / 10.0)
+    torch.testing.assert_close(moved - moved[1], clipped - clipped[1])
+    assert float(moved.max() - moved.min()) < 20.0
+    today, _ = contrastive_target_log_probs(anchor, hint, contrast)
+    assert float((today - anchor).max() - (today - anchor).min()) == pytest.approx(30.0, rel=1e-4)
+
+
+def _anchored_loss(student, hint, contrast, anchor, mask=None, grad_proxies=False):
+    return compute_self_distillation_loss(
+        student_log_probs=torch.zeros(2, 4),
+        teacher_log_probs=torch.zeros(2, 4),
+        response_mask=torch.ones(2, 4),
+        self_distillation_config=_contrast_cfg(),
+        student_topk_log_probs=student,
+        teacher_topk_log_probs=hint,
+        contrast_topk_log_probs=contrast,
+        anchor_topk_log_probs=anchor,
+        self_distillation_mask=mask,
+        grad_proxies=grad_proxies,
+    )
+
+
+def test_the_anchored_loss_is_the_reverse_kl_to_the_anchor_plus_the_shift():
+    student, hint, contrast = _topk_batch()
+    anchor = _topk_batch(seed=1)[0]
+    student = student.clone().requires_grad_(True)
+    loss, metrics = _anchored_loss(student, hint, contrast, anchor)
+    (grad,) = torch.autograd.grad(loss, student)
+
+    binned = _with_tail(student)
+    target, _ = contrastive_target_log_probs(
+        binned.detach(), _with_tail(hint), _with_tail(contrast), anchor=_with_tail(anchor)
+    )
+    reference = (binned.exp() * (binned - target)).sum(-1).mean()
+    (expected,) = torch.autograd.grad(reference, student)
+    torch.testing.assert_close(loss, reference.detach())
+    torch.testing.assert_close(grad, expected)
+
+    # a contrast equal to the hint leaves the anchor itself as the target: zero loss only at the anchor
+    same, _ = _anchored_loss(anchor, hint, hint, anchor)
+    assert float(same) == pytest.approx(0.0, abs=1e-6)
+    away, _ = _anchored_loss(student.detach(), hint, hint, anchor)
+    assert float(away) > 1e-4
+
+
+def test_the_target_entropy_metrics_are_against_the_student_and_the_anchor():
+    student, hint, _ = _topk_batch()
+    anchor = _topk_batch(seed=1)[0]
+    _, plain = _contrast_loss(student, hint, student)
+    assert "self_distillation/target_entropy_minus_student__sum" in plain
+    assert "self_distillation/target_entropy_minus_anchor__sum" not in plain
+
+    _, metrics = _anchored_loss(student, hint, hint, anchor, mask=torch.tensor([1.0, 0.0]))
+
+    def entropy(log_probs):
+        binned = _with_tail(log_probs)[0]
+        return -(binned.exp() * binned).sum(-1)
+
+    # the target is the anchor: zero against it, the anchor's entropy minus the student's against the student
+    assert metrics["self_distillation/target_entropy_minus_anchor__sum"] == pytest.approx(0.0, abs=1e-4)
+    expected = float((entropy(anchor) - entropy(student)).sum())
+    assert metrics["self_distillation/target_entropy_minus_student__sum"] == pytest.approx(expected, abs=1e-4)
+    ratios = finalize_ratio_metrics(metrics)
+    assert ratios["self_distillation/target_entropy_minus_student"] == pytest.approx(expected / 4, abs=1e-4)
+
+
+def test_an_anchor_needs_a_contrast():
+    student, hint, _ = _topk_batch()
+    with pytest.raises(ValueError, match="anchor"):
+        _anchored_loss(student, hint, None, student)
+
+
+def test_the_reverse_kl_grad_proxy_is_the_logit_gradient_norm():
+    logits = torch.randn(3, 7, requires_grad=True)
+    target = torch.log_softmax(torch.randn(3, 7), dim=-1)
+    student = torch.log_softmax(logits, dim=-1)
+    kl = (student.exp() * (student - target)).sum(-1)
+    (grad,) = torch.autograd.grad(kl.sum(), logits)
+    torch.testing.assert_close(reverse_kl_logit_grad_norm(student.detach(), target), grad.norm(dim=-1))
+
+
+def test_the_sd_grad_proxy_sums_over_the_supervised_tokens_only():
+    student, hint, contrast = _topk_batch()
+    mask = torch.tensor([1.0, 0.0])
+    _, quiet = _anchored_loss(student, hint, contrast, None, mask=mask)
+    assert "self_distillation/grad_proxy_sd__sum" not in quiet
+    _, metrics = _anchored_loss(student, hint, contrast, None, mask=mask, grad_proxies=True)
+    binned = _with_tail(student)
+    target, _ = contrastive_target_log_probs(binned, _with_tail(hint), _with_tail(contrast))
+    norms = reverse_kl_logit_grad_norm(binned, target)
+    assert metrics["self_distillation/grad_proxy_sd__sum"] == pytest.approx(float(norms[0].sum()), rel=1e-5)
+    assert float(metrics["self_distillation/grad_proxy_sd_term"]) == pytest.approx(float(norms[0].mean()), rel=1e-5)
+
+
+def _outcome(student_log_probs, outcome_mask, weights, **kwargs):
+    return compute_outcome_nll_loss(
+        student_log_probs=student_log_probs,
+        response_mask=torch.ones_like(student_log_probs),
+        outcome_mask=outcome_mask,
+        outcome_weights=weights,
+        loss_agg_mode=kwargs.pop("loss_agg_mode", "traj-mean-token-mean"),
+        dp_size=1,
+        global_batch_size=kwargs.pop("global_batch_size", 1),
+        **kwargs,
+    )
+
+
+def test_the_outcome_term_is_the_mean_over_trajectories_of_their_token_mean_nll():
+    log_probs = torch.log(torch.tensor([[0.5, 0.25, 0.5, 0.9], [0.1, 0.2, 0.4, 0.8]]))
+    mask = torch.tensor([[1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]])
+    # one trajectory in two segments (shares 0.5 each) and nothing else
+    loss, metrics = _outcome(log_probs, mask, torch.tensor([0.5, 0.5]))
+    first, second = -log_probs[0, :2].mean(), -log_probs[1].mean()
+    torch.testing.assert_close(loss, 0.5 * first + 0.5 * second)
+    assert metrics["outcome/tokens__sum"] == 6 and metrics["outcome/rows__sum"] == 2
+    assert metrics["outcome/nll__sum"] == pytest.approx(float(-log_probs[mask.bool()].sum()))
+
+    halved, _ = _outcome(log_probs, mask, torch.tensor([0.5, 0.5]), global_batch_size=2)
+    torch.testing.assert_close(halved, loss / 2)
+    # a signed per-row weight is the same term pushing the other way
+    flipped, _ = _outcome(log_probs, mask, torch.tensor([-0.5, -0.5]))
+    torch.testing.assert_close(flipped, -loss)
+    with pytest.raises(ValueError, match="traj-mean-token-mean"):
+        _outcome(log_probs, mask, torch.tensor([0.5, 0.5]), loss_agg_mode="token-mean")
+
+
+def test_the_nll_grad_proxy_is_the_distance_from_the_one_hot_label():
+    probs = torch.softmax(torch.randn(1, 3, 6), dim=-1)
+    labels = torch.tensor([[2, 0, 5]])
+    exact = (torch.nn.functional.one_hot(labels, 6).float() - probs).norm(dim=-1)
+    label_log_probs = probs.log().gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    topk_log_probs, topk_indices = probs.log().topk(6, dim=-1)
+    _, metrics = _outcome(
+        label_log_probs,
+        torch.ones(1, 3),
+        torch.ones(1),
+        student_topk_log_probs=topk_log_probs,
+        student_topk_indices=topk_indices,
+        labels=labels,
+    )
+    assert metrics["outcome/grad_proxy_nll__sum"] == pytest.approx(float(exact.sum()), rel=1e-5)
+    assert float(metrics["outcome/grad_proxy_nll_term"]) == pytest.approx(float(exact.mean()), rel=1e-5)
 
 
 def test_compute_self_distillation_loss_optional_is_clip():

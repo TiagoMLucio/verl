@@ -20,6 +20,7 @@ processor and final loss -> the real ``_compute_sdpo_teacher_logps_for_loss`` (t
 engine forward with spliced rows and the hints-only skip) -> ``loss.backward()``.
 Only FSDP wrapping, Ray, and TransferQueue are stubbed."""
 
+import math
 from functools import partial
 from itertools import chain
 from types import SimpleNamespace
@@ -164,10 +165,17 @@ def teacher_module(chunked_teacher):
 
 
 def make_batch(
-    include_hinted=True, include_unhinted=True, loss_agg_mode="token-mean", hinted_span=(2, 7), contrast=None
+    include_hinted=True,
+    include_unhinted=True,
+    loss_agg_mode="token-mean",
+    hinted_span=(2, 7),
+    contrast=None,
+    anchor=False,
+    outcome=False,
 ):
     """Build the turn-mode mini-batch exactly as _maybe_build_self_distillation_batch ships it; ``contrast``
-    ("same" or "other" tokens than the hint) adds the hinted turn's contrast sub-row."""
+    ("same" or "other" tokens than the hint) adds the hinted turn's contrast sub-row, ``anchor`` its no-note
+    sub-row, and ``outcome`` makes the un-hinted row a successful one the outcome term reads whole."""
     rows = []
     if include_hinted:
         # hinted sample: prompt 4, response 12, one hinted turn covering response [2, 7); its
@@ -188,7 +196,12 @@ def make_batch(
                 SubRow(contrast_seq.shape[0], contrast_body.shape[0], start + contrast_ids.shape[0], start, end)
             ]
             seq = torch.cat([seq, contrast_seq])
-        meta = pack([sub_row], contrast_rows)
+        anchor_rows = []
+        if anchor:
+            anchor_seq = torch.cat([prompt, resp[:end]])
+            anchor_rows = [SubRow(anchor_seq.shape[0], end, start, start, end)]
+            seq = torch.cat([seq, anchor_seq])
+        meta = pack([sub_row], contrast_rows, anchor_rows)
         sd_mask = torch.zeros(12)
         sd_mask[start:end] = 1.0
         rows.append(dict(prompt=prompt, resp=resp, teacher_seq=seq, meta=torch.tensor(meta), sd_mask=sd_mask))
@@ -244,10 +257,17 @@ def make_batch(
         shares = [float(r["sd_mask"].sum() > 0) for r in rows]
         tensor_dict["trace_weight"] = njt([torch.tensor([w]) for w in shares])
         non_tensor_dict["global_batch_size"] = max(int(sum(shares)), 1)
+    if outcome:
+        success = [float(r["sd_mask"].sum() == 0) for r in rows]
+        tensor_dict["outcome_weight"] = njt([torch.tensor([w]) for w in success])
+        tensor_dict["outcome_mask"] = njt([m.float() * w for m, w in zip(response_mask, success, strict=True)])
+        non_tensor_dict["outcome_trajectories"] = int(sum(success))
     return tu.get_tensordict(tensor_dict=tensor_dict, non_tensor_dict=non_tensor_dict)
 
 
-def run_update(data, loss_agg_mode="token-mean", dp_size=None, alpha=0.5, chunked_teacher=False):
+def run_update(
+    data, loss_agg_mode="token-mean", dp_size=None, alpha=0.5, chunked_teacher=False, success_nll_coef=0.0
+):
     """Mirror ActorRolloutRefWorker.update_actor minus Ray/FSDP/TQ; ``dp_size`` fakes the rank count the
     loss is told, as if every rank held this same batch."""
     student_engine = make_engine(ToyLM(seed=0))
@@ -274,6 +294,7 @@ def run_update(data, loss_agg_mode="token-mean", dp_size=None, alpha=0.5, chunke
         distillation_add_tail=True,
         alpha=alpha,
         is_clip=2.0,
+        success_nll_coef=success_nll_coef,
     )
     loss_fn = partial(sdpo_ppo_loss, config=actor_config, sdpo_config=sdpo_config, teacher_logprob_fn=teacher_fn)
 
@@ -439,21 +460,48 @@ def test_the_contrast_subrow_is_scored_at_the_students_indices_apart_from_the_hi
     assert not torch.allclose(contrast[0, 2:7], other["teacher_topk_log_probs"][0, 2:7])
 
 
-def test_a_rank_without_contrast_rows_still_returns_the_contrast_output(single_process_group, cpu_ops, monkeypatch):
-    """Another rank holding contrast sub-rows makes this rank's loss report the same metric keys: its
-    contrast output is zeros, at no hinted position."""
+@pytest.mark.parametrize("anchor", [False, True])
+def test_a_rank_without_contrast_rows_still_returns_the_contrast_output(
+    single_process_group, cpu_ops, monkeypatch, anchor
+):
+    """Another rank holding contrast (and anchor) sub-rows makes this rank's loss report the same metric
+    keys: its contrast and anchor outputs are zeros, at no hinted position."""
     real = dist.all_reduce
 
     def other_rank_has_contrast(tensor, op=None, group=None):
         real(tensor, op=op, group=group)
-        if tensor.shape == (2,):  # the (calls, has contrast) pair
+        if tensor.shape == (3,):  # the (calls, has contrast, has anchor) triple
             tensor[1] = 1
+            tensor[2] = int(anchor)
 
     monkeypatch.setattr(dist, "all_reduce", other_rank_has_contrast)
     result = _score(make_batch(include_hinted=False, include_unhinted=True), torch.zeros(1, 9, TOPK, dtype=torch.long))
-    assert result["contrast_topk_log_probs"].shape == (1, 9, TOPK)
-    assert result["contrast_topk_log_probs"].abs().sum() == 0
+    keys = ("contrast_topk_log_probs", "anchor_topk_log_probs") if anchor else ("contrast_topk_log_probs",)
+    for key in keys:
+        assert result[key].shape == (1, 9, TOPK)
+        assert result[key].abs().sum() == 0
+    assert anchor or "anchor_topk_log_probs" not in result
     assert result["teacher_topk_log_probs"][0, 0].abs().sum() > 0
+
+
+def test_the_anchor_subrow_is_the_teacher_on_the_turn_with_no_note(single_process_group, cpu_ops):
+    """The anchor output is the teacher scoring the hinted span with nothing spliced, at the student's indices,
+    and leaves the hint and contrast outputs as they were."""
+    topk = torch.randint(0, VOCAB, (2, 12, TOPK), generator=torch.Generator().manual_seed(0))
+    contrast = _score(make_batch(contrast="other"), topk)
+    anchored = _score(make_batch(contrast="other", anchor=True), topk)
+    for key in ("teacher_log_probs", "teacher_topk_log_probs", "contrast_topk_log_probs"):
+        torch.testing.assert_close(anchored[key], contrast[key], atol=1e-6, rtol=1e-6)
+
+    # prompt (4) + response[:7]: the span's tokens sit at 6..10, scored from the logits at 5..9
+    no_note = make_batch(include_unhinted=False)["input_ids"].values()[:11]
+    with torch.no_grad():
+        logits = _score.module(no_note.unsqueeze(0)).logits[0]
+    expected = torch.log_softmax(logits.float(), -1)[5:10].gather(-1, topk[0, 2:7])
+    torch.testing.assert_close(anchored["anchor_topk_log_probs"][0, 2:7], expected, atol=1e-5, rtol=1e-5)
+    assert anchored["anchor_topk_log_probs"][0, :2].abs().sum() == 0
+    assert anchored["anchor_topk_log_probs"][0, 7:].abs().sum() == 0
+    assert anchored["anchor_topk_log_probs"][1].abs().sum() == 0
 
 
 @pytest.mark.parametrize("remove_padding", [True, False], ids=["rmpad", "padded"])
@@ -565,6 +613,65 @@ def test_the_update_trains_toward_the_difference_of_the_two_teachers(single_proc
     for name in ("kl_hint", "kl_target", "contrast_floor_masked"):
         assert f"self_distillation/{name}" in summed
     assert not any(key.endswith("__sum") for key in summed)
+
+
+def test_the_anchored_update_trains_toward_the_no_note_teacher_plus_the_shift(single_process_group, cpu_ops):
+    """End to end with the three sub-rows: a contrast equal to the hint leaves the no-note teacher as the
+    target (the toy student is not it, so it trains); the entropy metrics come out against both."""
+    torch.manual_seed(0)
+    same_engine, same = run_update(make_batch(contrast="same", anchor=True), alpha=1.0)
+    torch.manual_seed(0)
+    other_engine, other = run_update(make_batch(contrast="other", anchor=True), alpha=1.0)
+    for engine in (same_engine, other_engine):
+        grads = _grads(engine)
+        assert all(torch.isfinite(g).all() for g in grads) and sum(g.abs().sum() for g in grads) > 1e-3
+    assert not all(torch.equal(a, b) for a, b in zip(_grads(same_engine), _grads(other_engine), strict=True))
+
+    summed = finalize_ratio_metrics({k: v.aggregate() for k, v in other["metrics"].items() if k.endswith("__sum")})
+    for name in ("target_entropy_minus_student", "target_entropy_minus_anchor", "kl_target"):
+        assert math.isfinite(summed[f"self_distillation/{name}"])
+
+
+def _outcome_update(coef, outcome=True):
+    torch.manual_seed(0)
+    data = make_batch(loss_agg_mode="traj-mean-token-mean", outcome=outcome)
+    return run_update(data, loss_agg_mode="traj-mean-token-mean", alpha=1.0, success_nll_coef=coef)
+
+
+def test_a_zero_outcome_coefficient_leaves_the_update_as_it_was(single_process_group, cpu_ops):
+    """The trainer ships no outcome field at coefficient 0; the loss also ignores them if they are there."""
+    today_engine, today = _outcome_update(0.0, outcome=False)
+    zero_engine, zero = _outcome_update(0.0)
+    for a, b in zip(_grads(today_engine), _grads(zero_engine), strict=True):
+        torch.testing.assert_close(a, b, atol=1e-7, rtol=0)
+    assert _pg_loss(today) == pytest.approx(_pg_loss(zero), abs=1e-7)
+    assert not [k for k in zero["metrics"] if k.startswith("outcome/") or "grad_proxy" in k]
+
+
+def test_the_outcome_term_adds_its_nll_to_the_distillation_loss(single_process_group, cpu_ops):
+    """The successful row's NLL enters with its coefficient, linearly; its metrics are its own tokens."""
+    base_engine, _ = _outcome_update(0.0)
+    one_engine, one = _outcome_update(0.3)
+    two_engine, _ = _outcome_update(0.6)
+    base, g1, g2 = _grads(base_engine), _grads(one_engine), _grads(two_engine)
+    assert sum((a - b).abs().sum() for a, b in zip(g1, base, strict=True)) > 1e-4
+    for b, a1, a2 in zip(base, g1, g2, strict=True):
+        torch.testing.assert_close(a2 - b, 2 * (a1 - b), atol=1e-6, rtol=1e-4)
+
+    metrics = {k: v.aggregate() for k, v in one["metrics"].items() if hasattr(v, "aggregate")}
+    assert metrics["outcome/tokens__sum"] == 9 and metrics["outcome/rows__sum"] == 1
+    # the student's own NLL on the successful row: prompt 3 + response 9, the response scored from 2..10
+    student = ToyLM(seed=0)
+    ids = make_batch()["input_ids"].unbind()[1]
+    with torch.no_grad():
+        log_probs = torch.log_softmax(student(ids.unsqueeze(0)).logits[0], -1)
+    nll = -log_probs[2:11].gather(-1, ids[3:12].unsqueeze(-1)).mean()
+    ratios = finalize_ratio_metrics({k: v for k, v in metrics.items() if k.endswith("__sum")})
+    assert ratios["outcome/nll_per_token"] == pytest.approx(float(nll), rel=1e-5)
+    assert metrics["outcome/nll_loss"] == pytest.approx(float(nll), rel=1e-5), "one trajectory, weight 1"
+    for key in ("outcome/grad_proxy_nll", "self_distillation/grad_proxy_sd"):
+        assert ratios[key] > 0
+    assert metrics["outcome/grad_proxy_nll_term"] > 0 and metrics["self_distillation/grad_proxy_sd_term"] > 0
 
 
 def test_per_span_export_names_its_span_and_matches_the_batch_metrics(single_process_group, cpu_ops):
@@ -690,6 +797,28 @@ def test_a_row_with_no_supervised_token_is_untouched(single_process_group, cpu_o
     ref_engine, _ = run_update(reference)
     for g_cut, g_ref in zip(_grads(cut_engine), _grads(ref_engine), strict=True):
         assert torch.equal(g_cut, g_ref)
+
+
+def test_truncation_leaves_a_successful_row_whole_for_the_outcome_term(single_process_group, cpu_ops):
+    """The outcome rows carry no supervised token, so the cut leaves them, their outcome mask and weight
+    whole; the hinted row's (empty) outcome mask is cut with its response; the update is unchanged."""
+    torch.manual_seed(0)
+    whole = make_batch(loss_agg_mode="traj-mean-token-mean", outcome=True)
+    torch.manual_seed(0)
+    cut = make_batch(loss_agg_mode="traj-mean-token-mean", outcome=True)
+    truncate_rows_after_last_supervised_token(cut)
+
+    assert _lens(cut, "responses") == [7, 9] and _lens(cut, "outcome_mask") == [7, 9]
+    assert torch.equal(cut["outcome_mask"].unbind()[1], whole["outcome_mask"].unbind()[1])
+    assert cut["outcome_mask"].unbind()[1].sum() == 9
+    for row_cut, row_whole in zip(cut["outcome_weight"].unbind(), whole["outcome_weight"].unbind(), strict=True):
+        assert torch.equal(row_cut, row_whole)
+
+    whole_engine, whole_out = run_update(whole, loss_agg_mode="traj-mean-token-mean", success_nll_coef=0.3)
+    cut_engine, cut_out = run_update(cut, loss_agg_mode="traj-mean-token-mean", success_nll_coef=0.3)
+    assert _pg_loss(cut_out) == pytest.approx(_pg_loss(whole_out))
+    for g_cut, g_whole in zip(_grads(cut_engine), _grads(whole_engine), strict=True):
+        assert torch.allclose(g_cut, g_whole)
 
 
 def test_a_field_off_the_response_grid_on_one_row_is_reported_not_skipped(single_process_group, cpu_ops):
