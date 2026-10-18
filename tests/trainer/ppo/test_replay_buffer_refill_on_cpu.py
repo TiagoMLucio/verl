@@ -137,15 +137,26 @@ def test_a_failed_prompt_still_stops_sampling(monkeypatch):
         step.sample(num_groups=2)
 
 
-def _trainer(filter_groups, adv_estimator="grpo", loss_mode="vanilla"):
+def _trainer(filter_groups, adv_estimator="grpo", loss_mode="vanilla", data=None):
     trainer = object.__new__(main_ppo_sync.PPOTrainer)
     trainer.config = OmegaConf.create(
         {
             "algorithm": {"adv_estimator": adv_estimator, "filter_groups": filter_groups},
             "actor_rollout_ref": {"actor": {"policy_loss": {"loss_mode": loss_mode}}},
+            "data": data or {"train_batch_size": 64},
         }
     )
     return trainer
+
+
+def test_a_step_that_sends_more_prompts_than_it_keeps_needs_no_refill(monkeypatch):
+    step = Step(monkeypatch, refills=[MIXED])
+    for uid, scores in zip("abcdef", (FAIL, MIXED, PASS, MIXED, MIXED, MIXED), strict=True):
+        step.dispatch(uid, scores, 1)
+    kept, dropped, metrics = step.sample(num_groups=3, max_prompts=3)
+    assert step.calls == []
+    assert _uids(kept) == ["b", "d", "e"] and _uids(dropped) == ["a", "c", "f"]
+    assert metrics["training/refill/surplus_varied_groups"] == 1
 
 
 def test_refill_settings_follow_algorithm_filter_groups():
@@ -159,6 +170,9 @@ def test_refill_settings_follow_algorithm_filter_groups():
         _trainer(on, loss_mode="sdpo")._refill_settings()
     with pytest.raises(ValueError, match="metric must be 'reward'"):
         _trainer({"enable": True, "metric": "acc"})._refill_settings()
+    assert _trainer(on, data={"train_batch_size": 64, "gen_batch_size": 96})._refill_settings()
+    with pytest.raises(ValueError, match="data.gen_batch_size=32 sends fewer prompts than the 64 groups"):
+        _trainer(on, data={"train_batch_size": 64, "gen_batch_size": 32})._refill_settings()
 
 
 def test_refill_prompts_come_from_the_same_pass_as_the_step_batches(monkeypatch):

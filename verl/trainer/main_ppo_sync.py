@@ -788,8 +788,10 @@ class PPOTrainer:
         self._init_dump_executor()
 
     def _refill_settings(self) -> Optional[dict]:
-        """``algorithm.filter_groups``: replace GRPO groups whose sessions all share one score while the step
-        generates (DAPO's dynamic sampling); None when it is off."""
+        """``algorithm.filter_groups``: a step sends ``data.gen_batch_size`` prompts and keeps
+        ``data.train_batch_size`` groups, those whose sessions end on different scores first, replacing the others
+        while the step generates (DAPO's dynamic sampling) up to ``max_num_gen_batches`` batches of prompts;
+        None when it is off."""
         filter_groups = self.config.algorithm.get("filter_groups", None)
         if filter_groups is None or not filter_groups.get("enable", False):
             return None
@@ -799,6 +801,10 @@ class PPOTrainer:
             raise ValueError("algorithm.filter_groups does not apply to the sdpo loss")
         if filter_groups.get("metric", None) != "reward":
             raise ValueError("algorithm.filter_groups.metric must be 'reward': a session's final rm_scores")
+        kept = self.config.data.train_batch_size
+        sent = self.config.data.get("gen_batch_size", kept)
+        if sent < kept:
+            raise ValueError(f"data.gen_batch_size={sent} sends fewer prompts than the {kept} groups a step keeps")
         return {"max_num_gen_batches": filter_groups.get("max_num_gen_batches", 0)}
 
     def _init_tokenizer(self):
@@ -2409,7 +2415,8 @@ class PPOTrainer:
             if self._refill is None:
                 batch = self.replay_buffer.sample(partition_id="train", global_steps=self.global_steps)
             else:
-                num_groups = len(batch_dict["uid"])
+                # a step sends data.gen_batch_size prompts and keeps data.train_batch_size groups
+                num_groups = self.config.data.train_batch_size
                 batch, self._refill_dropped, refill_metrics = self.replay_buffer.sample_varied_groups(
                     partition_id="train",
                     global_steps=self.global_steps,
