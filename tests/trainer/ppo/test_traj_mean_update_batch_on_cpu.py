@@ -142,6 +142,7 @@ def _trainer(monkeypatch, n_tasks, n_rows, supervised_rows, micro=None):
     )
     trainer.use_critic = False
     trainer.global_steps = 1
+    trainer._refill = None
     trainer.tokenizer = SimpleNamespace(eos_token_id=0)
     trainer._get_dp_size = lambda wg, role: DP
     removed = []
@@ -354,6 +355,7 @@ def _grpo_trainer(monkeypatch, outcome, condensed_every=5, adv_estimator="grpo")
     )
     trainer.use_critic = False
     trainer.global_steps = 1
+    trainer._refill = None
     trainer.tokenizer = SimpleNamespace(eos_token_id=0)
     trainer._get_dp_size = lambda wg, role: DP
     trainer.replay_buffer = SimpleNamespace(remove=lambda partition_id, keys: None)

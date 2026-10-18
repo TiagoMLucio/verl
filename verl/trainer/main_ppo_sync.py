@@ -22,6 +22,7 @@ Differs from original PPO trainer in main_ppo.py:
 """
 
 import asyncio
+import itertools
 import json
 import logging
 import math
@@ -213,6 +214,24 @@ def _final_segment_local_indices(keys: list[str]) -> list[int]:
     return [row for _, row in best.values()]
 
 
+def _session_scores_by_uid(keys: list[str], partition_id: str) -> dict[str, list[float]]:
+    """Each prompt uid's session scores, a session scoring its final segment's summed ``rm_scores``."""
+    final_keys = [keys[i] for i in _final_segment_local_indices(keys)]
+    if not final_keys:
+        return {}
+    scores = tq.kv_batch_get(keys=final_keys, partition_id=partition_id, select_fields=["rm_scores"])["rm_scores"]
+    scores = (scores.to_padded_tensor(0.0) if scores.is_nested else scores).reshape(len(final_keys), -1).sum(-1)
+    by_uid = defaultdict(list)
+    for key, score in zip(final_keys, scores.tolist(), strict=True):
+        by_uid[_parse_key(key)[0]].append(score)
+    return by_uid
+
+
+def _keep_items(items: list[dict]) -> list[dict]:
+    """Collate for the refill dataloader: prompts are collated once a dispatch knows how many it takes."""
+    return items
+
+
 #: Exits where the harness, not the policy, ended the rollout.
 INFRA_FAILURE_REASONS = frozenset(
     {"agent_loop_failed", "setup_timeout", "terminal_dead", "generation_timeout", "episode_timeout", "build_failed"}
@@ -328,9 +347,9 @@ class ReplayBuffer:
                     del partition[key]
 
     def assign(self, partition_id: str, owners: dict[str, Any]):
-        """Record which agent loop worker runs each prompt of the latest dispatch."""
+        """Record which agent loop worker runs each prompt; a refill adds to the step's earlier dispatches."""
         with self.lock:
-            self.owners[partition_id] = dict(owners)
+            self.owners[partition_id].update(owners)
 
     def _raise_if_a_worker_died(self, partition_id: str, running: list[str], global_steps: int):
         """A killed worker never reports its prompts, so waiting for them would hang the run."""
@@ -395,6 +414,111 @@ class ReplayBuffer:
                 self._raise_if_a_worker_died(partition_id, running, global_steps)
                 last_liveness_check = time.monotonic()
 
+    def sample_varied_groups(
+        self, partition_id: str, global_steps: int, num_groups: int, refill_fn, max_prompts: int = 0
+    ) -> tuple[KVBatchMeta, KVBatchMeta, dict]:
+        """Sample ``num_groups`` prompt groups whose sessions end on different scores, refilling the others.
+
+        A finished group whose sessions all share one score has zero GRPO advantage. It is set aside and
+        earns two refill prompts, which ``refill_fn(count)`` dispatches (returning how many it sent) while
+        other groups still run, with at most ``num_groups`` prompts in flight. Once enough varied groups
+        finished, dispatch stops and the groups still running are awaited. Varied groups are kept in dispatch
+        order; set-aside groups fill a shortfall left when ``max_prompts`` (non-positive: no limit) or the
+        prompt source runs out.
+
+        Returns:
+            The kept rows, the rows of every other group of the step, and the refill metrics.
+        """
+        judged: dict[str, list[float]] = {}
+        credit, dispatched, exhausted, draining = 0, None, False, False
+        last_liveness_check = time.monotonic()
+        while True:
+            time.sleep(self.poll_interval)
+            with self.lock:
+                order, running, finished, failed = [], [], [], []
+                rows, row_tags = defaultdict(list), {}
+                for key, tag in self.partitions[partition_id].items():
+                    if tag.get("global_steps") != global_steps:
+                        continue
+                    if tag["status"] == "success":
+                        rows[_parse_key(key)[0]].append(key)
+                        row_tags[key] = tag
+                        continue
+                    order.append(key)
+                    if tag["status"] == "running":
+                        running.append(key)
+                    elif tag["status"] == "finished":
+                        finished.append(key)
+                    elif tag["status"] == "failure":
+                        failed.append(key)
+            if failed:
+                raise RuntimeError(
+                    f"{len(failed)} prompts failed in the agent loop at global_steps={global_steps} "
+                    f"(first: {failed[0]}); stopping instead of training on a partial batch. "
+                    "The cause is the 'Error in _run_prompt' traceback in the log."
+                )
+            if dispatched is None:
+                dispatched = len(order)
+
+            new = [uid for uid in finished if uid not in judged]
+            if new:
+                scores = _session_scores_by_uid([key for uid in new for key in rows[uid]], partition_id)
+                for uid in new:
+                    judged[uid] = scores.get(uid, [])
+                    if not draining and not _varied(judged[uid]):
+                        credit += 2
+            varied = [uid for uid in order if uid in judged and _varied(judged[uid])]
+            if len(varied) >= num_groups:
+                draining, credit = True, 0
+
+            if not draining and not exhausted and credit > 0:
+                room = num_groups - len(running)
+                if max_prompts > 0:
+                    room = min(room, max_prompts - dispatched)
+                    exhausted = max_prompts <= dispatched
+                count = min(credit, room)
+                if count > 0:
+                    sent = refill_fn(count)
+                    credit -= count
+                    dispatched += sent
+                    exhausted = exhausted or sent < count
+                    continue
+            if running:
+                if time.monotonic() - last_liveness_check >= self.liveness_interval:
+                    self._raise_if_a_worker_died(partition_id, running, global_steps)
+                    last_liveness_check = time.monotonic()
+                continue
+            if not draining and not exhausted:
+                continue
+
+            keep = varied[:num_groups]
+            if len(keep) < num_groups:
+                keep += [uid for uid in order if uid in judged and not _varied(judged[uid])][: num_groups - len(keep)]
+            kept = set(keep)
+            kept_keys = [key for uid in keep for key in rows[uid]]
+            dropped_keys = [key for uid in order if uid not in kept for key in rows[uid]]
+            unvaried = [scores for scores in judged.values() if not _varied(scores)]
+            session_scores = [score for scores in judged.values() for score in scores]
+            metrics = {
+                "training/refill/dispatched_prompts": dispatched,
+                "training/refill/varied_groups": len(varied),
+                "training/refill/all_pass_groups": sum(bool(s) and s[0] > 0 for s in unvaried),
+                "training/refill/all_fail_groups": sum(not s or s[0] <= 0 for s in unvaried),
+                "training/refill/surplus_varied_groups": max(0, len(varied) - num_groups),
+                "training/refill/no_signal_groups_kept": max(0, num_groups - len(varied)),
+                "training/refill/score_mean": float(np.mean(session_scores)) if session_scores else 0.0,
+            }
+            return (
+                KVBatchMeta(partition_id=partition_id, keys=kept_keys, tags=[row_tags[k] for k in kept_keys]),
+                KVBatchMeta(partition_id=partition_id, keys=dropped_keys, tags=[row_tags[k] for k in dropped_keys]),
+                metrics,
+            )
+
+
+def _varied(scores: list[float]) -> bool:
+    """Whether a group's sessions end on different scores, i.e. it carries a GRPO advantage."""
+    return len(scores) > 1 and max(scores) > min(scores)
+
 
 @ray.remote
 class AgentLoopWorkerTQ(AgentLoopWorker):
@@ -410,6 +534,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 
         validate = batch["validate"] if "validate" in batch else False
         batch.pop("validate", None)
+        untraced = batch["untraced"] if "untraced" in batch else False
+        batch.pop("untraced", None)
         config = self.config.actor_rollout_ref.rollout
         sampling_params = dict(
             temperature=config.temperature,
@@ -438,7 +564,9 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         index = list(raw_index.tolist()) if hasattr(raw_index, "tolist") else list(raw_index)
         max_samples_per_worker = RolloutTraceConfig.get_instance().max_samples_per_step_per_worker
         unique_indices = list(set(index))
-        if max_samples_per_worker is not None and max_samples_per_worker < len(unique_indices):
+        if untraced:
+            traced_indices = set()
+        elif max_samples_per_worker is not None and max_samples_per_worker < len(unique_indices):
             selected_samples = set(np.random.choice(unique_indices, max_samples_per_worker, replace=False).tolist())
             traced_indices = {i for i in range(len(batch)) if index[i] in selected_samples}
         else:
@@ -580,6 +708,7 @@ class AgentLoopManagerTQ(AgentLoopManager):
         self.agent_loop_workers_class = AgentLoopWorkerTQ
         super().__init__(*args, **kwargs)
         self.replay_buffer = replay_buffer
+        self._next_worker = 0
 
     @classmethod
     @auto_await
@@ -613,7 +742,11 @@ class AgentLoopManagerTQ(AgentLoopManager):
         self.replay_buffer.add(partition_id, items)
 
         chunkes = prompts.chunk(len(self.agent_loop_workers))
-        dispatch = list(zip(self.agent_loop_workers, chunkes, strict=False))
+        # a refill sends a prompt or two: rotate the first worker so they do not all land on one
+        start = self._next_worker % len(self.agent_loop_workers)
+        workers = self.agent_loop_workers[start:] + self.agent_loop_workers[:start]
+        dispatch = list(zip(workers, chunkes, strict=False))
+        self._next_worker = start + len(dispatch)
         self.replay_buffer.assign(partition_id, {uid: worker for worker, chunk in dispatch for uid in chunk["uid"]})
         ray.get([worker.generate_sequences.remote(chunk) for worker, chunk in dispatch])
 
@@ -645,12 +778,28 @@ class PPOTrainer:
         self.replay_buffer = ReplayBuffer()
         self._sdpo_span_rows = []
         self._update_keys = None
+        self._refill = self._refill_settings()
+        self._refill_dropped = None
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._init_tokenizer()
         self._init_dataloader()
         self._init_dump_executor()
+
+    def _refill_settings(self) -> Optional[dict]:
+        """``algorithm.filter_groups``: replace GRPO groups whose sessions all share one score while the step
+        generates (DAPO's dynamic sampling); None when it is off."""
+        filter_groups = self.config.algorithm.get("filter_groups", None)
+        if filter_groups is None or not filter_groups.get("enable", False):
+            return None
+        if self.config.algorithm.adv_estimator != core_algos.AdvantageEstimator.GRPO:
+            raise ValueError("algorithm.filter_groups needs algorithm.adv_estimator=grpo")
+        if self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla") == "sdpo":
+            raise ValueError("algorithm.filter_groups does not apply to the sdpo loss")
+        if filter_groups.get("metric", None) != "reward":
+            raise ValueError("algorithm.filter_groups.metric must be 'reward': a session's final rm_scores")
+        return {"max_num_gen_batches": filter_groups.get("max_num_gen_batches", 0)}
 
     def _init_tokenizer(self):
         """Initialize tokenizer."""
@@ -692,14 +841,20 @@ class PPOTrainer:
             max_samples=self.config.data.get("val_max_samples", -1),
         )
 
+        self._step_prompts = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+        # refills take single prompts, so the dataloader's saved position counts exactly what was sent
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
-            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+            batch_size=1 if self._refill else self._step_prompts,
             num_workers=self.config.data["dataloader_num_workers"],
             drop_last=True,
-            collate_fn=collate_fn,
+            collate_fn=_keep_items if self._refill else collate_fn,
             sampler=create_rl_sampler(self.config.data, self.train_dataset),
         )
+        if self._refill:
+            self._steps_per_epoch = len(self.train_dataset) // self._step_prompts
+        else:
+            self._steps_per_epoch = len(self.train_dataloader)
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
             batch_size=self.config.data.val_batch_size or len(self.val_dataset),
@@ -714,7 +869,7 @@ class PPOTrainer:
         )
 
         # adjust total_training_steps
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+        total_training_steps = self._steps_per_epoch * self.config.trainer.total_epochs
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = self.config.trainer.total_training_steps
         self.total_training_steps = total_training_steps
@@ -1884,14 +2039,7 @@ class PPOTrainer:
         if self.config.algorithm.adv_estimator != core_algos.AdvantageEstimator.GRPO:
             raise ValueError("drop_unsupervised_rows without the sdpo loss needs algorithm.adv_estimator=grpo")
         real = [k for k, tag in zip(batch.keys, batch.tags, strict=True) if not tag.get("is_padding", False)]
-        final_keys = [real[i] for i in _final_segment_local_indices(real)]
-        scores = tq.kv_batch_get(keys=final_keys, partition_id=batch.partition_id, select_fields=["rm_scores"])[
-            "rm_scores"
-        ]
-        scores = (scores.to_padded_tensor(0.0) if scores.is_nested else scores).reshape(len(final_keys), -1).sum(-1)
-        by_uid = defaultdict(list)
-        for key, score in zip(final_keys, scores.tolist(), strict=True):
-            by_uid[_parse_key(key)[0]].append(score)
+        by_uid = _session_scores_by_uid(real, batch.partition_id)
         varied = {uid for uid, group in by_uid.items() if max(group) > min(group)}
         return [
             not tag.get("is_padding", False) and _parse_key(key)[0] in varied
@@ -2128,7 +2276,7 @@ class PPOTrainer:
                 self._shutdown_dump_executor()
                 return
 
-        current_epoch = self.global_steps // len(self.train_dataloader)
+        current_epoch = self.global_steps // self._steps_per_epoch
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
         # we start from step 1
@@ -2143,7 +2291,7 @@ class PPOTrainer:
 
         last_val_metrics = None
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            for batch_dict in self._train_batches():
                 is_last_step = self.global_steps >= self.total_training_steps
                 metrics, timing_raw = {}, {}
 
@@ -2180,12 +2328,19 @@ class PPOTrainer:
 
                 # 6. dump rollout generations if enabled
                 rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                dropped = self._refill_dropped
                 if rollout_data_dir:
                     self._log_rollout_data(batch, timing_raw, rollout_data_dir)
+                    if dropped is not None and dropped.keys:
+                        self._log_rollout_data(dropped, timing_raw, os.path.join(rollout_data_dir, "dropped"))
 
                 # 7. cleanup transfer queue and replay buffer
                 tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
                 self.replay_buffer.remove(batch.partition_id, batch.keys)
+                if dropped is not None and dropped.keys:
+                    tq.kv_clear(keys=dropped.keys, partition_id=dropped.partition_id)
+                    self.replay_buffer.remove(dropped.partition_id, dropped.keys)
+                self._refill_dropped = None
 
                 self.logger.log(data=metrics, step=self.global_steps)
                 progress_bar.update(1)
@@ -2200,6 +2355,34 @@ class PPOTrainer:
         # Ensure dump executor is shut down when training loop ends without reaching is_last_step
         self._shutdown_dump_executor()
         self.logger.finish()
+
+    def _train_batches(self):
+        """One epoch of step batches. With refill the dataloader hands out single prompts, and a step's
+        refills draw the next ones from the same pass."""
+        if self._refill is None:
+            yield from self.train_dataloader
+            return
+        self._train_prompts = iter(self.train_dataloader)
+        while (batch_dict := self._next_train_prompts(self._step_prompts)) is not None:
+            yield batch_dict
+
+    def _next_train_prompts(self, count: int) -> Optional[dict]:
+        """The epoch's next ``count`` prompts collated into one batch, or None once fewer remain."""
+        items = [item for chunk in itertools.islice(self._train_prompts, count) for item in chunk]
+        return collate_fn(items) if len(items) == count else None
+
+    def _refill_prompts(self, count: int) -> int:
+        """Dispatch ``count`` more prompts for this step; returns how many were sent."""
+        batch_dict = self._next_train_prompts(count)
+        if batch_dict is None:
+            return 0
+        batch_dict["uid"] = np.array([str(uuid.uuid4()) for _ in range(count)], dtype=object)
+        batch = tu.get_tensordict(batch_dict)
+        tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
+        # the step's trace budget is spent on its first dispatch; each small refill would trace again
+        tu.assign_non_tensor_data(batch, "untraced", True)
+        self.async_rollout_manager.generate_sequences(batch)
+        return count
 
     def step(self, batch_dict: dict, metrics: dict, timing_raw: dict) -> KVBatchMeta:
         # 1. put batch to agent loop manager
@@ -2223,7 +2406,18 @@ class PPOTrainer:
 
         # 2. sample batch from replay buffer
         with marked_timer("gen", timing_raw, color="red"):
-            batch = self.replay_buffer.sample(partition_id="train", global_steps=self.global_steps)
+            if self._refill is None:
+                batch = self.replay_buffer.sample(partition_id="train", global_steps=self.global_steps)
+            else:
+                num_groups = len(batch_dict["uid"])
+                batch, self._refill_dropped, refill_metrics = self.replay_buffer.sample_varied_groups(
+                    partition_id="train",
+                    global_steps=self.global_steps,
+                    num_groups=num_groups,
+                    refill_fn=self._refill_prompts,
+                    max_prompts=self._refill["max_num_gen_batches"] * num_groups,
+                )
+                metrics.update(refill_metrics)
         self._abort_if_all_rollouts_failed(batch)
         batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         self.checkpoint_manager.sleep_replicas()
