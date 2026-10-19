@@ -18,6 +18,7 @@ The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 import gc
 import logging
 import os
+import random
 import time
 import warnings
 from contextlib import nullcontext
@@ -61,6 +62,7 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_optimizer,
     replace_lora_wrapper,
 )
+from verl.utils.grad_split import grad_split_metrics, snapshot_grads, split_sums
 from verl.utils.memory_utils import retry_triton_module_loads, take_peak
 from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
 from verl.utils.py_functional import convert_to_regular_types
@@ -674,6 +676,19 @@ class FSDPEngine(BaseEngine):
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )
 
+        # the split-half gradient measurement (verl.utils.grad_split): half A is the first half of the micro-batches
+        split_at = None
+        if not forward_only and isinstance(self.module, FSDPModule) and len(micro_batches) >= 2:
+            if indices is not None:
+                # the packer puts the heaviest micro-batches first; one permutation on every rank keeps the ranks'
+                # k-th micro-batches matched and makes each half a random half of the rows
+                self._grad_split_calls = getattr(self, "_grad_split_calls", 0) + 1
+                order = random.Random(self._grad_split_calls).sample(range(len(micro_batches)), len(micro_batches))
+                micro_batches = [micro_batches[i] for i in order]
+                indices = [indices[i] for i in order]
+            split_at = len(micro_batches) // 2
+        half_a, rows = None, [0, 0]
+
         output_lst = []
 
         ctx = torch.no_grad() if forward_only else nullcontext()
@@ -711,6 +726,11 @@ class FSDPEngine(BaseEngine):
                     # train_batch drops model_output; kept, every micro-batch's outputs would pile up to the end
                     meta_info.pop("model_output", None)
 
+            if split_at is not None:
+                rows[micro_idx >= split_at] += len(micro_batch)
+                if micro_idx == split_at - 1:
+                    half_a = snapshot_grads(self.module)
+
             if traced:
                 trace_file.emit(
                     "update/micro_batch", mb_start, time.time(),
@@ -721,7 +741,13 @@ class FSDPEngine(BaseEngine):
             output_lst.append(meta_info)
 
         # postprocess and return
-        return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+        output = postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+        if half_a is not None:
+            sums = split_sums(self.module, half_a, self.get_data_parallel_group())
+            counts = torch.tensor(rows, dtype=torch.float64, device=get_device_id())
+            torch.distributed.all_reduce(counts, group=self.get_data_parallel_group())
+            output["metrics"].update(grad_split_metrics(*sums, *counts.tolist()))
+        return output
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         raise NotImplementedError("forward_step must be implemented in subclass")
