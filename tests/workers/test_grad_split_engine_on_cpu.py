@@ -15,6 +15,7 @@
 module's sharded gradients, and leaves a forward-only pass alone."""
 
 import copy
+from itertools import chain
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +28,7 @@ from torch.distributed.fsdp import fully_shard
 import verl.utils.grad_split as grad_split
 import verl.workers.engine.fsdp.transformer_impl as impl
 from verl.utils import tensordict_utils as tu
+from verl.utils.torch_functional import allgather_dict_into_dict
 
 ROWS, DIM = 6, 5
 
@@ -71,17 +73,28 @@ def _grad(model, data, rows):
     return torch.cat([p.grad.flatten() for p in model.parameters()])
 
 
-def test_a_training_pass_logs_both_halves(gloo):
+def _values(output):
+    """Each grad_split metric, logged as a one-item list like a micro-batch metric."""
+    lists = {key: val for key, val in output["metrics"].items() if key.startswith("grad_split/")}
+    assert lists and all(isinstance(val, list) and len(val) == 1 for val in lists.values())
+    return {key: val[0] for key, val in lists.items()}
+
+
+def _sharded_pass():
     torch.manual_seed(0)
     reference = torch.nn.Sequential(torch.nn.Linear(DIM, 4), torch.nn.Tanh(), torch.nn.Linear(4, 1))
     model = copy.deepcopy(reference)
     fully_shard(model, mesh=init_device_mesh("cpu", (1,)))
     data = _data()
-
     output = impl.FSDPEngine.forward_backward_batch(_engine(model), data, loss_function=None, forward_only=False)
+    return reference, data, output
+
+
+def test_a_training_pass_logs_both_halves(gloo):
+    reference, data, output = _sharded_pass()
 
     a, b = _grad(reference, data, slice(0, ROWS // 2)), _grad(reference, data, slice(ROWS // 2, ROWS))
-    metrics = output["metrics"]
+    metrics = _values(output)
     assert metrics["grad_split/rows_a"] == ROWS // 2 and metrics["grad_split/rows_b"] == ROWS - ROWS // 2
     assert metrics["grad_split/sq_a"] == pytest.approx(float(a @ a), rel=1e-5)
     assert metrics["grad_split/sq_b"] == pytest.approx(float(b @ b), rel=1e-5)
@@ -108,10 +121,18 @@ def test_packed_micro_batches_are_split_into_random_halves(gloo):
     assert sorted(rows_a) != sorted(row for k in range(len(micro) // 2) for row in indices[k])
     rows_b = [row for row in range(ROWS) if row not in rows_a]
     a, b = _grad(reference, data, rows_a), _grad(reference, data, rows_b)
-    metrics = output["metrics"]
+    metrics = _values(output)
     assert (metrics["grad_split/rows_a"], metrics["grad_split/rows_b"]) == (len(rows_a), len(rows_b))
     assert metrics["grad_split/sq_a"] == pytest.approx(float(a @ a), rel=1e-5)
     assert metrics["grad_split/dot_ab"] == pytest.approx(float(a @ b), rel=1e-5, abs=1e-6)
+
+
+def test_the_metrics_survive_the_dp_gather_and_the_mini_batch_flatten(gloo):
+    _, _, output = _sharded_pass()
+    # TrainingWorker._postprocess_output gathers every metric over the dp group, then train_mini_batch flattens it
+    gathered = allgather_dict_into_dict(data=output["metrics"], group=dist.group.WORLD)
+    flat = {key: list(chain.from_iterable(val)) for key, val in gathered.items() if key.startswith("grad_split/")}
+    assert flat["grad_split/cos"] == [_values(output)["grad_split/cos"]]
 
 
 def test_a_forward_only_pass_logs_nothing(gloo):

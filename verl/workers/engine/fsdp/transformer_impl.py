@@ -746,7 +746,8 @@ class FSDPEngine(BaseEngine):
             sums = split_sums(self.module, half_a, self.get_data_parallel_group())
             counts = torch.tensor(rows, dtype=torch.float64, device=get_device_id())
             torch.distributed.all_reduce(counts, group=self.get_data_parallel_group())
-            output["metrics"].update(grad_split_metrics(*sums, *counts.tolist()))
+            # listed like a micro-batch metric: the dp gather nests each rank's list, which train_mini_batch flattens
+            output["metrics"].update({key: [value] for key, value in grad_split_metrics(*sums, *counts.tolist()).items()})
         return output
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
