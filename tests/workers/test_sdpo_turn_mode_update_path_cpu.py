@@ -195,29 +195,22 @@ def make_batch(
     rows = []
     if include_hinted:
         # hinted sample: prompt 4, response 12, one hinted turn covering response [2, 7); its
-        # teacher row is the prompt, the history, the hint and the scored span
+        # teacher row is the prompt and the response up to the span once, then the hint, which
+        # goes right before the scored span
         start, end = hinted_span
         prompt = torch.arange(4, dtype=torch.long) + 1
         resp = torch.arange(12, dtype=torch.long) + 5
         hint_ids = torch.tensor([50, 51, 52], dtype=torch.long)
-        body = torch.cat([resp[:start], hint_ids, resp[start:end]])
-        seq = torch.cat([prompt, body])
-        sub_row = SubRow(seq.shape[0], body.shape[0], start + hint_ids.shape[0], start, end)
+        split = prompt.shape[0] + start
+        seq = torch.cat([prompt, resp[:end], hint_ids])
+        sub_row = SubRow(split, hint_ids.shape[0], start, end)
         contrast_rows = []
         if contrast is not None:
             contrast_ids = hint_ids if contrast == "same" else torch.tensor([60, 61], dtype=torch.long)
-            contrast_body = torch.cat([resp[:start], contrast_ids, resp[start:end]])
-            contrast_seq = torch.cat([prompt, contrast_body])
-            contrast_rows = [
-                SubRow(contrast_seq.shape[0], contrast_body.shape[0], start + contrast_ids.shape[0], start, end)
-            ]
-            seq = torch.cat([seq, contrast_seq])
-        anchor_rows = []
-        if anchor:
-            anchor_seq = torch.cat([prompt, resp[:end]])
-            anchor_rows = [SubRow(anchor_seq.shape[0], end, start, start, end)]
-            seq = torch.cat([seq, anchor_seq])
-        meta = pack([sub_row], contrast_rows, anchor_rows)
+            contrast_rows = [SubRow(split, contrast_ids.shape[0], start, end)]
+            seq = torch.cat([seq, contrast_ids])
+        anchor_rows = [SubRow(split, 0, start, end)] if anchor else []
+        meta = pack(prompt.shape[0], [sub_row], contrast_rows, anchor_rows)
         sd_mask = torch.zeros(12)
         sd_mask[start:end] = 1.0
         rows.append(dict(prompt=prompt, resp=resp, teacher_seq=seq, meta=torch.tensor(meta), sd_mask=sd_mask))

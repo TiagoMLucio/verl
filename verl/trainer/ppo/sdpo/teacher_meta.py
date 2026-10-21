@@ -13,25 +13,28 @@
 # limitations under the License.
 """Wire codec of the per-row SDPO teacher meta.
 
-A hinted sample ships its teacher sub-rows concatenated in one sequence and a flat int64
-``teacher_seq_meta`` of ``[n_sub, *fields per sub-row]`` that maps each sub-row's scored span
-back onto the sample's response grid. A contrast teacher appends one more sub-row per sub-row
-(same span, other context) after them, with the same fields; an anchored contrast appends a third
-group (same span, no note at all) after the contrast sub-rows.
+A hinted sample ships its trajectory once, the base (the student's prompt, left-truncated, then its
+response up to the last scored span), followed by every sub-row's note, and a flat int64
+``teacher_seq_meta`` of ``[n_sub, response_offset, *fields per sub-row]``: the response starts at
+``response_offset`` in the base, and a sub-row is the base up to its ``split``, its own note, then the
+base again up to the end of its scored span, which maps onto the response's ``[start, end)``. A contrast
+teacher appends one more sub-row per sub-row (same split and span, its own note) after them; an
+anchored contrast appends a third group (same split and span, no note) after the contrast sub-rows.
+The sub-rows of a sample differ only from their split on, so the teacher reads the base once.
 """
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 from typing import NamedTuple, Optional
+
+import torch
 
 
 class SubRow(NamedTuple):
-    """One teacher sub-row: ``total_len`` tokens whose last ``body_len`` are the body (the
-    response-side tail), with the scored span at ``body[body_start:]`` mapping onto the
-    response's ``[start, end)``."""
+    """One teacher sub-row: the base up to ``split``, ``note_len`` note tokens, then the base up to the
+    scored span's end; the span maps onto the response's ``[start, end)``."""
 
-    total_len: int
-    body_len: int
-    body_start: int
+    split: int
+    note_len: int
     start: int
     end: int
 
@@ -40,14 +43,18 @@ FIELDS = len(SubRow._fields)
 
 
 def pack(
-    sub_rows: Iterable[SubRow], contrast_rows: Iterable[SubRow] = (), anchor_rows: Iterable[SubRow] = ()
+    response_offset: int,
+    sub_rows: Iterable[SubRow],
+    contrast_rows: Iterable[SubRow] = (),
+    anchor_rows: Iterable[SubRow] = (),
 ) -> list[int]:
-    """Flatten sub-rows into the wire meta ``[n_sub, *fields...]``, then the contrast sub-rows, then the
-    anchor (no-note) sub-rows."""
+    """Flatten sub-rows into the wire meta ``[n_sub, response_offset, *fields...]``, then the contrast
+    sub-rows, then the anchor (no-note) sub-rows."""
     sub_rows, contrast_rows, anchor_rows = list(sub_rows), list(contrast_rows), list(anchor_rows)
     assert not contrast_rows or len(contrast_rows) == len(sub_rows), "one contrast sub-row per sub-row"
     assert not anchor_rows or len(anchor_rows) == len(contrast_rows), "one anchor sub-row per contrast sub-row"
-    return [len(sub_rows), *(value for sub_row in [*sub_rows, *contrast_rows, *anchor_rows] for value in sub_row)]
+    rows = [*sub_rows, *contrast_rows, *anchor_rows]
+    return [len(sub_rows), response_offset, *(value for sub_row in rows for value in sub_row)]
 
 
 def unpack(flat: list[int], sample: Optional[int] = None, contrast: bool = False, anchor: bool = False) -> list[SubRow]:
@@ -55,7 +62,7 @@ def unpack(flat: list[int], sample: Optional[int] = None, contrast: bool = False
     the anchor sub-rows (none when the sample ships none); ``sample`` only labels the malformed-meta
     assertion."""
     assert not (contrast and anchor), "unpack one group at a time"
-    n_sub, entries = flat[0], flat[1:]
+    n_sub, entries = flat[0], flat[2:]
     where = "" if sample is None else f" for sample {sample}"
     assert len(entries) in (FIELDS * n_sub, 2 * FIELDS * n_sub, 3 * FIELDS * n_sub), (
         f"teacher_seq_meta malformed{where}: {n_sub} sub-rows, {len(entries)} ints"
@@ -65,13 +72,49 @@ def unpack(flat: list[int], sample: Optional[int] = None, contrast: bool = False
     return rows[group * n_sub : (group + 1) * n_sub]
 
 
-# The un-hinted row's stub: one 2-token sub-row whose 1-token body scores response position 0.
-DEGENERATE_META = pack([SubRow(total_len=2, body_len=1, body_start=0, start=0, end=1)])
+class NotedSubRow(NamedTuple):
+    """A shipped sub-row with its note's tokens; ``contrast`` marks a contrast teacher's sub-row and
+    ``anchor`` a no-note one."""
+
+    row: SubRow
+    note: torch.Tensor
+    contrast: bool = False
+    anchor: bool = False
+
+
+def unpack_row(
+    seq: torch.Tensor, flat: list[int], sample: Optional[int] = None
+) -> tuple[torch.Tensor, int, list[NotedSubRow]]:
+    """A shipped teacher row as ``(base, response_offset, sub-rows with their notes)``, in wire order."""
+    groups = [
+        (sub_row, contrast, anchor)
+        for contrast, anchor in ((False, False), (True, False), (False, True))
+        for sub_row in unpack(flat, sample, contrast=contrast, anchor=anchor)
+    ]
+    base_len = seq.shape[0] - sum(sub_row.note_len for sub_row, _, _ in groups)
+    noted, at = [], base_len
+    for sub_row, contrast, anchor in groups:
+        noted.append(NotedSubRow(sub_row, seq[at : at + sub_row.note_len], contrast, anchor))
+        at += sub_row.note_len
+    return seq[:base_len], flat[1], noted
+
+
+def sub_row_ids(base: torch.Tensor, response_offset: int, noted: NotedSubRow) -> torch.Tensor:
+    """The whole sequence a sub-row stands for: the base up to its split, its note, then the base up to
+    the end of its scored span."""
+    split, stop = noted.row.split, response_offset + noted.row.end
+    return torch.cat([base[:split], noted.note, base[split:stop]])
+
+
+# The un-hinted row's stub: a 2-token base (the prompt's last token, the response's first) and one sub-row
+# with no note scoring response position 0.
+DEGENERATE_META = pack(1, [SubRow(split=1, note_len=0, start=0, end=1)])
 
 
 class SubRowSpan(NamedTuple):
-    """The scored span of one exploded sub-row, on its parent sample's response grid;
-    ``contrast`` marks a contrast teacher's sub-row and ``anchor`` a no-note one."""
+    """The scored span of one sub-row, on its parent sample's response grid; ``body_start`` is where the
+    span starts in the sub-row's branch after its first token. ``contrast`` marks a contrast teacher's
+    sub-row and ``anchor`` a no-note one."""
 
     parent: int
     body_start: int
@@ -79,11 +122,3 @@ class SubRowSpan(NamedTuple):
     end: int
     contrast: bool = False
     anchor: bool = False
-
-
-def body_slices(sub_spans: Iterable[SubRowSpan]) -> Iterator[tuple[int, int, slice, slice]]:
-    """Per sub-row ``(j, parent, body_slice, response_slice)``: the body positions the teacher
-    scored and the response positions they belong to."""
-    for j, span in enumerate(sub_spans):
-        length = span.end - span.start
-        yield j, span.parent, slice(span.body_start, span.body_start + length), slice(span.start, span.end)

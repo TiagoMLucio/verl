@@ -15,8 +15,8 @@
 
 Covers the dp>1 crash where ``upsample_batch_to_divisible_size`` padding rows
 inherited the template sample's spliced teacher fields: a 1-token stub carrying
-a real row's ``teacher_seq_meta`` spans poisons ``scatter_turn_teacher_outputs``
-(span end far beyond the stub's response grid).
+a real row's ``teacher_seq_meta`` spans poisons ``teacher_branches`` and
+``scatter_turn_teacher_outputs`` (span end far beyond the stub's response grid).
 """
 
 import pytest
@@ -26,7 +26,7 @@ from tensordict import TensorDict
 from verl.trainer.ppo.padding_utils import construct_minimal_padding_template
 from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META, SubRow, pack, unpack
 from verl.utils import tensordict_utils as tu
-from verl.workers.utils.sdpo import explode_turn_teacher_rows, scatter_turn_teacher_outputs
+from verl.workers.utils.sdpo import scatter_turn_teacher_outputs, teacher_branches
 
 
 def njt(rows):
@@ -34,50 +34,54 @@ def njt(rows):
 
 
 def make_hinted_sample(resp_len=9000, prompt_len=50, contrast=False, anchor=False):
-    """A spliced teacher row as the turn-hint teacher ships it: one sub-row per hinted turn
-    (here [100, 2600) and [2600, resp_len)), each the prompt, the history, the hint and the
-    scored span; with ``contrast`` the same sub-rows again after them, a contrast text in place of the hint,
-    and with ``anchor`` too the same turns once more with no note spliced."""
+    """A spliced teacher row as the turn-hint teacher ships it: the prompt and the response once, then one
+    note per sub-row, one sub-row per hinted turn (here [100, 2600) and [2600, resp_len)); with ``contrast``
+    the same sub-rows again after them, a contrast text in place of the hint, and with ``anchor`` too the
+    same turns once more with no note."""
     response_ids = torch.arange(resp_len, dtype=torch.long)
     prompt_ids = torch.full((prompt_len,), 7, dtype=torch.long)
     hint_ids = [torch.full((20,), 5, dtype=torch.long), torch.full((30,), 6, dtype=torch.long)]
-    pieces, sub_rows, contrast_pieces, contrast_rows, anchor_pieces, anchor_rows = [], [], [], [], [], []
-    for (start, end), hint in zip([(100, 2600), (2600, resp_len)], hint_ids, strict=True):
-        for pieces_out, rows_out, text in (
-            (pieces, sub_rows, hint),
-            (contrast_pieces, contrast_rows, hint[:10] + 3),
-            (anchor_pieces, anchor_rows, hint[:0]),
-        ):
-            body = torch.cat([response_ids[:start], text, response_ids[start:end]])
-            pieces_out.append(torch.cat([prompt_ids, body]))
-            rows_out.append(SubRow(prompt_len + body.shape[0], body.shape[0], start + text.shape[0], start, end))
-    if not contrast:
-        contrast_pieces, contrast_rows = [], []
-    if not anchor:
-        anchor_pieces, anchor_rows = [], []
-    seq = torch.cat(pieces + contrast_pieces + anchor_pieces)
-    meta = pack(sub_rows, contrast_rows, anchor_rows)
+    notes = {"hint": [], "contrast": [], "anchor": []}
+    for start, hint in zip([100, 2600], hint_ids, strict=True):
+        for group, text in (("hint", hint), ("contrast", hint[:10] + 3), ("anchor", hint[:0])):
+            notes[group].append((start, text))
+    groups = ["hint"] + ["contrast"] * contrast + ["anchor"] * anchor
+    ends = {100: 2600, 2600: resp_len}
+    rows = [[SubRow(prompt_len + start, text.shape[0], start, ends[start]) for start, text in notes[g]] for g in groups]
+    seq = torch.cat([prompt_ids, response_ids, *(text for g in groups for _, text in notes[g])])
     return {
         "responses": response_ids,
         "response_mask": torch.ones(resp_len),
         "teacher_input_ids": seq,
-        "teacher_seq_meta": torch.tensor(meta, dtype=torch.int64),
+        "teacher_seq_meta": torch.tensor(pack(prompt_len, *rows), dtype=torch.int64),
     }
 
 
-def run_teacher_grid_path(micro):
-    """Mirror _compute_sdpo_teacher_logps_for_loss's turn-mode shape flow."""
+STUB = {
+    "responses": torch.tensor([11], dtype=torch.long),
+    "response_mask": torch.zeros(1),
+    "teacher_input_ids": torch.tensor([8, 11], dtype=torch.long),
+    "teacher_seq_meta": torch.tensor(DEGENERATE_META, dtype=torch.int64),
+}
+
+
+def branch_spans(micro):
+    return [branch.span for _, branches in teacher_branches(
+        micro["teacher_input_ids"], micro["teacher_seq_meta"], micro["responses"]
+    ) for branch in branches]
+
+
+def run_teacher_grid_path(micro, value=lambda span: torch.randn(())):
+    """Mirror _score_teacher_branches's shape flow: every branch's outputs cover its own span."""
     batch_size = micro["responses"].size(0)
     full_response_length = max(r.shape[0] for r in micro["responses"].unbind())
-    _, sub_resps, _, sub_spans = explode_turn_teacher_rows(
-        teacher_input_ids=micro["teacher_input_ids"],
-        teacher_seq_meta=micro["teacher_seq_meta"],
-        responses=micro["responses"],
-        mask_dtype=micro["response_mask"].dtype,
-    )
-    max_body = max(r.shape[0] for r in sub_resps.unbind())
-    fake_outputs = torch.randn(len(sub_spans), max_body)
-    return scatter_turn_teacher_outputs(fake_outputs, sub_spans, batch_size, full_response_length)
+    spans = branch_spans(micro)
+    outputs = [value(span).expand(span.end - span.start).clone() for span in spans]
+    grids = [
+        scatter_turn_teacher_outputs(outputs, spans, batch_size, full_response_length, contrast, anchor)
+        for contrast, anchor in ((False, False), (True, False), (False, True))
+    ]
+    return spans, grids
 
 
 def to_td(samples):
@@ -87,13 +91,7 @@ def to_td(samples):
 
 
 def test_micro_splits_stay_row_aligned():
-    stub = {
-        "responses": torch.tensor([11], dtype=torch.long),
-        "response_mask": torch.zeros(1),
-        "teacher_input_ids": torch.tensor([8, 11], dtype=torch.long),
-        "teacher_seq_meta": torch.tensor(DEGENERATE_META, dtype=torch.int64),
-    }
-    td = to_td([make_hinted_sample(), stub])
+    td = to_td([make_hinted_sample(), STUB])
     run_teacher_grid_path(td)
     for idx in ([0], [1], [1, 0]):
         run_teacher_grid_path(tu.index_select_tensor_dict(td, idx))
@@ -101,57 +99,35 @@ def test_micro_splits_stay_row_aligned():
         run_teacher_grid_path(micro)
 
 
+# each group's sub-row of each turn, and the stub, scored with its own constant
+VALUES = {
+    (0, 100, False, False): 1.0, (0, 2600, False, False): 2.0, (0, 100, True, False): 3.0,
+    (0, 2600, True, False): 4.0, (0, 100, False, True): 5.0, (0, 2600, False, True): 6.0, (1, 0, False, False): 7.0,
+}
+
+
+def _value(span):
+    return torch.tensor(VALUES[(span.parent, span.start, span.contrast, span.anchor)])
+
+
 def test_contrast_subrows_scatter_apart_from_the_hint_ones():
-    stub = {
-        "responses": torch.tensor([11], dtype=torch.long),
-        "response_mask": torch.zeros(1),
-        "teacher_input_ids": torch.tensor([8, 11], dtype=torch.long),
-        "teacher_seq_meta": torch.tensor(DEGENERATE_META, dtype=torch.int64),
-    }
-    micro = to_td([make_hinted_sample(contrast=True), stub])
-    _, sub_resps, _, sub_spans = explode_turn_teacher_rows(
-        teacher_input_ids=micro["teacher_input_ids"],
-        teacher_seq_meta=micro["teacher_seq_meta"],
-        responses=micro["responses"],
-        mask_dtype=micro["response_mask"].dtype,
-    )
-    assert [(span.parent, span.contrast) for span in sub_spans] == [
+    spans, (hint, contrast, _) = run_teacher_grid_path(to_td([make_hinted_sample(contrast=True), STUB]), _value)
+    assert sorted((span.parent, span.contrast) for span in spans) == [
         (0, False), (0, False), (0, True), (0, True), (1, False)
     ]
-    max_body = max(r.shape[0] for r in sub_resps.unbind())
-    outputs = torch.arange(1.0, 6.0).reshape(5, 1).expand(5, max_body).clone()  # sub-row j is all j + 1
-
-    hint = scatter_turn_teacher_outputs(outputs, sub_spans, 2, 9000)
-    contrast = scatter_turn_teacher_outputs(outputs, sub_spans, 2, 9000, contrast=True)
     assert hint[0, 100:2600].eq(1).all() and hint[0, 2600:].eq(2).all() and hint[0, :100].eq(0).all()
     assert contrast[0, 100:2600].eq(3).all() and contrast[0, 2600:].eq(4).all() and contrast[0, :100].eq(0).all()
-    assert hint[1, 0] == 5 and contrast[1].eq(0).all(), "the un-hinted row's stub has no contrast sub-row"
+    assert hint[1, 0] == 7 and contrast[1].eq(0).all(), "the un-hinted row's stub has no contrast sub-row"
 
 
 def test_anchor_subrows_scatter_apart_from_the_hint_and_contrast_ones():
-    stub = {
-        "responses": torch.tensor([11], dtype=torch.long),
-        "response_mask": torch.zeros(1),
-        "teacher_input_ids": torch.tensor([8, 11], dtype=torch.long),
-        "teacher_seq_meta": torch.tensor(DEGENERATE_META, dtype=torch.int64),
-    }
-    micro = to_td([make_hinted_sample(contrast=True, anchor=True), stub])
-    _, sub_resps, _, sub_spans = explode_turn_teacher_rows(
-        teacher_input_ids=micro["teacher_input_ids"],
-        teacher_seq_meta=micro["teacher_seq_meta"],
-        responses=micro["responses"],
-        mask_dtype=micro["response_mask"].dtype,
+    spans, (hint, contrast, anchor) = run_teacher_grid_path(
+        to_td([make_hinted_sample(contrast=True, anchor=True), STUB]), _value
     )
-    assert [(span.parent, span.contrast, span.anchor) for span in sub_spans] == [
-        (0, False, False), (0, False, False), (0, True, False), (0, True, False),
-        (0, False, True), (0, False, True), (1, False, False),
+    assert sorted((span.parent, span.contrast, span.anchor) for span in spans) == [
+        (0, False, False), (0, False, False), (0, False, True), (0, False, True),
+        (0, True, False), (0, True, False), (1, False, False),
     ]
-    max_body = max(r.shape[0] for r in sub_resps.unbind())
-    outputs = torch.arange(1.0, 8.0).reshape(7, 1).expand(7, max_body).clone()  # sub-row j is all j + 1
-
-    hint = scatter_turn_teacher_outputs(outputs, sub_spans, 2, 9000)
-    contrast = scatter_turn_teacher_outputs(outputs, sub_spans, 2, 9000, contrast=True)
-    anchor = scatter_turn_teacher_outputs(outputs, sub_spans, 2, 9000, anchor=True)
     assert hint[0, 100:2600].eq(1).all() and hint[0, 2600:].eq(2).all()
     assert contrast[0, 100:2600].eq(3).all() and contrast[0, 2600:].eq(4).all()
     assert anchor[0, 100:2600].eq(5).all() and anchor[0, 2600:].eq(6).all() and anchor[0, :100].eq(0).all()
@@ -159,16 +135,16 @@ def test_anchor_subrows_scatter_apart_from_the_hint_and_contrast_ones():
 
 
 def test_the_meta_packs_and_unpacks_three_groups():
-    rows = [SubRow(10, 8, 2, 2, 8), SubRow(20, 16, 3, 10, 16)]
-    contrast = [SubRow(12, 10, 4, 2, 8), SubRow(22, 18, 5, 10, 16)]
-    anchor = [SubRow(8, 6, 0, 2, 8), SubRow(18, 14, 1, 10, 16)]
-    flat = pack(rows, contrast, anchor)
-    assert flat[0] == 2 and len(flat) == 1 + 3 * 2 * 5
+    rows = [SubRow(8, 2, 2, 8), SubRow(14, 3, 10, 16)]
+    contrast = [SubRow(8, 4, 2, 8), SubRow(14, 5, 10, 16)]
+    anchor = [SubRow(8, 0, 2, 8), SubRow(14, 0, 10, 16)]
+    flat = pack(6, rows, contrast, anchor)
+    assert flat[:2] == [2, 6] and len(flat) == 2 + 3 * 2 * 4
     assert unpack(flat) == rows and unpack(flat, contrast=True) == contrast and unpack(flat, anchor=True) == anchor
-    two = pack(rows, contrast)
+    two = pack(6, rows, contrast)
     assert unpack(two, contrast=True) == contrast and unpack(two, anchor=True) == []
     with pytest.raises(AssertionError, match="anchor"):
-        pack(rows, (), anchor)
+        pack(6, rows, (), anchor)
     with pytest.raises(AssertionError, match="one group"):
         unpack(flat, contrast=True, anchor=True)
 
@@ -177,7 +153,7 @@ def test_corrupt_spans_are_caught():
     sample = make_hinted_sample()
     sample["responses"] = torch.arange(100, dtype=torch.long)  # truncated vs meta
     sample["response_mask"] = torch.ones(100)
-    with pytest.raises(AssertionError, match="span exceeds the response row"):
+    with pytest.raises(AssertionError, match="teacher_seq_meta malformed"):
         run_teacher_grid_path(to_td([sample]))
 
 
@@ -197,7 +173,7 @@ def test_padding_template_rebuilds_teacher_fields():
     )
     template, tag = construct_minimal_padding_template(source, {"seq_len": 9050}, eos_token_id=2)
 
-    assert template["teacher_seq_meta"].tolist() == [1, 2, 1, 0, 0, 1]
+    assert template["teacher_seq_meta"].tolist() == DEGENERATE_META
     assert template["teacher_input_ids"].shape[0] == 2
     assert template["self_distillation_mask"].tolist() == [0.0]
     assert tag["is_padding"]

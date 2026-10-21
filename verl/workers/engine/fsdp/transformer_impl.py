@@ -21,7 +21,7 @@ import os
 import random
 import time
 import warnings
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Callable, ContextManager, Optional
 
 import torch
@@ -638,6 +638,16 @@ class FSDPEngine(BaseEngine):
         Includes activation offload entry/exit.
         """
         return EngineEvalModeCtx(self, **kwargs)
+
+    @contextmanager
+    def continuing(self, cache):
+        """Forwards inside continue ``cache`` (a transformers ``Cache``): they attend to the context it
+        holds, at the positions their ``position_ids`` give, and append their own to it."""
+        self._cache = cache
+        try:
+            yield
+        finally:
+            self._cache = None
 
     def get_data_parallel_rank(self):
         if self.ulysses_device_mesh is not None:
@@ -1808,10 +1818,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
             forward_module = self.module
             if forward_only and self._inference_module is not None:
                 forward_module = self._inference_module
-            raw_output = forward_module(
-                **model_inputs,
-                use_cache=False,
-            )  # prevent model thinks we are generating
+            # without a cache to continue, use_cache=False keeps the model from thinking it is generating
+            cache = getattr(self, "_cache", None)
+            cache_kwargs = {"use_cache": False} if cache is None else {"past_key_values": cache, "use_cache": True}
+            raw_output = forward_module(**model_inputs, **cache_kwargs)
 
             model_output = self.prepare_model_outputs(
                 output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function

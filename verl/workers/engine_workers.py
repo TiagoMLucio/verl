@@ -35,7 +35,6 @@ from verl.checkpoint_engine import CheckpointEngineRegistry
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
-from verl.trainer.ppo.sdpo.teacher_meta import body_slices
 from verl.utils import tensordict_utils as tu
 from verl.utils import trace_file
 from verl.utils.config import omega_conf_to_dataclass
@@ -63,12 +62,10 @@ from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_pad
 from verl.workers.utils.sdpo import (
     TrustRegionTeacher,
     attach_response_keep_positions,
-    explode_turn_teacher_rows,
     has_non_empty_multi_modal_inputs,
     reconstruct_padded_teacher_from_nested,
-    scatter_turn_teacher_outputs,
+    score_teacher_branches,
     truncate_rows_after_last_supervised_token,
-    turn_keep_positions,
 )
 
 logger = logging.getLogger(__file__)
@@ -844,48 +841,42 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if has_non_empty_multi_modal_inputs(data):
             raise ValueError("SDPO does not support multi-modal inputs in actor.update_policy.")
 
+        temperature = tu.get_non_tensor_data(data=data, key="temperature", default=1.0)
+        non_tensor_dict = {
+            "temperature": temperature,
+            "pad_token_id": tu.get_non_tensor_data(data=data, key="pad_token_id", default=0),
+        }
+        use_logits_processor = return_all_logps or student_topk_indices is not None
+        default_keys = {
+            "use_remove_padding": tu.get_non_tensor_data(
+                data=data, key="use_remove_padding", default=self.ref.model_config.get("use_remove_padding", False)
+            ),
+            "use_dynamic_bsz": False,
+            "max_token_len_per_gpu": None,
+            # the teacher's outputs are top-k logps read off the logits, same as the student
+            "use_fused_kernels": False,
+            "calculate_entropy": False,
+            "distillation_use_topk": use_logits_processor,
+        }
+        # When full-logit distillation is on (top-k or all-vocab), run the teacher
+        # extractor as the engine's logits processor; otherwise only plain log_probs
+        # are needed. The extractor itself picks top-k vs all-vocab from the data.
+        loss_function = _sdpo_teacher_extractor if use_logits_processor else None
+        output_keys = ["log_probs"]
+        if return_all_logps:
+            output_keys.append("all_logps")
+        elif student_topk_indices is not None:
+            output_keys.append("topk_logps")
+
         # Both trainers pass the same fields; the transfer-queue path materializes the teacher
         # sequence as a nested (no-padding) tensor and we rebuild the padded layout here, while
         # the legacy path already carries the padded teacher tensors (and precomputed mask/pos).
         teacher_input_ids = data["teacher_input_ids"]
-        turn_meta = tu.get(data, "teacher_seq_meta", default=None)
-        sub_spans = None
-        has_contrast = has_anchor = False
-        if teacher_input_ids.is_nested and turn_meta is not None:
-            # spliced teacher rows: score each sub-row's body, then scatter the span outputs
-            # back to the response grid.
-            batch_size = data["responses"].size(0)
-            full_response_length = max(r.shape[0] for r in data["responses"].unbind())
-            sub_seqs, sub_resps, sub_masks, sub_spans = explode_turn_teacher_rows(
-                teacher_input_ids=teacher_input_ids,
-                teacher_seq_meta=turn_meta,
-                responses=data["responses"],
-                mask_dtype=data["response_mask"].dtype,
+        if teacher_input_ids.is_nested and tu.get(data, "teacher_seq_meta", default=None) is not None:
+            return score_teacher_branches(
+                self.ref.engine, data, student_topk_indices, output_keys, non_tensor_dict, default_keys, loss_function
             )
-            (
-                teacher_input_ids,
-                teacher_attention_mask,
-                teacher_position_ids,
-                responses,
-                response_mask,
-            ) = reconstruct_padded_teacher_from_nested(
-                teacher_input_ids=sub_seqs,
-                responses=sub_resps,
-                response_mask=sub_masks,
-                pad_token_id=tu.get_non_tensor_data(data=data, key="pad_token_id", default=0),
-            )
-            has_contrast = any(span.contrast for span in sub_spans)
-            has_anchor = any(span.anchor for span in sub_spans)
-            if (has_contrast or has_anchor) and student_topk_indices is None:
-                raise ValueError("SDPO contrast sub-rows need top-k distillation (distillation_topk set).")
-            if student_topk_indices is not None:
-                sub_indices = student_topk_indices.new_zeros(
-                    (len(sub_spans), responses.shape[1], student_topk_indices.shape[-1])
-                )
-                for j, parent, body_slice, response_slice in body_slices(sub_spans):
-                    sub_indices[j, body_slice] = student_topk_indices[parent, response_slice]
-                student_topk_indices = sub_indices
-        elif teacher_input_ids.is_nested:
+        if teacher_input_ids.is_nested:
             (
                 teacher_input_ids,
                 teacher_attention_mask,
@@ -922,93 +913,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if student_topk_indices is not None:
             tensor_dict["student_topk_indices"] = student_topk_indices
 
-        temperature = tu.get_non_tensor_data(data=data, key="temperature", default=1.0)
-        non_tensor_dict = {
-            "temperature": temperature,
-            "pad_token_id": tu.get_non_tensor_data(data=data, key="pad_token_id", default=0),
-        }
-        use_logits_processor = return_all_logps or student_topk_indices is not None
-        default_keys = {
-            "use_remove_padding": tu.get_non_tensor_data(
-                data=data, key="use_remove_padding", default=self.ref.model_config.get("use_remove_padding", False)
-            ),
-            "use_dynamic_bsz": False,
-            "max_token_len_per_gpu": None,
-            # the teacher's outputs are top-k logps read off the logits, same as the student
-            "use_fused_kernels": False,
-            "calculate_entropy": False,
-            "distillation_use_topk": use_logits_processor,
-        }
-
-        # Span-only lm_head: only the supervised-span positions are ever consumed from spliced teacher rows.
-        keep_positions = turn_keep_positions(sub_seqs, sub_resps, sub_spans).unbind() if sub_spans is not None else None
-        # the ids the student chose at those positions, for the head to score a chunk at a time
-        keep_ids = None
-        if keep_positions is not None and student_topk_indices is not None:
-            keep_ids = [student_topk_indices[j, body] for j, _, body, _ in body_slices(sub_spans)]
-
-        # When full-logit distillation is on (top-k or all-vocab), run the teacher
-        # extractor as the engine's logits processor; otherwise only plain log_probs
-        # are needed. The extractor itself picks top-k vs all-vocab from the data.
-        loss_function = _sdpo_teacher_extractor if use_logits_processor else None
-        output_keys = ["log_probs"]
-        if return_all_logps:
-            output_keys.append("all_logps")
-        elif student_topk_indices is not None:
-            output_keys.append("topk_logps")
-
-        # each spliced sub-row carries its whole prefix, so a trace's sub-rows are scored one call each: together
-        # they can outgrow the GPU, and every call keeps its own unpadding bookkeeping (max_seq_len, indices)
-        row_slices = [slice(j, j + 1) for j in range(responses.shape[0])] if sub_spans is not None else [slice(None)]
-        n_calls = len(row_slices)
-        if sub_spans is not None and torch.distributed.is_initialized():
-            # each infer_batch runs FSDP all-gathers and an all-reduce, so every rank makes the same number of calls;
-            # a rank with fewer sub-rows repeats its last one and drops the extra outputs; a rank whose rows are all
-            # un-hinted still returns the contrast and anchor outputs (zeros) when another rank has them, so every
-            # rank's loss reports the same metric keys
-            group = self.ref.engine.get_data_parallel_group()
-            device = "cpu" if torch.distributed.get_backend(group) == "gloo" else get_device_name()
-            count = torch.tensor([n_calls, int(has_contrast), int(has_anchor)], device=device)
-            torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.MAX, group=group)
-            n_calls, has_contrast, has_anchor = int(count[0]), bool(count[1]), bool(count[2])
-        parts = {key: [] for key in output_keys}
         with self.ref.engine.eval_mode(disable_auto_offload=False):
-            for call in range(n_calls):
-                rows = row_slices[min(call, len(row_slices) - 1)]
-                teacher_td = tu.get_tensordict(
-                    tensor_dict={key: value[rows] for key, value in tensor_dict.items()},
-                    non_tensor_dict=dict(non_tensor_dict),
-                )
-                teacher_td = left_right_2_no_padding(teacher_td)
-                tu.assign_non_tensor(teacher_td, **default_keys, micro_batch_size_per_gpu=responses[rows].shape[0])
-                if keep_positions is not None:
-                    teacher_td["logits_keep_positions"] = torch.nested.nested_tensor(
-                        list(keep_positions[rows]), layout=torch.jagged
-                    )
-                if keep_ids is not None:
-                    teacher_td["logits_keep_topk_indices"] = torch.nested.nested_tensor(
-                        keep_ids[rows], layout=torch.jagged
-                    )
-                model_output = self.ref.engine.infer_batch(teacher_td, loss_function=loss_function)["model_output"]
-                if call < len(row_slices):
-                    for key in output_keys:
-                        parts[key].append(no_padding_2_padding(model_output[key], teacher_td).float())
+            teacher_td = left_right_2_no_padding(
+                tu.get_tensordict(tensor_dict=tensor_dict, non_tensor_dict=dict(non_tensor_dict))
+            )
+            tu.assign_non_tensor(teacher_td, **default_keys, micro_batch_size_per_gpu=responses.shape[0])
+            model_output = self.ref.engine.infer_batch(teacher_td, loss_function=loss_function)["model_output"]
+        padded = {key: no_padding_2_padding(model_output[key], teacher_td).float() for key in output_keys}
 
-        def to_response_grid(key: str, contrast: bool = False, anchor: bool = False) -> torch.Tensor:
-            padded = torch.cat(parts[key])
-            if sub_spans is None:
-                return padded
-            return scatter_turn_teacher_outputs(padded, sub_spans, batch_size, full_response_length, contrast, anchor)
-
-        result = {"teacher_log_probs": to_response_grid("log_probs")}
+        result = {"teacher_log_probs": padded["log_probs"]}
         if return_all_logps:
-            result["teacher_all_log_probs"] = to_response_grid("all_logps")
+            result["teacher_all_log_probs"] = padded["all_logps"]
         elif student_topk_indices is not None:
-            result["teacher_topk_log_probs"] = to_response_grid("topk_logps")
-            if has_contrast:
-                result["contrast_topk_log_probs"] = to_response_grid("topk_logps", contrast=True)
-            if has_anchor:
-                result["anchor_topk_log_probs"] = to_response_grid("topk_logps", anchor=True)
+            result["teacher_topk_log_probs"] = padded["topk_logps"]
         return result
 
     def _ema_teacher_active(self) -> bool:

@@ -11,23 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Span-only teacher lm_head: computing values only at ``turn_keep_positions`` and
-scattering them back to the packed layout must reproduce the full-computation grid
-(including the -1 next-token shift shared with ``no_padding_2_padding``). Un-hinted /
-padding rows ship the degenerate sub-row so the teacher still scores them, and keep one
-dummy student keep position under the hints-only contract."""
+"""Span-only teacher lm_head: each branch keeps exactly the positions that predict its scored
+span (the -1 next-token shift shared with ``no_padding_2_padding``), and their values scatter
+back onto the response grid. Un-hinted / padding rows ship the degenerate sub-row so the teacher
+still scores them, and keep one dummy student keep position under the hints-only contract."""
 
 import torch
 from tensordict import TensorDict
 
 from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META, SubRow, pack
 from verl.workers.utils.padding import no_padding_2_padding
-from verl.workers.utils.sdpo import (
-    explode_turn_teacher_rows,
-    response_keep_positions,
-    scatter_turn_teacher_outputs,
-    turn_keep_positions,
-)
+from verl.workers.utils.sdpo import response_keep_positions, scatter_turn_teacher_outputs, teacher_branches
 
 
 def njt(rows):
@@ -35,19 +29,17 @@ def njt(rows):
 
 
 def make_rows():
-    # hinted sample: two sub-rows over a 60-token prefix, bodies cut after their spans
-    # [10, 40) and [120, 200) on the response grid
-    sub_rows = [
-        SubRow(total_len=100, body_len=40, body_start=10, start=10, end=40),
-        SubRow(total_len=260, body_len=200, body_start=120, start=120, end=200),
-    ]
+    # hinted sample: a 60-token prompt, then the response up to the last span; two sub-rows with their
+    # notes before the turns whose spans are [10, 40) and [120, 200) on the response grid
+    response = torch.arange(200, dtype=torch.long)
+    sub_rows = [SubRow(split=68, note_len=3, start=10, end=40), SubRow(split=178, note_len=5, start=120, end=200)]
     hinted = {
-        "responses": torch.arange(200, dtype=torch.long),
+        "responses": response,
         "response_mask": torch.ones(200),
-        "teacher_input_ids": torch.arange(360, dtype=torch.long),
-        "teacher_seq_meta": torch.tensor(pack(sub_rows), dtype=torch.int64),
+        "teacher_input_ids": torch.cat([1000 + torch.arange(60), response, torch.full((8,), 999)]),
+        "teacher_seq_meta": torch.tensor(pack(60, sub_rows), dtype=torch.int64),
     }
-    # degenerate stub (un-hinted or padding row): 1-token teacher body, zero mask
+    # degenerate stub (un-hinted or padding row): 2-token base, zero mask
     stub = {
         "responses": torch.tensor([11], dtype=torch.long),
         "response_mask": torch.zeros(1),
@@ -57,50 +49,32 @@ def make_rows():
     return hinted, stub
 
 
-def test_keep_positions_match_consumed_positions():
+def test_branch_keep_positions_predict_the_scored_span():
     hinted, stub = make_rows()
-    sub_seqs, sub_resps, _, sub_spans = explode_turn_teacher_rows(
+    rows = teacher_branches(
         teacher_input_ids=njt([hinted["teacher_input_ids"], stub["teacher_input_ids"]]),
         teacher_seq_meta=njt([hinted["teacher_seq_meta"], stub["teacher_seq_meta"]]),
         responses=njt([hinted["responses"], stub["responses"]]),
     )
+    spans = [branch.span for _, branches in rows for branch in branches]
     # one sub-row per hint, and every row keeps one (dp-collective lockstep); the stub's is 1 token
-    assert [s.parent for s in sub_spans] == [0, 0, 1]
-    keep = turn_keep_positions(sub_seqs, sub_resps, sub_spans)
+    assert [span.parent for span in spans] == [0, 0, 1]
 
-    seq_lens = sub_seqs.offsets().diff()
-    body_lens = sub_resps.offsets().diff()
-
-    # full-path values: position index over the packed layout
-    offsets = sub_seqs.offsets()
-    total_nnz = int(offsets[-1])
-    values_full = torch.arange(total_nnz, dtype=torch.float32)
-
-    teacher_td = TensorDict(
-        {
-            "prompts": njt([seq[: seq_lens[j] - body_lens[j]] for j, seq in enumerate(sub_seqs.unbind())]),
-            "responses": sub_resps,
-        },
-        batch_size=len(sub_spans),
-    )
-    batch_size, response_length = 2, 200
-
-    def to_grid(packed_values):
-        padded = no_padding_2_padding(torch.nested.nested_tensor_from_jagged(packed_values, offsets), teacher_td)
-        return scatter_turn_teacher_outputs(padded, sub_spans, batch_size, response_length)
-
-    grid_full = to_grid(values_full)
-
-    # reduced path: compute only at keep positions, scatter back into zeros
-    keep_idx = keep.values() + offsets[:-1].repeat_interleave(keep.offsets().diff())
-    values_reduced = values_full.new_zeros(total_nnz).index_copy_(0, keep_idx, values_full[keep_idx])
-    grid_reduced = to_grid(values_reduced)
-
-    assert torch.equal(grid_full, grid_reduced), "span-only computation must reproduce the consumed grid"
-    # sanity: the grid actually carries the span values (scatter is not a no-op)
-    assert grid_full[0, 10:40].abs().sum() > 0
+    responses = [hinted["responses"], stub["responses"]]
+    outputs = []
+    for _, branches in rows:
+        for branch in branches:
+            span = branch.span
+            keep = torch.arange(span.body_start, span.body_start + span.end - span.start)
+            # position k predicts token k + 1
+            assert torch.equal(branch.ids[keep + 1], responses[span.parent][span.start : span.end])
+            outputs.append(branch.ids[keep + 1].float())
+    grid = scatter_turn_teacher_outputs(outputs, spans, 2, 200)
+    assert torch.equal(grid[0, 10:40], torch.arange(10, 40, dtype=torch.float32))
+    assert torch.equal(grid[0, 120:200], torch.arange(120, 200, dtype=torch.float32))
+    assert grid[0, :10].abs().sum() == 0 and grid[0, 40:120].abs().sum() == 0
     # the stub row only carries its degenerate first-position value (masked in the loss)
-    assert grid_full[1, 1:].abs().sum() == 0
+    assert grid[1, 0] == 11 and grid[1, 1:].abs().sum() == 0
 
 
 def test_meta_without_sub_rows_keeps_a_dummy_student_position():

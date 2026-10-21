@@ -26,6 +26,7 @@ from tensordict import TensorDict
 
 from verl.trainer import main_ppo_sync
 from verl.trainer.ppo import padding_utils
+from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META
 
 DP, MINI = 4, 128
 
@@ -99,7 +100,7 @@ def _row(weight, traj, seq_len, outcome=None):
         trace_weight=torch.tensor([weight]),
         traj_id=torch.tensor([traj]),
         teacher_input_ids=torch.tensor([1, 2]),
-        teacher_seq_meta=torch.tensor([1, 2, 1, 0, 0, 1]),
+        teacher_seq_meta=torch.tensor(DEGENERATE_META),
         self_distillation_mask=torch.full((seq_len - 2,), weight),
         uid=f"u{traj}",
     )

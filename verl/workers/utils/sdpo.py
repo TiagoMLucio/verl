@@ -11,18 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Worker-side half of :mod:`verl.trainer.ppo.sdpo`: re-pad the nested teacher tensors, explode
-spliced rows into sub-rows, mark the span-only logits positions, scatter the teacher outputs
-back to the response grid, and mix the trust-region teacher."""
+"""Worker-side half of :mod:`verl.trainer.ppo.sdpo`: re-pad the nested teacher tensors, split
+spliced rows into their base and the branches off it, mark the span-only logits positions, scatter
+the teacher outputs back to the response grid, and mix the trust-region teacher."""
 
 from types import SimpleNamespace
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
+from transformers import DynamicCache
 
-from verl.trainer.ppo.sdpo.teacher_meta import SubRowSpan, body_slices, unpack
+from verl.trainer.ppo.sdpo.teacher_meta import SubRowSpan, unpack, unpack_row
 from verl.utils import tensordict_utils as tu
+from verl.utils.device import get_device_name
 from verl.utils.model import compute_position_id_with_mask
+from verl.workers.utils.padding import left_right_2_no_padding
 
 
 def reconstruct_padded_teacher_from_nested(
@@ -85,60 +88,90 @@ def reconstruct_padded_teacher_from_nested(
     return teacher_input_ids, teacher_attention_mask, teacher_position_ids, responses_padded, response_mask_padded
 
 
-def explode_turn_teacher_rows(
-    teacher_input_ids: torch.Tensor,
-    teacher_seq_meta: torch.Tensor,
-    responses: torch.Tensor,
-    mask_dtype: torch.dtype = torch.int64,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[SubRowSpan]]:
-    """Unpack per-sample spliced teacher rows into the sub-batch the teacher forward scores.
+class Branch(NamedTuple):
+    """One sub-row as a continuation of its sample's base: ``ids`` (the base token before the split, the
+    note, then the base up to the scored span's end) follow the first ``point`` base tokens, at positions
+    ``point`` on. The base token is read again so that a sub-row with no note scores its first token too."""
 
-    ``teacher_seq_meta`` is flat per sample (see :mod:`verl.trainer.ppo.sdpo.teacher_meta`).
-    Each sub-row's body is its verbatim tail, so the padded reconstruction contract holds.
-    One sub-row per supervised span, each carrying only its own prefix, so the teacher scores
-    every span from the context built for it. Rows without supervised spans ship a
-    degenerate 2-token sub-row: the teacher forward must run on every rank every micro-batch
-    so its dp-group collectives stay in lockstep. A sample's contrast sub-rows follow its own,
-    flagged ``contrast`` in their span, and its no-note sub-rows follow those, flagged ``anchor``.
-    Returns nested sequences / bodies / all-ones body presence masks (``mask_dtype``) plus one
-    :class:`SubRowSpan` per sub-row.
+    point: int
+    ids: torch.Tensor
+    span: SubRowSpan
+
+
+def teacher_branches(
+    teacher_input_ids: torch.Tensor, teacher_seq_meta: torch.Tensor, responses: torch.Tensor
+) -> list[tuple[torch.Tensor, list[Branch]]]:
+    """Per sample, its base and its sub-rows as branches off it, in the order they leave the base.
+
+    ``teacher_seq_meta`` is flat per sample (see :mod:`verl.trainer.ppo.sdpo.teacher_meta`). One sub-row
+    per supervised span, each with only its own note, so the teacher scores every span from the context
+    built for it; the sub-rows share the base before their split, so the teacher reads it once. Rows
+    without supervised spans ship a 2-token stub: the teacher forward must run on every rank every
+    micro-batch so its dp-group collectives stay in lockstep. A sample's contrast sub-rows follow its
+    own, flagged ``contrast`` in their span, and its no-note sub-rows follow those, flagged ``anchor``.
     """
-    seq_list = teacher_input_ids.unbind()
-    meta_list = teacher_seq_meta.unbind()
-
-    sub_seqs, sub_resps, sub_masks, sub_spans = [], [], [], []
-    resp_list = responses.unbind()
-    assert len(seq_list) == len(resp_list), (
-        f"teacher rows ({len(seq_list)}) and responses ({len(resp_list)}) disagree on batch size"
-    )
-    for i, (seq, meta) in enumerate(zip(seq_list, meta_list, strict=True)):
-        offset = 0
-        flat = meta.tolist()
-        sub_rows = [(row, False, False) for row in unpack(flat, sample=i)]
-        sub_rows += [(row, True, False) for row in unpack(flat, sample=i, contrast=True)]
-        sub_rows += [(row, False, True) for row in unpack(flat, sample=i, anchor=True)]
-        for j, (sub_row, contrast, anchor) in enumerate(sub_rows):
-            assert 0 < sub_row.body_len <= sub_row.total_len and offset + sub_row.total_len <= seq.shape[0], (
-                f"teacher_seq_meta malformed for sample {i} sub-row {j}: total {sub_row.total_len}, "
-                f"body {sub_row.body_len}, offset {offset}, seq len {seq.shape[0]}"
+    rows = []
+    samples = zip(teacher_input_ids.unbind(), teacher_seq_meta.unbind(), responses.unbind(), strict=True)
+    for i, (seq, meta, response) in enumerate(samples):
+        base, offset, noted = unpack_row(seq, meta.tolist(), sample=i)
+        branches = []
+        for j, (sub_row, note, contrast, anchor) in enumerate(noted):
+            split, stop = sub_row.split, offset + sub_row.end
+            assert 0 < split <= offset + sub_row.start < stop <= base.shape[0] and sub_row.end <= response.shape[0], (
+                f"teacher_seq_meta malformed for sample {i} sub-row {j}: {sub_row}, response offset {offset}, "
+                f"base {base.shape[0]} tokens, response {response.shape[0]}"
             )
-            assert sub_row.end <= resp_list[i].shape[0], (
-                f"teacher_seq_meta span exceeds the response row for sample {i}: "
-                f"end {sub_row.end} > response len {resp_list[i].shape[0]}"
+            ids = torch.cat([base[split - 1 : split], note, base[split:stop]])
+            body_start = note.shape[0] + offset + sub_row.start - split
+            branches.append(
+                Branch(split - 1, ids, SubRowSpan(i, body_start, sub_row.start, sub_row.end, contrast, anchor))
             )
-            sub = seq[offset : offset + sub_row.total_len]
-            sub_seqs.append(sub)
-            sub_resps.append(sub[-sub_row.body_len :])
-            sub_masks.append(torch.ones(sub_row.body_len, dtype=mask_dtype, device=sub.device))
-            sub_spans.append(SubRowSpan(i, sub_row.body_start, sub_row.start, sub_row.end, contrast, anchor))
-            offset += sub_row.total_len
+        rows.append((base, sorted(branches, key=lambda branch: branch.point)))
+    return rows
 
-    return (
-        torch.nested.nested_tensor(sub_seqs, layout=torch.jagged),
-        torch.nested.nested_tensor(sub_resps, layout=torch.jagged),
-        torch.nested.nested_tensor(sub_masks, layout=torch.jagged),
-        sub_spans,
-    )
+
+# a forward that continues a cache gets a dense (query x key) SDPA mask, so a long read on goes in pieces
+CONTINUATION_PIECE = 2048
+
+
+def continuation_pieces(start: int, stop: int) -> list[tuple[int, int]]:
+    """``[start, stop)`` in pieces of one to two :data:`CONTINUATION_PIECE` tokens, or whole when shorter."""
+    n = max(1, (stop - start) // CONTINUATION_PIECE)
+    bounds = [start + (stop - start) * k // n for k in range(n + 1)]
+    return list(zip(bounds[:-1], bounds[1:], strict=True))
+
+
+class TeacherCache(DynamicCache):
+    """The cache a teacher row's reads and branches continue. Its recurrent (linear-attention) layers keep their
+    state in the dtype the kernel returns it in: transformers sizes it by the conv state's, the model's dtype,
+    which would round it to bf16 at every handover between forwards, where a single forward keeps it fp32."""
+
+    def update_recurrent_state(self, recurrent_states: torch.Tensor, layer_idx: int, **kwargs) -> torch.Tensor:
+        layer = self.layers[layer_idx]
+        if not layer.is_recurrent_states_initialized:
+            layer.recurrent_states = torch.zeros_like(recurrent_states)
+            layer.is_recurrent_states_initialized = True
+        return super().update_recurrent_state(recurrent_states, layer_idx, **kwargs)
+
+
+def recurrent_states(cache) -> list:
+    """Copies of a transformers cache's recurrent-layer states, which a forward overwrites in place
+    (attention layers append their keys and values instead, so a crop rewinds them)."""
+    return [
+        (layer.conv_states.clone(), layer.recurrent_states.clone())
+        if getattr(layer, "has_previous_state", False)
+        else None
+        for layer in cache.layers
+    ]
+
+
+def rewind(cache, length: int, states: list) -> None:
+    """Put ``cache`` back to the ``length`` tokens it held when ``states`` was taken."""
+    cache.crop(length)
+    for layer, saved in zip(cache.layers, states, strict=True):
+        if saved is not None:
+            layer.conv_states.copy_(saved[0])
+            layer.recurrent_states.copy_(saved[1])
 
 
 def _keep_positions(prefix_lens: torch.Tensor, spans_per_row: list[list[tuple[int, int]]]) -> torch.Tensor:
@@ -157,13 +190,6 @@ def _keep_positions(prefix_lens: torch.Tensor, spans_per_row: list[list[tuple[in
         else:
             rows.append(torch.tensor([prefix_len - 1], dtype=torch.int64))
     return torch.nested.nested_tensor(rows, layout=torch.jagged)
-
-
-def turn_keep_positions(sub_seqs: torch.Tensor, sub_resps: torch.Tensor, sub_spans: list[SubRowSpan]) -> torch.Tensor:
-    """Logits positions scoring the supervised spans on the spliced teacher rows."""
-    prefix_lens = sub_seqs.offsets().diff() - sub_resps.offsets().diff()
-    spans = [[(body.start, body.stop - body.start)] for _, _, body, _ in body_slices(sub_spans)]
-    return _keep_positions(prefix_lens, spans)
 
 
 def response_keep_positions(
@@ -313,31 +339,143 @@ def truncate_rows_after_last_supervised_token(data) -> float:
 
 
 def scatter_turn_teacher_outputs(
-    sub_outputs: torch.Tensor,
+    span_outputs: list[torch.Tensor],
     sub_spans: list[SubRowSpan],
     batch_size: int,
     response_length: int,
     contrast: bool = False,
     anchor: bool = False,
 ) -> torch.Tensor:
-    """Scatter padded spliced-body teacher outputs back onto the (batch, response) grid: the hint
-    sub-rows, or with ``contrast`` the contrast teacher's, or with ``anchor`` the no-note ones.
+    """Scatter the teacher's outputs on each sub-row's scored span back onto the (batch, response) grid:
+    the hint sub-rows, or with ``contrast`` the contrast teacher's, or with ``anchor`` the no-note ones.
 
     Positions outside the scored spans stay zero; the per-token distillation mask excludes them.
     """
-    full = sub_outputs.new_zeros((batch_size, response_length, *sub_outputs.shape[2:]))
-    for j, parent, body_slice, response_slice in body_slices(sub_spans):
-        if (sub_spans[j].contrast, sub_spans[j].anchor) != (contrast, anchor):
+    full = span_outputs[0].new_zeros((batch_size, response_length, *span_outputs[0].shape[1:]))
+    for j, (outputs, span) in enumerate(zip(span_outputs, sub_spans, strict=True)):
+        if (span.contrast, span.anchor) != (contrast, anchor):
             continue
-        if parent >= batch_size or response_slice.stop > response_length or sub_outputs.dim() < 2:
+        if span.parent >= batch_size or span.end > response_length or outputs.shape[0] != span.end - span.start:
             raise RuntimeError(
                 "scatter_turn_teacher_outputs misalignment: "
-                f"row j={j} span={sub_spans[j]} vs "
-                f"grid=({batch_size},{response_length}) sub_outputs={tuple(sub_outputs.shape)} "
+                f"row j={j} span={span} vs grid=({batch_size},{response_length}) outputs={tuple(outputs.shape)} "
                 f"n_sub={len(sub_spans)} all_spans={sub_spans}"
             )
-        full[parent, response_slice] = sub_outputs[j, body_slice]
+        full[span.parent, span.start : span.end] = outputs
     return full
+
+
+def score_teacher_branches(
+    engine, data, student_topk_indices, output_keys, non_tensor_dict, default_keys, loss_function
+) -> dict[str, torch.Tensor]:
+    """Teacher targets of spliced rows: every sub-row is a branch off its sample's base, which the
+    teacher reads once through a cache and continues per branch from its split, scoring the branch's
+    span (see :func:`teacher_branches`)."""
+    rows = teacher_branches(data["teacher_input_ids"], data["teacher_seq_meta"], data["responses"])
+    has_contrast = any(branch.span.contrast for _, branches in rows for branch in branches)
+    has_anchor = any(branch.span.anchor for _, branches in rows for branch in branches)
+    if (has_contrast or has_anchor) and student_topk_indices is None:
+        raise ValueError("SDPO contrast sub-rows need top-k distillation (distillation_topk set).")
+
+    # a sample's forwards in order: read its base on to each split (in pieces once a cache holds some of it),
+    # then the branches leaving it there
+    steps = []
+    for i, (base, branches) in enumerate(rows):
+        read = 0
+        for branch in branches:
+            if branch.point > read:
+                pieces = [(0, branch.point)] if read == 0 else continuation_pieces(read, branch.point)
+                steps += [(lo, base[lo:hi], None) for lo, hi in pieces]
+                read = branch.point
+            steps.append((branch.point, branch.ids, branch))
+    n_calls = len(steps)
+    if torch.distributed.is_initialized():
+        # each infer_batch runs FSDP all-gathers and an all-reduce, so every rank makes the same number of calls;
+        # a rank with fewer forwards a 2-token stub for the rest; a rank whose rows are all un-hinted still returns
+        # the contrast and anchor outputs (zeros) when another rank has them, so every rank's loss reports the same
+        # metric keys
+        group = engine.get_data_parallel_group()
+        device = "cpu" if torch.distributed.get_backend(group) == "gloo" else get_device_name()
+        count = torch.tensor([n_calls, int(has_contrast), int(has_anchor)], device=device)
+        torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.MAX, group=group)
+        n_calls, has_contrast, has_anchor = int(count[0]), bool(count[1]), bool(count[2])
+
+    mask_dtype = data["response_mask"].dtype
+
+    def forward(ids, position, cache, keep, keep_ids=None, scored=True) -> dict:
+        """One teacher forward of ``ids`` at positions ``position`` on, continuing ``cache`` (None: from
+        scratch), scored at the row positions ``keep`` (on the student's ``keep_ids`` there, when given);
+        an unscored forward only extends the cache, its one kept position read off the label alone."""
+        input_ids = ids.unsqueeze(0)
+        tensors = {
+            "input_ids": input_ids,
+            "attention_mask": torch.ones_like(input_ids),
+            "position_ids": torch.arange(position, position + ids.shape[0], device=ids.device).unsqueeze(0),
+            "prompts": input_ids[:, :1],
+            "responses": input_ids[:, 1:],
+            "response_mask": torch.ones_like(input_ids[:, 1:], dtype=mask_dtype),
+        }
+        if keep_ids is not None:
+            tensors["student_topk_indices"] = keep_ids.new_zeros((1, ids.shape[0] - 1, keep_ids.shape[-1]))
+            tensors["student_topk_indices"][0, keep] = keep_ids
+        teacher_td = left_right_2_no_padding(
+            tu.get_tensordict(tensor_dict=tensors, non_tensor_dict=dict(non_tensor_dict))
+        )
+        keys = default_keys if scored else {**default_keys, "distillation_use_topk": False}
+        tu.assign_non_tensor(teacher_td, **keys, micro_batch_size_per_gpu=1)
+        teacher_td["logits_keep_positions"] = torch.nested.nested_tensor([keep], layout=torch.jagged)
+        if keep_ids is not None:
+            # the ids the student chose at those positions, for the head to score a chunk at a time
+            teacher_td["logits_keep_topk_indices"] = torch.nested.nested_tensor([keep_ids], layout=torch.jagged)
+        with engine.continuing(cache):
+            return engine.infer_batch(teacher_td, loss_function=loss_function if scored else None)["model_output"]
+
+    config = getattr(engine.module, "config", None)
+    # a read keeps only its first position
+    first = torch.zeros(1, dtype=torch.int64, device=rows[0][0].device)
+    outputs, spans = {key: [] for key in output_keys}, []
+    cache = states = None
+    with engine.eval_mode(disable_auto_offload=False):
+        for position, ids, branch in steps:
+            if branch is None:
+                if position == 0:
+                    cache = TeacherCache(config=config)
+                forward(ids, position, cache, first, scored=False)
+                states = None
+                continue
+            span = branch.span
+            keep = torch.arange(span.body_start, span.body_start + span.end - span.start, device=ids.device)
+            keep_ids = None
+            if student_topk_indices is not None:
+                keep_ids = student_topk_indices[span.parent, span.start : span.end]
+            if branch.point == 0:
+                model_output = forward(ids, 0, None, keep, keep_ids)
+            else:
+                states = recurrent_states(cache) if states is None else states
+                model_output = forward(ids, branch.point, cache, keep, keep_ids)
+                rewind(cache, branch.point, states)
+            for key in output_keys:
+                outputs[key].append(model_output[key].values()[keep].float())
+            spans.append(span)
+        for _ in range(n_calls - len(steps)):
+            forward(rows[0][0][:2], 0, None, first, scored=False)
+
+    batch_size = data["responses"].size(0)
+    response_length = max(r.shape[0] for r in data["responses"].unbind())
+
+    def to_response_grid(key: str, contrast: bool = False, anchor: bool = False) -> torch.Tensor:
+        return scatter_turn_teacher_outputs(outputs[key], spans, batch_size, response_length, contrast, anchor)
+
+    result = {"teacher_log_probs": to_response_grid("log_probs")}
+    if "all_logps" in outputs:
+        result["teacher_all_log_probs"] = to_response_grid("all_logps")
+    elif student_topk_indices is not None:
+        result["teacher_topk_log_probs"] = to_response_grid("topk_logps")
+        if has_contrast:
+            result["contrast_topk_log_probs"] = to_response_grid("topk_logps", contrast=True)
+        if has_anchor:
+            result["anchor_topk_log_probs"] = to_response_grid("topk_logps", anchor=True)
+    return result
 
 
 def has_non_empty_multi_modal_inputs(data) -> bool:
@@ -384,6 +522,11 @@ class TrustRegionTeacher(torch.nn.Module):
         raise ValueError(f"Unsupported model output type for trust-region teacher: {type(output)}")
 
     def forward(self, *args, **kwargs):
+        if kwargs.get("past_key_values") is not None:
+            raise NotImplementedError(
+                "the trust-region teacher mixes two models, which cannot continue one cache: spliced teacher rows "
+                "are scored through one, so they need teacher_regularization ema"
+            )
         ref_output = self.ref_module(*args, **kwargs)
         student_output = self.student_module(*args, **kwargs)
         ref_logits = self._extract_logits(ref_output)
