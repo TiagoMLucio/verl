@@ -17,9 +17,10 @@ A hinted sample ships its trajectory once, the base (the student's prompt, left-
 response up to the last scored span), followed by every sub-row's note, and a flat int64
 ``teacher_seq_meta`` of ``[n_sub, response_offset, *fields per sub-row]``: the response starts at
 ``response_offset`` in the base, and a sub-row is the base up to its ``split``, its own note, then the
-base again up to the end of its scored span, which maps onto the response's ``[start, end)``. A contrast
-teacher appends one more sub-row per sub-row (same split and span, its own note) after them; an
-anchored contrast appends a third group (same split and span, no note) after the contrast sub-rows.
+base again up to the end of its scored span, which maps onto the response's ``[start, end)``. Each
+contrast teacher appends one more group of sub-rows (same splits and spans, its own notes) after them;
+an anchored contrast appends a last group (same splits and spans, no notes) after the contrast groups,
+which is how it is told apart: a contrast note is never empty.
 The sub-rows of a sample differ only from their split on, so the teacher reads the base once.
 """
 
@@ -42,34 +43,41 @@ class SubRow(NamedTuple):
 FIELDS = len(SubRow._fields)
 
 
-def pack(
-    response_offset: int,
-    sub_rows: Iterable[SubRow],
-    contrast_rows: Iterable[SubRow] = (),
-    anchor_rows: Iterable[SubRow] = (),
-) -> list[int]:
-    """Flatten sub-rows into the wire meta ``[n_sub, response_offset, *fields...]``, then the contrast
-    sub-rows, then the anchor (no-note) sub-rows."""
-    sub_rows, contrast_rows, anchor_rows = list(sub_rows), list(contrast_rows), list(anchor_rows)
-    assert not contrast_rows or len(contrast_rows) == len(sub_rows), "one contrast sub-row per sub-row"
-    assert not anchor_rows or len(anchor_rows) == len(contrast_rows), "one anchor sub-row per contrast sub-row"
-    rows = [*sub_rows, *contrast_rows, *anchor_rows]
+def pack(response_offset: int, sub_rows: Iterable[SubRow], *groups: Iterable[SubRow]) -> list[int]:
+    """Flatten sub-rows into the wire meta ``[n_sub, response_offset, *fields...]``, then each further group
+    in order (an empty one is no group): the contrast groups, then the anchor (no-note) group."""
+    sub_rows, groups = list(sub_rows), [group for group in map(list, groups) if group]
+    assert all(len(group) == len(sub_rows) for group in groups), "every group has one sub-row per sub-row"
+    assert all(row.note_len > 0 for group in groups[:-1] for row in group), "only the last group may have no notes"
+    assert not groups or groups[0][0].note_len > 0, "an anchor group follows a contrast group"
+    rows = [*sub_rows, *(sub_row for group in groups for sub_row in group)]
     return [len(sub_rows), response_offset, *(value for sub_row in rows for value in sub_row)]
 
 
-def unpack(flat: list[int], sample: Optional[int] = None, contrast: bool = False, anchor: bool = False) -> list[SubRow]:
-    """Inverse of :func:`pack`: the sub-rows, or with ``contrast`` the contrast sub-rows, or with ``anchor``
-    the anchor sub-rows (none when the sample ships none); ``sample`` only labels the malformed-meta
-    assertion."""
-    assert not (contrast and anchor), "unpack one group at a time"
+def _groups(flat: list[int], sample: Optional[int]) -> tuple[list[list[SubRow]], bool]:
     n_sub, entries = flat[0], flat[2:]
+    if n_sub == 0:
+        return [[]], False
     where = "" if sample is None else f" for sample {sample}"
-    assert len(entries) in (FIELDS * n_sub, 2 * FIELDS * n_sub, 3 * FIELDS * n_sub), (
+    assert entries and len(entries) % (FIELDS * n_sub) == 0, (
         f"teacher_seq_meta malformed{where}: {n_sub} sub-rows, {len(entries)} ints"
     )
     rows = [SubRow(*entries[FIELDS * j : FIELDS * (j + 1)]) for j in range(len(entries) // FIELDS)]
-    group = 2 if anchor else 1 if contrast else 0
-    return rows[group * n_sub : (group + 1) * n_sub]
+    groups = [rows[at : at + n_sub] for at in range(0, len(rows), n_sub)]
+    return groups, len(groups) > 2 and all(row.note_len == 0 for row in groups[-1])
+
+
+def unpack(flat: list[int], sample: Optional[int] = None, contrast: bool = False, anchor: bool = False) -> list[SubRow]:
+    """Inverse of :func:`pack`: the sub-rows, or with ``contrast`` every contrast group's sub-rows in order,
+    or with ``anchor`` the anchor sub-rows (none when the sample ships none); ``sample`` only labels the
+    malformed-meta assertion."""
+    assert not (contrast and anchor), "unpack one group at a time"
+    groups, has_anchor = _groups(flat, sample)
+    if anchor:
+        return groups[-1] if has_anchor else []
+    if contrast:
+        return [sub_row for group in groups[1 : len(groups) - has_anchor] for sub_row in group]
+    return groups[0]
 
 
 class NotedSubRow(NamedTuple):

@@ -15,6 +15,7 @@
 spliced rows into their base and the branches off it, mark the span-only logits positions, scatter
 the teacher outputs back to the response grid, and mix the trust-region teacher."""
 
+import math
 from types import SimpleNamespace
 from typing import NamedTuple, Optional
 
@@ -352,11 +353,13 @@ def scatter_turn_teacher_outputs(
     anchor: bool = False,
 ) -> torch.Tensor:
     """Scatter the teacher's outputs on each sub-row's scored span back onto the (batch, response) grid:
-    the hint sub-rows, or with ``contrast`` the contrast teacher's, or with ``anchor`` the no-note ones.
+    the hint sub-rows, or with ``contrast`` the contrast teachers', or with ``anchor`` the no-note ones.
+    Several contrast teachers on one span (log-probs) give the log of their mean probability.
 
     Positions outside the scored spans stay zero; the per-token distillation mask excludes them.
     """
     full = span_outputs[0].new_zeros((batch_size, response_length, *span_outputs[0].shape[1:]))
+    per_span = {}
     for j, (outputs, span) in enumerate(zip(span_outputs, sub_spans, strict=True)):
         if (span.contrast, span.anchor) != (contrast, anchor):
             continue
@@ -366,7 +369,12 @@ def scatter_turn_teacher_outputs(
                 f"row j={j} span={span} vs grid=({batch_size},{response_length}) outputs={tuple(outputs.shape)} "
                 f"n_sub={len(sub_spans)} all_spans={sub_spans}"
             )
-        full[span.parent, span.start : span.end] = outputs
+        per_span.setdefault((span.parent, span.start, span.end), []).append(outputs)
+    for (parent, start, end), outputs in per_span.items():
+        if contrast and len(outputs) > 1:
+            full[parent, start:end] = torch.logsumexp(torch.stack(outputs), dim=0) - math.log(len(outputs))
+        else:
+            full[parent, start:end] = outputs[-1]
     return full
 
 
