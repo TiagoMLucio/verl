@@ -21,9 +21,11 @@ from typing import NamedTuple, Optional
 import torch
 from transformers import DynamicCache
 
+from verl.models.transformers import lower_right_sdpa
 from verl.trainer.ppo.sdpo.teacher_meta import SubRowSpan, unpack, unpack_row
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_name
+from verl.utils.fsdp_utils import fsdp2_gathered
 from verl.utils.model import compute_position_id_with_mask
 from verl.workers.utils.padding import left_right_2_no_padding
 
@@ -130,13 +132,16 @@ def teacher_branches(
     return rows
 
 
-# a forward that continues a cache gets a dense (query x key) SDPA mask, so a long read on goes in pieces
+# a forward that continues a cache gets a dense (query x key) SDPA mask, so a long read on goes in pieces;
+# the lower-right causal bias needs no mask, and longer pieces only bound the activations
 CONTINUATION_PIECE = 2048
+LOWER_RIGHT_PIECE = 8192
 
 
-def continuation_pieces(start: int, stop: int) -> list[tuple[int, int]]:
-    """``[start, stop)`` in pieces of one to two :data:`CONTINUATION_PIECE` tokens, or whole when shorter."""
-    n = max(1, (stop - start) // CONTINUATION_PIECE)
+def continuation_pieces(start: int, stop: int, piece: Optional[int] = None) -> list[tuple[int, int]]:
+    """``[start, stop)`` in pieces of one to two ``piece`` tokens (:data:`CONTINUATION_PIECE` by default), or
+    whole when shorter."""
+    n = max(1, (stop - start) // (piece or CONTINUATION_PIECE))
     bounds = [start + (stop - start) * k // n for k in range(n + 1)]
     return list(zip(bounds[:-1], bounds[1:], strict=True))
 
@@ -379,21 +384,22 @@ def score_teacher_branches(
 
     # a sample's forwards in order: read its base on to each split (in pieces once a cache holds some of it),
     # then the branches leaving it there
+    piece = LOWER_RIGHT_PIECE if lower_right_sdpa.available(engine.module) else CONTINUATION_PIECE
     steps = []
     for i, (base, branches) in enumerate(rows):
         read = 0
         for branch in branches:
             if branch.point > read:
-                pieces = [(0, branch.point)] if read == 0 else continuation_pieces(read, branch.point)
+                pieces = [(0, branch.point)] if read == 0 else continuation_pieces(read, branch.point, piece)
                 steps += [(lo, base[lo:hi], None) for lo, hi in pieces]
                 read = branch.point
             steps.append((branch.point, branch.ids, branch))
     n_calls = len(steps)
     if torch.distributed.is_initialized():
-        # each infer_batch runs FSDP all-gathers and an all-reduce, so every rank makes the same number of calls;
-        # a rank with fewer forwards a 2-token stub for the rest; a rank whose rows are all un-hinted still returns
-        # the contrast and anchor outputs (zeros) when another rank has them, so every rank's loss reports the same
-        # metric keys
+        # over sharded parameters each infer_batch runs FSDP all-gathers and an all-reduce, so every rank makes the
+        # same number of calls, a rank with fewer forwarding a 2-token stub for the rest; a rank whose rows are all
+        # un-hinted still returns the contrast and anchor outputs (zeros) when another rank has them, so every
+        # rank's loss reports the same metric keys
         group = engine.get_data_parallel_group()
         device = "cpu" if torch.distributed.get_backend(group) == "gloo" else get_device_name()
         count = torch.tensor([n_calls, int(has_contrast), int(has_anchor)], device=device)
@@ -422,7 +428,7 @@ def score_teacher_branches(
             tu.get_tensordict(tensor_dict=tensors, non_tensor_dict=dict(non_tensor_dict))
         )
         keys = default_keys if scored else {**default_keys, "distillation_use_topk": False}
-        tu.assign_non_tensor(teacher_td, **keys, micro_batch_size_per_gpu=1)
+        tu.assign_non_tensor(teacher_td, **keys, micro_batch_size_per_gpu=1, rank_local=local)
         teacher_td["logits_keep_positions"] = torch.nested.nested_tensor([keep], layout=torch.jagged)
         if keep_ids is not None:
             # the ids the student chose at those positions, for the head to score a chunk at a time
@@ -435,7 +441,13 @@ def score_teacher_branches(
     first = torch.zeros(1, dtype=torch.int64, device=rows[0][0].device)
     outputs, spans = {key: [] for key in output_keys}, []
     cache = states = None
-    with engine.eval_mode(disable_auto_offload=False):
+    local = False
+    # the parameters gathered once, the forwards inside run no collectives and each rank makes only its own
+    with (
+        engine.eval_mode(disable_auto_offload=False),
+        fsdp2_gathered(engine.module) as local,
+        lower_right_sdpa.lower_right_sdpa(engine.module),
+    ):
         for position, ids, branch in steps:
             if branch is None:
                 if position == 0:
@@ -457,8 +469,9 @@ def score_teacher_branches(
             for key in output_keys:
                 outputs[key].append(model_output[key].values()[keep].float())
             spans.append(span)
-        for _ in range(n_calls - len(steps)):
-            forward(rows[0][0][:2], 0, None, first, scored=False)
+        if not local:
+            for _ in range(n_calls - len(steps)):
+                forward(rows[0][0][:2], 0, None, first, scored=False)
 
     batch_size = data["responses"].size(0)
     response_length = max(r.shape[0] for r in data["responses"].unbind())

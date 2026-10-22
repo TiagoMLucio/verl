@@ -142,6 +142,7 @@ def teacher_batch(remove_padding):
 def test_branches_score_their_spans_as_fresh_subrow_forwards(single_process_group, monkeypatch, remove_padding):
     # the base between two hinted turns is read on in several pieces
     monkeypatch.setattr(sdpo_utils, "CONTINUATION_PIECE", 3)
+    monkeypatch.setattr(sdpo_utils, "LOWER_RIGHT_PIECE", 3)
     model = tiny_qwen35()
     data, hinted, meta = teacher_batch(remove_padding)
     topk = torch.randint(0, VOCAB, (2, 40, TOPK), generator=torch.Generator().manual_seed(2))

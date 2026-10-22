@@ -676,9 +676,11 @@ class FSDPEngine(BaseEngine):
 
         # compute num_tokens in global batch for loss normalization
         batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
-        torch.distributed.all_reduce(
-            batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
-        )
+        # a rank-local forward (the cached teacher's, over gathered parameters) must run no dp collective
+        if not tu.get_non_tensor_data(data=data, key="rank_local", default=False):
+            torch.distributed.all_reduce(
+                batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
+            )
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 

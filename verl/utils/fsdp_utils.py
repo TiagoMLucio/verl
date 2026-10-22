@@ -794,6 +794,36 @@ def set_reshard_after_forward(module: FSDPModule, reshard_after_forward: bool, r
                 )
 
 
+@contextmanager
+def fsdp2_gathered(module: nn.Module):
+    """Holds an FSDP2 module's parameters unsharded through the forwards inside: one all-gather on entry instead of
+    one per forward, so those forwards run no collectives and the ranks may make different numbers of them.
+
+    Every rank must enter it together (the entry gathers). Yields whether it gathered: a module that is not FSDP2
+    yields False and its forwards keep their collectives."""
+    fsdp_modules = [m for m in module.modules() if isinstance(m, FSDPModule)] if FSDPModule is not None else []
+    if not fsdp_modules:
+        yield False
+        return
+    saved = []
+    for m in fsdp_modules:
+        state = m._get_fsdp_state()
+        group = state._fsdp_param_group
+        saved.append((state, state._auto_reshard_after_forward, group.post_forward_mesh_info if group else None))
+    for m in fsdp_modules:
+        m.unshard()
+    set_reshard_after_forward(module, False)
+    try:
+        yield True
+    finally:
+        for state, auto, info in saved:
+            state._auto_reshard_after_forward = auto
+            if state._fsdp_param_group is not None:
+                state._fsdp_param_group.post_forward_mesh_info = info
+        for m in fsdp_modules:
+            m.reshard()
+
+
 def normalize_peft_param_name(params: dict) -> dict:
     """
     Converts peft model parameter name to base parameter name
