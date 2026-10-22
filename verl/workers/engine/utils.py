@@ -25,7 +25,7 @@ from verl.utils.device import is_npu_available
 from verl.utils.device import manual_seed as device_manual_seed
 from verl.utils.device import manual_seed_all as device_manual_seed_all
 from verl.utils.py_functional import append_to_dict
-from verl.utils.seqlen_balancing import rearrange_micro_batches, restore_dynamic_batch
+from verl.utils.seqlen_balancing import calculate_workload, rearrange_micro_batches, restore_dynamic_batch
 
 
 def enable_full_determinism(seed: int):
@@ -90,9 +90,26 @@ def prepare_micro_batches(
         assert total_data_size % (force_group_size * micro_batch_size_per_gpu) == 0, (
             "data size must be divisible by force_group_size * micro_batch_size_per_gpu"
         )
-        micro_batches = tu.chunk_tensordict(data, total_data_size // (micro_batch_size_per_gpu * force_group_size))
-        batch_idx_list = None
+        num_micro_batches = total_data_size // (micro_batch_size_per_gpu * force_group_size)
+        if force_group_size == 1 and num_micro_batches > 1:
+            # dp ranks run their micro-batches in lockstep, so each runs its rows heaviest first and a step's
+            # ranks hold rows of similar cost, as the dynamic path's sort does
+            order = calculate_workload(_seq_lens(data).long()).argsort(descending=True, stable=True).tolist()
+            batch_idx_list = [
+                order[k : k + micro_batch_size_per_gpu] for k in range(0, total_data_size, micro_batch_size_per_gpu)
+            ]
+            micro_batches = [tu.index_select_tensor_dict(data, idx) for idx in batch_idx_list]
+        else:
+            micro_batches = tu.chunk_tensordict(data, num_micro_batches)
+            batch_idx_list = None
     return micro_batches, batch_idx_list
+
+
+def _seq_lens(data: TensorDict) -> torch.Tensor:
+    input_ids = data["input_ids"]
+    if input_ids.is_nested:
+        return input_ids.offsets().diff()
+    return data["attention_mask"].sum(dim=1)
 
 
 def postprocess_batch_func(output_lst, indices, data: TensorDict):
@@ -104,7 +121,6 @@ def postprocess_batch_func(output_lst, indices, data: TensorDict):
     each losses_reduced contains 1. model_output, 2. loss, 3. metrics.
     """
 
-    use_dynamic_bsz = tu.get_non_tensor_data(data=data, key="use_dynamic_bsz", default=True)
     pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
     assert pad_mode == DatasetPadMode.NO_PADDING, "postprocess_batch_func only support NO_PADDING pad_mode"
 
@@ -135,8 +151,8 @@ def postprocess_batch_func(output_lst, indices, data: TensorDict):
         else:
             raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
-        # reverse with dynamic bsz
-        if use_dynamic_bsz:
+        # back to the batch's order, which the micro-batches left (dynamic bsz, or static ones run by workload)
+        if indices is not None:
             model_output[key] = restore_dynamic_batch(model_output[key], indices)
 
     # loss
