@@ -193,6 +193,8 @@ class ActorConfig(BaseConfig):
     Args:
         strategy (str): Training strategy. Must be specified.
         ppo_mini_batch_size (int): Mini-batch size for PPO training.
+        ppo_num_mini_batches (Optional[int]): Optimizer steps per batch: each rank's rows split into this many
+            equal mini-batches, however many rows the batch holds; replaces ppo_mini_batch_size when set.
         ppo_micro_batch_size (Optional[int]): Micro-batch size for PPO training.
             If None, uses ppo_micro_batch_size_per_gpu.
         ppo_micro_batch_size_per_gpu (Optional[int]): Micro-batch size per GPU for PPO training.
@@ -234,6 +236,7 @@ class ActorConfig(BaseConfig):
 
     strategy: str = MISSING
     ppo_mini_batch_size: int = 256
+    ppo_num_mini_batches: Optional[int] = None
     ppo_micro_batch_size: Optional[int] = None  # deprecate
     ppo_micro_batch_size_per_gpu: Optional[int] = None
     ppo_infer_micro_batch_size_per_gpu: Optional[int] = None
@@ -312,6 +315,14 @@ class ActorConfig(BaseConfig):
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""
+        if self.ppo_num_mini_batches is not None:
+            if self.ppo_num_mini_batches < 1:
+                raise ValueError(f"ppo_num_mini_batches must be positive, got {self.ppo_num_mini_batches}")
+            if self.loss_agg_mode == "traj-mean-token-mean":
+                raise ValueError(
+                    "ppo_num_mini_batches splits a batch into several optimizer steps; "
+                    "loss_agg_mode=traj-mean-token-mean is one optimizer step over the whole batch"
+                )
         if self.loss_agg_mode == "traj-mean-token-mean":
             if self.policy_loss.loss_mode != "sdpo":
                 raise ValueError(

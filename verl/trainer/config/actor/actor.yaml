@@ -17,6 +17,9 @@ strategy: ???
 # Split each sample into sub-batches of this size for PPO
 ppo_mini_batch_size: 256
 
+# Optimizer steps per batch, each rank's rows in equal parts whatever their number; replaces ppo_mini_batch_size
+ppo_num_mini_batches: null
+
 # [Deprecated] Global micro batch size
 ppo_micro_batch_size: null
 

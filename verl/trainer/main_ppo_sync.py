@@ -1794,9 +1794,16 @@ class PPOTrainer:
                 )
                 required_multiple = math.lcm(required_multiple, dp_size * math.lcm(*(m for m in micro if m)))
         elif self.config.trainer.critic_warmup <= self.global_steps:
-            actor_global_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-            actor_global_mini_batch_size *= self.config.actor_rollout_ref.rollout.n
-            required_multiple = math.lcm(required_multiple, actor_global_mini_batch_size)
+            num_mini_batches = arr.actor.get("ppo_num_mini_batches")
+            if num_mini_batches:
+                # each rank's share splits into that many equal mini-batches of whole micro-batches
+                micro = arr.actor.get("ppo_micro_batch_size_per_gpu") or 1
+                log_prob_micro = arr.rollout.get("log_prob_micro_batch_size_per_gpu") or 1
+                required_multiple = math.lcm(required_multiple, dp_size * math.lcm(num_mini_batches * micro, log_prob_micro))
+            else:
+                actor_global_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+                actor_global_mini_batch_size *= self.config.actor_rollout_ref.rollout.n
+                required_multiple = math.lcm(required_multiple, actor_global_mini_batch_size)
 
         # Notice lcm(a, b, c) == lcm(lcm(a, b), c), so it is optimal.
         return required_multiple
@@ -2162,6 +2169,12 @@ class PPOTrainer:
                 extra_info["outcome_trajectories"] = outcome_trajectories
             if sdpo_enabled and self.config.actor_rollout_ref.actor.get("use_kl_loss", False):
                 extra_info["kl_trajectories"] = supervised_trajectories + outcome_trajectories
+        elif num_mini_batches := self.config.actor_rollout_ref.actor.get("ppo_num_mini_batches"):
+            # the batch is padded to dp x num_mini_batches rows (_get_required_batch_multiple); the seq-mean of
+            # each optimizer step divides by the rows that step holds
+            del extra_info["mini_batch_size"]
+            extra_info["num_mini_batch"] = num_mini_batches
+            extra_info["global_batch_size"] = len(batch.keys) // num_mini_batches
         batch.extra_info.update(extra_info)
 
         output: TensorDict = self.actor_rollout_wg.update_actor(batch)

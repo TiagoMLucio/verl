@@ -115,6 +115,8 @@ def _trainer(
     outcome_rows=None,
     success_nll_coef=0.0,
     use_kl_loss=False,
+    loss_agg_mode="traj-mean-token-mean",
+    num_mini_batches=None,
 ):
     """``n_rows - n_tasks`` tasks condensed into two segments; the first ``supervised_rows``
     rows carry weight, and with ``outcome_rows`` every row carries the outcome fields, the next
@@ -144,10 +146,11 @@ def _trainer(
             "actor_rollout_ref": {
                 "actor": {
                     "ppo_mini_batch_size": MINI,
+                    "ppo_num_mini_batches": num_mini_batches,
                     "ppo_micro_batch_size_per_gpu": micro,
                     "ppo_epochs": 1,
                     "drop_unsupervised_rows": True,
-                    "loss_agg_mode": "traj-mean-token-mean",
+                    "loss_agg_mode": loss_agg_mode,
                     "use_kl_loss": use_kl_loss,
                     "policy_loss": {"loss_mode": "sdpo"},
                     "self_distillation": {"full_logit_distillation": False, "success_nll_coef": success_nll_coef},
@@ -251,6 +254,28 @@ def test_the_kl_term_averages_over_every_trajectory_the_update_reads(monkeypatch
     update_batch = _update(trainer, batch, {})
     assert update_batch.extra_info["kl_trajectories"] == trajectories
     assert update_batch.extra_info["global_batch_size"] == 90
+
+
+@pytest.mark.parametrize(
+    "supervised_rows, padded",
+    [
+        pytest.param(90, 96, id="90 hinted"),
+        pytest.param(100, 112, id="100 hinted"),
+        pytest.param(128, 128, id="all 128 hinted"),
+    ],
+)
+def test_a_fixed_mini_batch_count_splits_whatever_the_drop_keeps(monkeypatch, supervised_rows, padded):
+    """seq-mean with four optimizer steps per batch: the kept rows are padded to dp x 4, the worker gets the
+    count instead of a size, and each step's seq-mean divides by the rows it holds."""
+    trainer, batch, sent, _ = _trainer(
+        monkeypatch, 128, 128, supervised_rows, loss_agg_mode="seq-mean-token-mean", num_mini_batches=4
+    )
+    update_batch = _update(trainer, batch, {})
+    assert sent == [update_batch]
+    assert len(update_batch) == padded and (len(update_batch) // DP) % 4 == 0
+    assert "mini_batch_size" not in update_batch.extra_info
+    assert update_batch.extra_info["num_mini_batch"] == 4
+    assert update_batch.extra_info["global_batch_size"] == padded // 4
 
 
 def test_no_kl_count_ships_without_the_kl_term(monkeypatch):

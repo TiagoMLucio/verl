@@ -289,6 +289,15 @@ class TestActorConfig(unittest.TestCase):
         # the other modes keep the mini-batch free
         config(loss_agg_mode="seq-mean-token-mean", ppo_mini_batch_size=64).validate(n_gpus=4, train_batch_size=128)
 
+        # a fixed count of optimizer steps is several steps, so only the other modes take it
+        with self.assertRaises(ValueError) as cm:
+            config(ppo_num_mini_batches=4).validate(n_gpus=4, train_batch_size=128)
+        self.assertIn("ppo_num_mini_batches splits a batch", str(cm.exception))
+        with self.assertRaises(ValueError) as cm:
+            config(loss_agg_mode="seq-mean-token-mean", ppo_num_mini_batches=0).validate(n_gpus=4, train_batch_size=128)
+        self.assertIn("must be positive", str(cm.exception))
+        config(loss_agg_mode="seq-mean-token-mean", ppo_num_mini_batches=4).validate(n_gpus=4, train_batch_size=128)
+
     def test_the_outcome_term_needs_sdpo_and_traj_mean(self):
         """success_nll_coef divides by the solved trajectories, which only traj-mean-token-mean keeps apart
         from the distillation rows' count; a negative coefficient is refused on its own."""
